@@ -97,7 +97,7 @@ struct App {
     refresh: Duration,
 
     // Charts
-    core_history: Vec<VecDeque<f64>>, // per-core CPU history (0..100)
+    cpu_history: VecDeque<f64>, // avg CPU usage (0..100) over time
     history_len: usize,
 
     // Network rate calculation
@@ -125,12 +125,10 @@ impl App {
         let mut disks = Disks::new_with_refreshed_list();
         disks.refresh();
 
-        // init core history
-        let cores = sys.cpus().len().max(1);
-        let history_len = 60;
-        let core_history = (0..cores)
-            .map(|_| VecDeque::from(vec![0.0; history_len]))
-            .collect();
+        // init history with zeros
+        let history_len = 120; // ~ last N ticks in chart
+        let mut cpu_history = VecDeque::with_capacity(history_len);
+        cpu_history.extend(std::iter::repeat(0.0).take(history_len));
 
         // initial net snapshot
         let mut prev_net = BTreeMap::new();
@@ -153,7 +151,7 @@ impl App {
             sort_by: cfg.sort_by,
             sort_desc: cfg.sort_desc,
             refresh: Duration::from_millis(cfg.refresh_ms),
-            core_history,
+            cpu_history,
             history_len,
             prev_net,
             agg_rx_bps: 0.0,
@@ -177,21 +175,22 @@ impl App {
         self.networks.refresh();
         self.disks.refresh();
 
-        // update CPU per-core history
-        let cpus = self.sys.cpus();
-        if cpus.len() != self.core_history.len() {
-            self.core_history = (0..cpus.len())
-                .map(|_| VecDeque::from(vec![0.0; self.history_len]))
-                .collect();
-        }
-        for (i, cpu) in cpus.iter().enumerate() {
-            let usage = cpu.cpu_usage().clamp(0.0, 100.0);
-            let buf = &mut self.core_history[i];
-            if buf.len() >= self.history_len {
-                buf.pop_front();
+        // push average CPU usage into history
+        let avg_cpu = {
+            let cpus = self.sys.cpus();
+            if cpus.is_empty() {
+                0.0
+            } else {
+                let sum: f32 = cpus.iter().map(|c| c.cpu_usage()).sum();
+                (sum / (cpus.len() as f32)) as f64
             }
-            buf.push_back(usage as f64);
         }
+        .clamp(0.0, 100.0);
+
+        if self.cpu_history.len() >= self.history_len {
+            self.cpu_history.pop_front();
+        }
+        self.cpu_history.push_back(avg_cpu);
 
         // network bps
         self.update_network_rates(dt);
@@ -366,17 +365,17 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(size);
 
-    // Left side: CPU/Memory + Processes
+    // Left side: CPU overview / Memory / Procs
     let left = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(9), // CPU charts row (per-core)
+            Constraint::Length(6), // CPU overview (single composite chart)
             Constraint::Length(3), // Memory
             Constraint::Min(7),    // Processes
         ])
         .split(cols[0]);
 
-    draw_cpu_charts(f, left[0], app);
+    draw_cpu_overview(f, left[0], app);
     draw_mem(f, left[1], app);
     draw_procs(f, left[2], app);
 
@@ -393,54 +392,38 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     draw_disks(f, right[1], app);
 }
 
-fn draw_cpu_charts(f: &mut Frame<'_>, area: Rect, app: &App) {
-    let cores = app.core_history.len().max(1);
-    let cols = cores.min(4) as u16;
-    let rows = ((cores as f32) / (cols as f32)).ceil() as u16;
+fn draw_cpu_overview(f: &mut Frame<'_>, area: Rect, app: &App) {
+    // current usage is last point in history
+    let current = app
+        .cpu_history
+        .back()
+        .copied()
+        .unwrap_or(0.0)
+        .clamp(0.0, 100.0);
 
-    let vchunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(vec![Constraint::Ratio(1, rows.into()); rows as usize])
-        .split(area);
-
-    let mut idx = 0usize;
-    for r in 0..rows as usize {
-        let hchunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints(vec![Constraint::Ratio(1, cols.into()); cols as usize])
-            .split(vchunks[r]);
-
-        for c in 0..cols as usize {
-            if idx < cores {
-                let title = format!("CPU{}", idx);
-                draw_cpu_chart_single(f, hchunks[c], &app.core_history[idx], &title);
-                idx += 1;
-            }
-        }
-    }
-}
-
-fn draw_cpu_chart_single(f: &mut Frame<'_>, area: Rect, hist: &VecDeque<f64>, title: &str) {
-    let data: Vec<(f64, f64)> = hist
+    // convert history -> (x,y) pairs for Chart
+    let data: Vec<(f64, f64)> = app
+        .cpu_history
         .iter()
         .enumerate()
         .map(|(i, y)| (i as f64, *y))
         .collect();
 
     let datasets = vec![Dataset::default()
-        .name("usage")
+        .name("avg cpu")
         .marker(symbols::Marker::Braille)
         .graph_type(GraphType::Line)
         .data(&data)];
 
-    let x_max = (hist.len().saturating_sub(1)) as f64;
+    let x_max = (app.cpu_history.len().saturating_sub(1)) as f64;
+    let title = format!("CPU avg {:>4.1}%", current);
 
     let chart = Chart::new(datasets)
         .block(Block::default().borders(Borders::ALL).title(title))
         .x_axis(
             Axis::default()
                 .bounds([0.0, x_max.max(1.0)])
-                .labels(vec![Span::raw("now-"), Span::raw("now")]),
+                .labels(vec![Span::raw("past"), Span::raw("now")]),
         )
         .y_axis(
             Axis::default()
@@ -540,9 +523,13 @@ fn draw_network(f: &mut Frame<'_>, area: Rect, app: &App) {
     let header = Row::new(vec!["Iface", "RX total", "TX total"])
         .style(Style::default().add_modifier(Modifier::BOLD));
 
-    let rows = per
-        .into_iter()
-        .map(|(name, rx, tx)| Row::new(vec![Cell::from(name), Cell::from(human_bytes(rx)), Cell::from(human_bytes(tx))]));
+    let rows = per.into_iter().map(|(name, rx, tx)| {
+        Row::new(vec![
+            Cell::from(name),
+            Cell::from(human_bytes(rx)),
+            Cell::from(human_bytes(tx)),
+        ])
+    });
 
     let widths = [
         Constraint::Percentage(35),
@@ -564,7 +551,6 @@ fn draw_disks(f: &mut Frame<'_>, area: Rect, app: &App) {
     let mut rows_vec = Vec::new();
     for d in app.disks.iter() {
         let mount = d.mount_point().to_string_lossy().to_string();
-        // file_system() is OsStr in 0.30
         let fs = d.file_system().to_string_lossy().to_string();
         let total = d.total_space() as f64;
         let avail = d.available_space() as f64;
@@ -580,9 +566,9 @@ fn draw_disks(f: &mut Frame<'_>, area: Rect, app: &App) {
         rows_vec.push(("-".into(), "-".into(), "-".into()));
     }
 
-    let rows = rows_vec
-        .into_iter()
-        .map(|(m, fs, u)| Row::new(vec![Cell::from(m), Cell::from(fs), Cell::from(u)]));
+    let rows = rows_vec.into_iter().map(|(m, fs, u)| {
+        Row::new(vec![Cell::from(m), Cell::from(fs), Cell::from(u)])
+    });
 
     let widths = [
         Constraint::Percentage(45),
