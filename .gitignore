@@ -1,2 +1,27 @@
+# Build output
 /target
-.vscode/*
+
+# Editor and OS cruft
+/.vscode/
+/.idea/
+*.rs.bk
+*.swp
+.DS_Store
+
+# Snapshots written by the `P` key. With `[export] dir` unset — the default —
+# these land in the working directory, which is the checkout while developing.
+# See `export::export_path`.
+/crabmon-*.json
+/crabmon-*.csv
+
+# Session recordings from `--record`.
+*.jsonl
+
+# Action log, when `[audit] path` points somewhere relative, or when no
+# platform state directory can be resolved and it falls back to `./crabmon/`.
+/actions.log
+/crabmon/
+
+# Profiling output
+perf.data*
+flamegraph.svg

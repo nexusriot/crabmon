@@ -1,7 +1,18 @@
 [package]
 name = "crabmon"
-version = "0.2.2"
+version = "0.4.0"
 edition = "2021"
+description = "A fast, keyboard-driven terminal system monitor"
+repository = "https://github.com/nexusriot/crabmon"
+license = "MIT"
+
+[lib]
+name = "crabmon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "crabmon"
+path = "src/main.rs"
 
 [dependencies]
 crossterm = "0.27"
@@ -9,25 +20,40 @@ ratatui = { version = "0.26", default-features = false, features = ["crossterm"]
 sysinfo = "0.30"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
 dirs = "5"
+regex = "1"
 
-# Unix-only for sending signals (SIGTERM)
+# Unix-only: signals, priorities, affinity, graceful shutdown
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", default-features = false, features = ["signal"] }
+nix = { version = "0.29", default-features = false, features = ["signal", "sched"] }
+libc = "0.2"
+signal-hook = "0.3"
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.29", default-features = false, features = ["signal", "sched"] }
 
 [package.metadata.deb]
 maintainer = "Vladislav Ananyev <nexus.riot@gmail.com>"
 copyright = "2025, Vladislav Ananyev"
 license-file = ["LICENSE", "0"]
 extended-description = """\
-crabmon is a PoC Rust TUI system monitor: per-core CPU charts, \
-process table, network rates, and disk usage.
+crabmon is a Rust TUI system monitor: per-core CPU history, a process table \
+with tree view, grouping by systemd unit or container, per-process disk IO and \
+open sockets, renice/affinity/signal control in bulk, network and disk \
+throughput charts, temperature sensors, GPU, cgroup, pressure-stall and \
+battery panels, threshold alerts, JSON/CSV snapshot export, session recording \
+and replay, a Prometheus exporter and remote monitoring over SSH.
 """
 assets = [
-  ["target/release/crabmon", "/usr/bin/", "755"]
+  ["target/release/crabmon", "/usr/bin/", "755"],
+  ["docs/crabmon.1", "/usr/share/man/man1/", "644"],
+  ["completions/crabmon.bash", "/usr/share/bash-completion/completions/crabmon", "644"],
+  ["completions/crabmon.zsh", "/usr/share/zsh/vendor-completions/_crabmon", "644"],
+  ["completions/crabmon.fish", "/usr/share/fish/vendor_completions.d/crabmon.fish", "644"],
+  ["README.md", "/usr/share/doc/crabmon/README.md", "644"],
+  ["CHANGELOG.md", "/usr/share/doc/crabmon/changelog", "644"]
 ]
 section = "utils"
 priority = "optional"
-
-

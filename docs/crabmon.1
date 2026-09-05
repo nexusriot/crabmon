@@ -1,0 +1,368 @@
+.TH CRABMON 1 "2026-09-05" "crabmon 0.4.0" "User Commands"
+.SH NAME
+crabmon \- terminal system monitor
+.SH SYNOPSIS
+.B crabmon
+.RI [ OPTIONS ]
+.SH DESCRIPTION
+.B crabmon
+is a keyboard-driven terminal system monitor. It shows per-core CPU history,
+memory and swap, a sortable and filterable process table with an optional tree
+view and per-process disk IO, network throughput, per-mount disk usage and IO,
+temperature sensors, GPU utilisation and cgroup limits.
+.PP
+With
+.B \-\-once
+it prints a single snapshot as JSON or CSV and exits, which makes it usable
+from scripts and monitoring pipelines.
+.SH OPTIONS
+.TP
+.BR \-r ", " \-\-refresh " " \fIMS\fR
+Refresh interval in milliseconds (200\-10000). Values below 200 ms are clamped:
+the underlying sampler needs at least that long between CPU samples for the
+percentages to mean anything.
+.TP
+.BR \-s ", " \-\-sort " " \fIKEY\fR
+Initial sort column: \fBpid\fR, \fBname\fR, \fBcpu\fR, \fBmem\fR, \fBvirt\fR,
+\fBdisk\fR, \fBtime\fR, \fBuser\fR, \fBstate\fR or \fBthreads\fR.
+.TP
+.BR \-a ", " \-\-ascending
+Sort ascending. The default is descending.
+.TP
+.BR \-f ", " \-\-filter " " \fIQUERY\fR
+Initial process filter. See \fBFILTER LANGUAGE\fR.
+.TP
+.BR \-t ", " \-\-tree
+Start in process-tree view.
+.TP
+.BR \-l ", " \-\-layout " " \fINAME\fR
+Initial layout: \fBdashboard\fR, \fBprocesses\fR, \fBcpu\fR or \fBio\fR.
+.TP
+.B \-\-theme " " \fINAME\fR
+Colour theme: \fBdefault\fR, \fBmono\fR, \fBnord\fR, \fBsolarized\fR or
+\fBgruvbox\fR.
+.TP
+.B \-\-no\-color
+Disable colour. Equivalent to \fB\-\-theme mono\fR.
+.TP
+.B \-\-no\-mouse
+Do not capture mouse events.
+.TP
+.BR \-1 ", " \-\-once
+Print one snapshot to standard output and exit instead of starting the TUI.
+.TP
+.B \-\-format " " \fIFMT\fR
+Output format for \fB\-\-once\fR: \fBjson\fR (default) or \fBcsv\fR.
+.TP
+.BR \-n ", " \-\-top " " \fIN\fR
+Limit \fB\-\-once\fR and \fBP\fR snapshot output to the top \fIN\fR processes.
+.TP
+.BR \-c ", " \-\-config " " \fIPATH\fR
+Use an alternate config file.
+.TP
+.BR \-g ", " \-\-group " " \fIBY\fR
+Aggregate the process table: \fBnone\fR, \fBservice\fR, \fBcontainer\fR or
+\fBuser\fR.
+.TP
+.B \-\-record " " \fIPATH\fR
+Append every sample to a JSON Lines recording. See \fBRECORDINGS\fR.
+.TP
+.B \-\-replay " " \fIPATH\fR
+Drive the interface from a recording instead of sampling this host.
+.TP
+.B \-\-remote " " \fITARGET\fR
+Monitor \fITARGET\fR over SSH. crabmon must be installed on the far end and
+SSH must work non-interactively; the refresh rate is bounded by the round trip.
+.TP
+.B \-\-remote\-command " " \fICMD\fR
+Command to run on the remote host. Defaults to
+.BR "crabmon \-\-once \-\-refresh 200" .
+.TP
+.B \-\-serve " " \fIADDR\fR
+Run headless and serve Prometheus metrics on \fIADDR\fR, e.g. \fB:9100\fR.
+Routes: \fB/metrics\fR, \fB/healthz\fR.
+.TP
+.BR \-h ", " \-\-help
+Print usage and exit.
+.TP
+.BR \-V ", " \-\-version
+Print the version and exit.
+.SH KEYS
+.TP
+.B q, Ctrl\-C
+Quit.
+.TP
+.B Up/Down, k/j, PgUp/PgDn, Home/End
+Move the selection.
+.TP
+.B Enter
+Open the process detail pane.
+.TP
+.B /
+Filter processes. \fBEsc\fR clears the filter.
+.TP
+.B c, m, p, n, d
+Sort by CPU, memory, PID, name or disk IO. Pressing the active column's key
+again reverses the order.
+.TP
+.BR < ", " > " (or " , " and " . )
+Move to the previous or next sort column.
+.TP
+.B s
+Reverse the sort order.
+.TP
+.B T
+Toggle the process tree.
+.TP
+.B H
+Show or hide individual threads.
+.TP
+.B G
+Cycle grouping: none, systemd unit, container, user.
+.TP
+.B Space
+Tag the selected process. Signals, renice and affinity then apply to every
+tagged process instead of just the cursor.
+.TP
+.B U
+Untag everything.
+.TP
+.B z
+Pause and resume sampling.
+.TP
+.BR [ ", " ]
+Step a recording back or forward one frame;
+.BR { " and " }
+step ten.
+.TP
+.B 1-9
+Apply the correspondingly numbered saved filter;
+.B 0
+clears the filter.
+.TP
+.B y
+Copy the selected process's command line to the system clipboard using OSC 52,
+which works through SSH and tmux.
+.TP
+.B L
+Show the local log of actions crabmon has taken. On Linux the sampler reports every task, so
+threads are hidden by default and the list shows processes only.
+.TP
+.B Tab, Shift\-Tab
+Cycle layouts.
+.TP
+.B v
+Include or exclude virtual interfaces (loopback, bridges, veth, VPN tunnels)
+from the aggregate network rate.
+.TP
+.B g
+Group or expand temperature sensors.
+.TP
+.BR + ", " \- " (or " = " and " _ )
+Refresh faster or slower.
+.TP
+.B t
+Signal menu for the selected process (Unix). A confirmation prompt follows.
+.TP
+.B r
+Change the selected process's nice value (Unix).
+.TP
+.B A
+Set the selected process's CPU affinity (Linux).
+.TP
+.B P
+Write a snapshot to the export directory.
+.TP
+.B !
+Show the alert rules and their state.
+.TP
+.BR ? " (or " F1 )
+Show all key bindings.
+.SH FILTER LANGUAGE
+Terms are separated by whitespace and combined with AND. A leading \fB!\fR
+negates a term.
+.PP
+.nf
+firefox            name contains "firefox"
+!kworker           name does not contain "kworker"
+user:vlad          user name contains "vlad"
+pid:1234           exact PID
+ppid:1             exact parent PID
+state:R            process state letter
+cmd:\-\-headless     substring of the full command line
+re:^chrom(e|ium)$  regular expression over the process name
+cpu>5              CPU percentage comparison (> >= < <= =)
+mem>100M           resident memory comparison, with K/M/G/T suffixes
+io>1M              disk IO rate comparison
+.fi
+.SH CONFIGURATION
+Settings live in
+.I $XDG_CONFIG_HOME/crabmon/config.toml
+(usually
+.IR ~/.config/crabmon/config.toml ).
+The file is written when the refresh interval changes and on exit. Missing or
+malformed files fall back to defaults; out-of-range values are clamped rather
+than rejected.
+.SS Top-level keys
+.TP
+.B refresh_ms
+Refresh interval in milliseconds, clamped to 200\-10000. Default 800.
+.TP
+.B sort_by
+Sort column: \fBpid\fR, \fBname\fR, \fBcpu\fR, \fBmem\fR, \fBvirt\fR,
+\fBdisk\fR, \fBtime\fR, \fBuser\fR, \fBstate\fR, \fBthreads\fR. Default
+\fBcpu\fR.
+.TP
+.B sort_desc
+Sort descending. Default true.
+.TP
+.B filter
+Initial filter query. Default empty.
+.TP
+.B tree
+Start in process-tree view. Default false.
+.TP
+.B show_threads
+List individual threads alongside processes. Default false: on Linux the
+sampler reports every task, which is several times more rows than processes.
+.TP
+.B group_by
+Aggregate the process table: \fBnone\fR, \fBservice\fR, \fBcontainer\fR or
+\fBuser\fR. Default \fBnone\fR.
+.TP
+.B layout
+\fBdashboard\fR, \fBprocesses\fR, \fBcpu\fR or \fBio\fR. Default
+\fBdashboard\fR.
+.TP
+.B theme
+\fBdefault\fR, \fBmono\fR, \fBnord\fR, \fBsolarized\fR or \fBgruvbox\fR.
+.TP
+.B group_sensors
+Collapse temperature sensors to one row per driver. Default true.
+.TP
+.B show_virtual_ifaces
+Count loopback, bridges, veth pairs and tunnels in the aggregate network rate.
+Default false, so VPN traffic is not counted twice.
+.TP
+.B virtual_iface_prefixes
+Interface-name prefixes treated as virtual. Defaults to \fBlo\fR, \fBdocker\fR,
+\fBbr\-\fR, \fBveth\fR, \fBvirbr\fR, \fBtun\fR, \fBtap\fR, \fBwg\fR,
+\fBvmnet\fR, \fBzt\fR, \fBcni\fR, \fBflannel\fR, \fBkube\fR and \fButun\fR.
+.TP
+.B history_len
+Samples kept per chart, clamped to 16\-4096. Default 240.
+.TP
+.B panel_order
+Draw order of the right-hand column. Default
+.BR net ", " sensors ", " disks ", " gpu ", " cgroup .
+.SS [thresholds]
+.B warn
+and
+.B crit
+are the 0..1 ratios at which gauges turn yellow and red (0.7 and 0.9).
+.B temp_warn
+and
+.B temp_crit
+are the same, as a fraction of each sensor's critical temperature (0.75 and
+0.9).
+.SS [panels]
+.BR header ", " cpu ", " mem ", " procs ", " net ", " sensors ", " disks ", "
+.BR gpu ", " cgroup ", " psi " and " power
+each switch a panel off when set to false. All default to true. The
+.BR psi ", " power ", " gpu " and " cgroup
+panels are additionally hidden when the machine has nothing to report.
+.SS [gpu]
+.B enabled
+draws the GPU panel.
+.B nvidia_smi
+additionally shells out to \fBnvidia\-smi\fR on every refresh; off by default
+because it costs tens of milliseconds.
+.SS [export]
+.B dir
+is where \fBP\fR writes snapshots (empty means the working directory),
+.B format
+is \fBjson\fR or \fBcsv\fR, and
+.B top_n
+limits the process list (0 keeps every process).
+.SS [record]
+.B top_n
+processes are kept per frame, busiest first, and real processes are preferred
+over threads (default 100; 0 keeps everything, at roughly 1.5 MB a frame).
+.B max_cmd_len
+truncates command lines (default 200) and
+.B omit_paths
+drops them, along with executable paths and working directories, entirely.
+.SS [serve]
+.B top_procs
+per-process series are exported by \fB\-\-serve\fR (default 20; 0 disables
+them).
+.SS [audit]
+.B enabled
+records every signal, renice and affinity change; \fBpath\fR overrides the
+default location under the platform state directory.
+.SS [[filter_preset]]
+Each table binds a
+.B name
+and a
+.B query
+to the next number key, in order. \fB$USER\fR is expanded. At most nine are
+used, since there are only nine number keys.
+.SS [colors]
+Overrides individual theme colours by name:
+.BR ok ", " warn ", " crit ", " accent ", " border ", " title ", " text ", "
+.BR dim ", " sel_fg ", " sel_bg .
+Values may be colour names (\fBred\fR), hex (\fB#ff8800\fR) or 256-colour
+indexes (\fB33\fR). Unknown keys and unparseable values are ignored.
+.SS [[alert]]
+Each table defines one rule:
+.IR name ", " kind " (" cpu ", " mem ", " swap ", " load ", " disk ", " temp ", "
+.IR gpu "), " threshold ", " for_secs ", " target " and " command .
+A rule fires only once its condition has held for \fIfor_secs\fR seconds, and
+its \fIcommand\fR runs once per activation.
+.I target
+restricts disk rules to a mount point, temperature rules to a sensor prefix and
+GPU rules to a device name.
+.SH RECORDINGS
+.B \-\-record
+writes one JSON object per sample, so a recording is greppable with
+.BR jq (1)
+and replayable with
+.BR "crabmon \-\-replay" .
+Frames are trimmed by \fB[record]\fR — by default the busiest 100 processes
+with command lines truncated to 200 characters, roughly 55 KiB per frame, or
+about 240 MiB for an hour at the default interval.
+.PP
+While replaying, sampling is paused: \fB[\fR and \fB]\fR step one frame,
+\fB{\fR and \fB}\fR step ten, and \fBz\fR plays on. Every panel renders
+from the recording exactly as it would from the live host.
+.SH PLATFORM NOTES
+Sending signals and renice are Unix-only. CPU affinity, GPU statistics
+(\fI/sys/class/drm\fR), cgroup limits, process grouping, open-socket lookup and
+pressure stall information are Linux-only; those panels are simply absent
+elsewhere. Pressure needs Linux 4.20+ with \fBCONFIG_PSI=y\fR.
+.PP
+Per-disk IO comes from \fI/proc/diskstats\fR on Linux and from
+.BR iostat (8)
+on FreeBSD. The FreeBSD path is compile-checked and unit-tested against captured
+output but has not been exercised on real hardware.
+.PP
+Battery and mains state need no privileges. CPU package power comes from RAPL,
+whose counters are root-only on most kernels since CVE-2020-8694; the figure is
+omitted rather than guessed when they cannot be read. Per-process disk IO
+requires permission to read \fI/proc/<pid>/io\fR, so figures for other users'
+processes read as zero unless crabmon runs as root.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 2
+Invalid command line.
+.SH FILES
+.TP
+.I ~/.config/crabmon/config.toml
+Configuration.
+.SH SEE ALSO
+.BR htop (1),
+.BR top (1),
+.BR iostat (1)
