@@ -222,6 +222,7 @@ fn a_firing_alert_takes_over_the_status_line() {
         for_secs: 0,
         target: "/boot".into(),
         command: String::new(),
+        command_clear: String::new(),
     }];
     let mut a = crabmon::App::new(cfg, Box::new(FakeSource::single(snapshot())));
     a.tick();
@@ -489,4 +490,114 @@ fn an_unreachable_remote_host_explains_the_empty_dashboard() {
     let s = screen(&mut a, 140, 30);
     assert!(s.contains("UNREACHABLE"), "{s}");
     assert!(s.contains("build01"), "{s}");
+}
+
+#[test]
+fn a_pinned_row_is_marked_and_hoisted_to_the_top() {
+    let mut app = common::app();
+    app.cfg.layout = crabmon::ui::Layout::Processes;
+    screen(&mut app, 120, 24);
+    app.select(app.index_of_pid(1).expect("systemd"));
+    app.on_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('f'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    let screen = screen(&mut app, 120, 24);
+    // The marker column means a pinned row is recognisable in the mono theme
+    // too, where the only other cue would be a colour it does not paint.
+    assert!(screen.contains('▸'), "no pin marker on screen:\n{screen}");
+    let first_row = screen.lines().find(|l| l.contains("systemd")).expect("systemd row");
+    assert!(first_row.contains('▸'), "{first_row}");
+}
+
+#[test]
+fn a_tagged_row_is_marked_without_relying_on_colour() {
+    let mut app = common::app();
+    app.cfg.layout = crabmon::ui::Layout::Processes;
+    // Draw once so the table has told `App` its real page size; otherwise
+    // tagging scrolls the row being tested off the top.
+    screen(&mut app, 120, 24);
+    app.on_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char(' '),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    let screen = screen(&mut app, 120, 24);
+    assert!(screen.contains('•'), "no tag marker on screen:\n{screen}");
+}
+
+#[test]
+fn the_grouped_view_shows_a_cursor_and_a_position() {
+    let mut app = common::app();
+    app.cfg.group_by = crabmon::metrics::GroupBy::Service;
+    let screen = screen(&mut app, 120, 10);
+    assert!(screen.contains("By service"), "{screen}");
+    assert!(screen.contains("GROUP"), "{screen}");
+    // The aggregate table now has a real selection, so something is highlighted.
+    assert!(app.groups().len() > 1);
+}
+
+#[test]
+fn a_truncated_popup_says_there_is_more_of_it() {
+    // Silently dropping the rows past the bottom made a half-shown key list
+    // look like the whole key list.
+    let mut app = common::app();
+    app.mode = crabmon::Mode::Help;
+    let screen = screen(&mut app, 100, 16);
+    let total = crabmon::ui::popups::KEYS.len();
+    assert!(screen.contains(&format!("of {total}")), "the help popup hides its length:\n{screen}");
+    assert!(screen.contains("scroll"), "{screen}");
+}
+
+#[test]
+fn the_detail_pane_lists_listening_ports_and_socket_count() {
+    let mut app = common::app();
+    app.mode = crabmon::Mode::Detail;
+    app.detail_sockets = vec![crabmon::metrics::sockets::Socket {
+        protocol: "tcp".into(),
+        local: "0.0.0.0:8080".into(),
+        remote: "0.0.0.0:0".into(),
+        state: "LISTEN".into(),
+    }];
+    let screen = screen(&mut app, 120, 30);
+    assert!(screen.contains("Listening"), "{screen}");
+    assert!(screen.contains("8080"), "{screen}");
+}
+
+#[test]
+fn a_stalled_sampler_says_so_rather_than_looking_frozen() {
+    struct Stuck(crabmon::Snapshot);
+    impl crabmon::MetricSource for Stuck {
+        fn snapshot(&mut self, _dt: std::time::Duration) -> crabmon::Snapshot {
+            self.0.clone()
+        }
+        fn frame_id(&self) -> Option<u64> {
+            Some(3)
+        }
+    }
+    let mut app = crabmon::App::new(common::config(), Box::new(Stuck(common::snapshot())));
+    app.tick();
+    assert!(screen(&mut app, 100, 20).contains("sampling"));
+}
+
+#[test]
+fn the_sampling_notice_never_buries_the_source_label() {
+    // A remote host that only said "sampling…" would be exactly the
+    // unexplained blank dashboard the UNREACHABLE banner exists to prevent.
+    struct Unreachable(crabmon::Snapshot);
+    impl crabmon::MetricSource for Unreachable {
+        fn snapshot(&mut self, _dt: std::time::Duration) -> crabmon::Snapshot {
+            self.0.clone()
+        }
+        fn frame_id(&self) -> Option<u64> {
+            Some(3)
+        }
+        fn label(&self) -> Option<String> {
+            Some("remote build-server UNREACHABLE - no route to host".into())
+        }
+    }
+    let mut app = crabmon::App::new(common::config(), Box::new(Unreachable(common::snapshot())));
+    app.tick();
+    let screen = screen(&mut app, 160, 20);
+    assert!(screen.contains("UNREACHABLE"), "{screen}");
+    assert!(screen.contains("sampling"), "{screen}");
 }

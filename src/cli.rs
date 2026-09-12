@@ -9,10 +9,11 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Every long flag the parser accepts. The docs tests check this against the
 /// README, the man page and the shell completions.
-pub const LONG_FLAGS: [&str; 22] = [
+pub const LONG_FLAGS: [&str; 28] = [
     "--refresh",
     "--sort",
     "--ascending",
+    "--descending",
     "--filter",
     "--tree",
     "--layout",
@@ -29,6 +30,11 @@ pub const LONG_FLAGS: [&str; 22] = [
     "--remote",
     "--remote-command",
     "--serve",
+    "--stream",
+    "--diff",
+    "--watch",
+    "--watch-for",
+    "--watch-timeout",
     "--help",
     "--version",
     "--no-colour",
@@ -50,12 +56,23 @@ pub struct Args {
     pub format: Option<ExportFormat>,
     pub top: Option<usize>,
     pub config: Option<String>,
-    /// Append every sampled snapshot to this file.
+    /// Record every sampled snapshot to this file, replacing any file there.
     pub record: Option<String>,
     /// Drive the UI from a recording instead of the live host.
     pub replay: Option<String>,
     /// Serve Prometheus metrics on this address, headless.
     pub serve: Option<String>,
+    /// Write one JSON snapshot per line forever. What `--remote` runs on the
+    /// far end, and usable on its own as a poor man's collector.
+    pub stream: bool,
+    /// Compare two snapshots, or the ends of one recording.
+    pub diff: Option<(String, Option<String>)>,
+    /// Headless: watch for processes matching this query.
+    pub watch: Option<String>,
+    /// How long the watch condition must hold before it counts.
+    pub watch_for: Option<u64>,
+    /// Give up waiting after this many seconds. 0 waits forever.
+    pub watch_timeout: Option<u64>,
     /// Monitor another host over SSH.
     pub remote: Option<String>,
     /// Command run on the far end of `--remote`.
@@ -79,8 +96,9 @@ USAGE:
 
 OPTIONS:
     -r, --refresh <MS>       Refresh interval, {min}-{max} ms
-    -s, --sort <KEY>         pid|name|cpu|mem|virt|disk|time|user|state|threads
-    -a, --ascending          Sort ascending (default: descending)
+    -s, --sort <KEY>         pid|name|cpu|mem|virt|disk|time|user|state|threads|nice
+    -a, --ascending          Sort ascending
+    -d, --descending         Sort descending (the default)
     -f, --filter <QUERY>     Initial process filter, e.g. 'user:root cpu>5'
     -t, --tree               Start in process-tree view
     -l, --layout <NAME>      dashboard|processes|cpu|io
@@ -92,11 +110,16 @@ OPTIONS:
     -n, --top <N>            Limit --once output to the top N processes
     -c, --config <PATH>      Use an alternate config file
     -g, --group <BY>         Group processes: none|service|container|user
-        --record <PATH>      Append every sample to a JSONL recording
+        --record <PATH>      Record every sample to a JSONL file (replaces it)
         --replay <PATH>      Replay a recording instead of sampling this host
         --remote <TARGET>    Monitor TARGET over SSH (needs crabmon installed there)
         --remote-command <C> Command to run on the remote host
         --serve <ADDR>       Serve Prometheus metrics on ADDR, e.g. :9100
+        --stream             Print a JSON snapshot per line forever
+        --diff <A> [B]       Compare two snapshots, or one recording end to end
+        --watch <QUERY>      Wait for processes matching QUERY, then exit 1
+        --watch-for <SECS>   ...only if the match holds this long
+        --watch-timeout <S>  ...and give up after this long (0 waits forever)
     -h, --help               Show this help
     -V, --version            Show version
 
@@ -108,7 +131,8 @@ KEYS (in the TUI, press ? for the full list):
     Tab          cycle layout         +/-    refresh faster/slower
     t            signal menu          r      renice      A    CPU affinity
     Space        tag for bulk action  G      group by    z    pause
-    [ ]          scrub a recording    y      copy cmd    L    action log
+    f/F          pin / unpin all      [ ]    scrub a recording
+    y            copy cmd             L      action log
     P            export snapshot      ?      help
 ",
         min = crate::MIN_REFRESH_MS,
@@ -160,6 +184,7 @@ where
                 out.sort = Some(SortBy::parse(&v).ok_or_else(|| format!("unknown sort key: {v}"))?);
             }
             "-a" | "--ascending" => out.sort_desc = Some(false),
+            "-d" | "--descending" => out.sort_desc = Some(true),
             "-f" | "--filter" => out.filter = Some(take_value(&mut i, &args, inline, &flag)?),
             "-t" | "--tree" => out.tree = Some(true),
             "-l" | "--layout" => {
@@ -200,6 +225,26 @@ where
                 out.remote_command = Some(take_value(&mut i, &args, inline, &flag)?)
             }
             "--serve" => out.serve = Some(take_value(&mut i, &args, inline, &flag)?),
+            "--stream" => out.stream = true,
+            "--diff" => {
+                let a = take_value(&mut i, &args, inline, &flag)?;
+                // A second path may follow; one on its own means "this
+                // recording's first frame against its last".
+                let b = args.get(i + 1).filter(|v| !v.starts_with('-')).cloned();
+                if b.is_some() {
+                    i += 1;
+                }
+                out.diff = Some((a, b));
+            }
+            "--watch" => out.watch = Some(take_value(&mut i, &args, inline, &flag)?),
+            "--watch-for" => {
+                let v = take_value(&mut i, &args, inline, &flag)?;
+                out.watch_for = Some(v.parse().map_err(|_| format!("bad duration: {v}"))?);
+            }
+            "--watch-timeout" => {
+                let v = take_value(&mut i, &args, inline, &flag)?;
+                out.watch_timeout = Some(v.parse().map_err(|_| format!("bad duration: {v}"))?);
+            }
             other => return Err(format!("unknown option: {other}\nTry 'crabmon --help'.")),
         }
         i += 1;
@@ -215,6 +260,28 @@ where
     }
     if out.replay.is_some() && out.record.is_some() {
         return Err("--record and --replay cannot be combined".into());
+    }
+    // The headless modes all sample this host. Accepting `--remote` alongside
+    // them used to print the *local* machine's snapshot with exit 0, which is a
+    // worse failure than refusing: a script gets plausible data about the wrong
+    // host and never finds out.
+    for (name, on) in
+        [("--once", out.once), ("--serve", out.serve.is_some()), ("--stream", out.stream)]
+    {
+        if !on {
+            continue;
+        }
+        if out.remote.is_some() {
+            return Err(format!("{name} samples this host; it cannot be combined with --remote"));
+        }
+        if out.replay.is_some() {
+            return Err(format!("{name} samples this host; it cannot be combined with --replay"));
+        }
+    }
+    let headless =
+        [out.once, out.serve.is_some(), out.stream, out.watch.is_some(), out.diff.is_some()];
+    if headless.iter().filter(|s| **s).count() > 1 {
+        return Err("--once, --serve, --stream, --watch and --diff are mutually exclusive".into());
     }
     Ok(Parsed::Run(Box::new(out)))
 }

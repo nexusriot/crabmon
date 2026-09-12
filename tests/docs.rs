@@ -209,14 +209,45 @@ fn the_readme_and_man_page_agree_on_the_filter_language() {
 }
 
 #[test]
-fn every_sort_key_is_documented_in_both_places() {
+fn every_sort_key_is_documented_where_the_option_is_described() {
+    // Scoped to the rows that describe `--sort` and `sort_by`, the way the
+    // `--group` check is. Searching the whole file let `nice` go undocumented
+    // in four places at once, because the word appears in "renice".
     let readme = read("README.md");
     let man = read("docs/crabmon.1");
+
+    let readme_row = readme
+        .lines()
+        .find(|l| l.contains("`--sort <KEY>`"))
+        .expect("the README options table should describe --sort");
+    let readme_cfg = readme
+        .lines()
+        .find(|l| l.trim_start().starts_with("sort_by ="))
+        .expect("the README config block should describe sort_by");
+    let man_flag = section_after(&man, "\\-\\-sort", 260);
+    let man_cfg = section_after(&man, "\n.B sort_by", 220);
+
     for key in crabmon::sort::ALL_SORTS {
         let k = key.key_name();
-        assert!(readme.contains(k), "README omits sort key {k}");
-        assert!(man.contains(k), "man page omits sort key {k}");
+        assert!(readme_row.contains(k), "the README's --sort row omits {k}");
+        assert!(readme_cfg.contains(k), "the README's sort_by comment omits {k}");
+        assert!(man_flag.contains(k), "the man page's --sort entry omits {k}");
+        assert!(man_cfg.contains(k), "the man page's sort_by entry omits {k}");
     }
+
+    // The help text is a fourth place the same list is written out.
+    let help = crabmon::cli::help_text();
+    let help_row = help.lines().find(|l| l.contains("--sort")).expect("--sort in the help");
+    for key in crabmon::sort::ALL_SORTS {
+        assert!(help_row.contains(key.key_name()), "--help omits sort key {}", key.key_name());
+    }
+}
+
+/// `len` bytes of `text` starting at `needle`, for scoping a check to one
+/// man-page entry rather than the whole document.
+fn section_after(text: &str, needle: &str, len: usize) -> String {
+    let i = text.find(needle).unwrap_or_else(|| panic!("{needle} is missing"));
+    text[i..(i + len).min(text.len())].to_string()
 }
 
 #[test]
@@ -515,15 +546,32 @@ fn the_changelog_accounts_for_every_released_version() {
     assert!(versions.contains(&"0.2.2"), "the released 0.2.2 entry was dropped");
 }
 
+/// Every flag arrived in some release, so every flag should appear somewhere in
+/// the changelog. Derived from the parser rather than a hand-written list,
+/// which is what used to go stale at each version bump.
 #[test]
-fn the_changelog_documents_the_features_this_version_added() {
+fn the_changelog_accounts_for_every_flag_the_parser_accepts() {
+    let text = read("CHANGELOG.md");
+    for flag in long_flags() {
+        // `--help` and `--version` are not features anyone announces.
+        if matches!(flag, "--help" | "--version") {
+            continue;
+        }
+        assert!(text.contains(flag), "no changelog entry ever mentions {flag}");
+    }
+}
+
+#[test]
+fn the_newest_changelog_entry_describes_this_version() {
     let text = read("CHANGELOG.md");
     // Element 0 is the file preamble; element 1 is the newest release section.
     let latest = text.split("\n## ").nth(1).expect("a release section");
-    for feature in ["--record", "--replay", "--serve", "--remote", "pressure", "attery"] {
-        assert!(
-            latest.to_lowercase().contains(&feature.to_lowercase()),
-            "the newest changelog entry never mentions {feature}"
-        );
-    }
+    assert!(
+        latest.starts_with(env!("CARGO_PKG_VERSION")),
+        "the newest section is not this version"
+    );
+    assert!(
+        latest.lines().filter(|l| l.trim_start().starts_with("- ")).count() >= 3,
+        "a release with no entries is not a release note"
+    );
 }

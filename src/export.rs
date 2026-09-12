@@ -60,13 +60,39 @@ fn csv_field(s: &str) -> String {
     }
 }
 
+/// Column order of the CSV export. Every `ProcRow` field the JSON carries is
+/// here too: a CSV that silently drops the cgroup, nice and path columns sends
+/// people back to the JSON for exactly the questions CSV is good at.
+pub const CSV_COLUMNS: [&str; 20] = [
+    "pid",
+    "ppid",
+    "name",
+    "cpu_percent",
+    "mem_bytes",
+    "virt_bytes",
+    "state",
+    "user",
+    "uid",
+    "nice",
+    "run_time_secs",
+    "start_time_unix",
+    "threads",
+    "read_bps",
+    "write_bps",
+    "service",
+    "container",
+    "exe",
+    "cwd",
+    "cmd",
+];
+
 pub fn procs_to_csv(procs: &[ProcRow]) -> String {
-    let mut out = String::from(
-        "pid,ppid,name,cpu_percent,mem_bytes,virt_bytes,state,user,run_time_secs,threads,read_bps,write_bps,cmd\n",
-    );
+    let mut out = CSV_COLUMNS.join(",");
+    out.push('\n');
     for p in procs {
+        let opt = |v: &Option<String>| csv_field(v.as_deref().unwrap_or(""));
         out.push_str(&format!(
-            "{},{},{},{:.1},{},{},{},{},{},{},{:.0},{:.0},{}\n",
+            "{},{},{},{:.1},{},{},{},{},{},{},{},{},{},{:.0},{:.0},{},{},{},{},{}\n",
             p.pid,
             p.ppid.map(|v| v.to_string()).unwrap_or_default(),
             csv_field(&p.name),
@@ -74,11 +100,18 @@ pub fn procs_to_csv(procs: &[ProcRow]) -> String {
             p.mem,
             p.virt,
             p.state,
-            csv_field(p.user.as_deref().unwrap_or("")),
+            opt(&p.user),
+            p.uid.map(|v| v.to_string()).unwrap_or_default(),
+            p.nice.map(|v| v.to_string()).unwrap_or_default(),
             p.run_time,
+            p.start_time_unix,
             p.threads.map(|t| t.to_string()).unwrap_or_default(),
             p.read_bps,
             p.write_bps,
+            opt(&p.service),
+            opt(&p.container),
+            csv_field(&p.exe),
+            csv_field(&p.cwd),
             csv_field(&p.cmd),
         ));
     }
@@ -133,9 +166,32 @@ mod tests {
     fn csv_quotes_commas_quotes_and_newlines() {
         let csv = procs_to_csv(&snap().procs);
         let header = csv.lines().next().unwrap();
-        assert_eq!(header.split(',').count(), 13);
+        assert_eq!(header.split(',').count(), CSV_COLUMNS.len());
         assert!(csv.contains("\"we, \"\"ird\"\"\""), "{csv}");
         assert!(csv.contains("\"a,b\nc\""), "{csv}");
+    }
+
+    #[test]
+    fn csv_carries_the_columns_the_json_does() {
+        let p = ProcRow {
+            pid: 7,
+            uid: Some(1000),
+            nice: Some(-5),
+            service: Some("docker.service".into()),
+            container: Some("abc123def456".into()),
+            exe: "/usr/bin/dockerd".into(),
+            cwd: "/".into(),
+            start_time_unix: 1_700_000_042,
+            ..Default::default()
+        };
+        let csv = procs_to_csv(&[p]);
+        let row = csv.lines().nth(1).unwrap();
+        for expected in
+            ["1000", "-5", "docker.service", "abc123def456", "/usr/bin/dockerd", "1700000042"]
+        {
+            assert!(row.contains(expected), "{expected} missing from {row}");
+        }
+        assert_eq!(row.split(',').count(), CSV_COLUMNS.len());
     }
 
     #[test]

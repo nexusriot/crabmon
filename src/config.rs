@@ -130,6 +130,43 @@ impl Default for ServeConfig {
     }
 }
 
+/// Settings for the process table itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProcsConfig {
+    /// Explicit column order. Empty means fit as many as the terminal is wide
+    /// enough for, which is the behaviour crabmon has always had.
+    pub columns: Vec<String>,
+    /// Look up listening ports for the rows currently on screen. Off by
+    /// default: it walks one fd table per visible row.
+    pub ports: bool,
+    /// Rows to keep pinned across restarts is meaningless — PIDs are recycled —
+    /// but the marker column can be switched off.
+    pub pin_marker: bool,
+}
+
+impl Default for ProcsConfig {
+    fn default() -> Self {
+        Self { columns: Vec::new(), ports: false, pin_marker: true }
+    }
+}
+
+/// Settings for `--remote`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RemoteConfig {
+    /// Hold one SSH session open and read a stream of frames, instead of
+    /// paying a connection and a process start for every sample. Falls back
+    /// automatically when the far end is too old to understand `--stream`.
+    pub stream: bool,
+}
+
+impl Default for RemoteConfig {
+    fn default() -> Self {
+        Self { stream: true }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GpuConfig {
@@ -185,10 +222,12 @@ pub struct Config {
     /// Draw order of the right-hand column.
     pub panel_order: Vec<String>,
     pub gpu: GpuConfig,
+    pub procs: ProcsConfig,
     pub export: ExportConfig,
     pub audit: AuditConfig,
     pub serve: ServeConfig,
     pub record: RecordConfig,
+    pub remote: RemoteConfig,
     pub colors: BTreeMap<String, String>,
     /// Queries bound to the number keys, in order.
     #[serde(rename = "filter_preset")]
@@ -220,10 +259,12 @@ impl Default for Config {
                 .map(|s| s.to_string())
                 .collect(),
             gpu: GpuConfig::default(),
+            procs: ProcsConfig::default(),
             export: ExportConfig::default(),
             audit: AuditConfig::default(),
             serve: ServeConfig::default(),
             record: RecordConfig::default(),
+            remote: RemoteConfig::default(),
             colors: BTreeMap::new(),
             saved_filters: default_saved_filters(),
             alerts: crate::alerts::default_rules(),
@@ -254,6 +295,9 @@ impl Config {
         }
         // The number keys only reach nine presets; more would be unreachable.
         self.saved_filters.truncate(9);
+        // An unknown column name would otherwise render as a blank strip with
+        // no hint about the typo.
+        self.procs.columns.retain(|c| crate::ui::procs::column_by_name(c).is_some());
         self
     }
 
@@ -332,6 +376,19 @@ mod tests {
         assert_eq!(cfg.thresholds.warn, 1.0);
         assert!(cfg.thresholds.crit >= cfg.thresholds.warn);
         assert_eq!(cfg.thresholds.temp_warn, 0.0);
+    }
+
+    #[test]
+    fn unknown_column_names_are_dropped_rather_than_drawn_blank() {
+        let cfg = Config {
+            procs: ProcsConfig {
+                columns: vec!["pid".into(), "nonsense".into(), "cpu".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .sanitize();
+        assert_eq!(cfg.procs.columns, vec!["pid".to_string(), "cpu".to_string()]);
     }
 
     #[test]

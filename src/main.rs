@@ -17,8 +17,9 @@ use crabmon::cli::{self, Args, Parsed};
 use crabmon::config::{self, Config};
 use crabmon::export;
 use crabmon::metrics::{MetricSource, SysinfoSource};
-use crabmon::record::{Recorder, ReplaySource};
+use crabmon::record::{trim_frame, Recorder, ReplaySource};
 use crabmon::remote::RemoteSource;
+use crabmon::sampler::ThreadedSource;
 
 fn main() -> Result<()> {
     let args = match cli::parse(std::env::args().skip(1)) {
@@ -40,9 +41,19 @@ fn main() -> Result<()> {
     let path = config_path(&args);
     let cfg = apply_args(config::load_from(&path), &args);
 
-    // `--serve` and `--once` are headless; both need the live host.
+    // The headless modes. `cli::parse` refuses to combine any of them with
+    // `--remote` or `--replay`, so each one here samples this host.
+    if let Some((a, b)) = &args.diff {
+        return print_diff(a, b.as_deref(), &args);
+    }
     if let Some(addr) = &args.serve {
         return serve_metrics(addr, &cfg);
+    }
+    if args.stream {
+        return stream_frames(&cfg);
+    }
+    if let Some(query) = &args.watch {
+        return watch_for(query, &cfg, &args);
     }
     if args.once {
         let mut source = live_source(&cfg);
@@ -58,6 +69,10 @@ fn live_source(cfg: &Config) -> SysinfoSource {
 }
 
 /// Where snapshots come from: a recording, another host, or this one.
+///
+/// Everything but a replay is sampled on a worker thread. A replay is already
+/// instant and needs `seek`/`peek` for the scrub keys, which only make sense
+/// synchronously.
 fn build_source(cfg: &Config, args: &Args) -> Result<Box<dyn MetricSource>> {
     if let Some(path) = &args.replay {
         let source =
@@ -66,9 +81,98 @@ fn build_source(cfg: &Config, args: &Args) -> Result<Box<dyn MetricSource>> {
         return Ok(Box::new(source));
     }
     if let Some(target) = &args.remote {
-        return Ok(Box::new(RemoteSource::new(target, args.remote_command.clone(), Vec::new())));
+        let remote = match (&args.remote_command, cfg.remote.stream) {
+            (Some(_), _) => RemoteSource::new(target, args.remote_command.clone(), Vec::new()),
+            (None, true) => RemoteSource::streaming(target, cfg.refresh_ms, Vec::new()),
+            (None, false) => RemoteSource::new(target, None, Vec::new()),
+        };
+        return Ok(Box::new(ThreadedSource::new(Box::new(remote))));
     }
-    Ok(Box::new(live_source(cfg)))
+    Ok(Box::new(ThreadedSource::new(Box::new(live_source(cfg)))))
+}
+
+/// `--stream`: one JSON snapshot per line, forever. This is what a streaming
+/// `--remote` runs on the far end, so frames are trimmed the same way a
+/// recording is — a full process list every second over SSH is unusable.
+fn stream_frames(cfg: &Config) -> Result<()> {
+    let mut source = live_source(cfg);
+    let interval = Duration::from_millis(cfg.refresh_ms);
+    source.snapshot(Duration::ZERO);
+    let mut out = io::stdout().lock();
+    loop {
+        std::thread::sleep(interval);
+        let snap = source.snapshot(interval);
+        let frame =
+            trim_frame(&snap, cfg.record.top_n, cfg.record.omit_paths, cfg.record.max_cmd_len);
+        let line = serde_json::to_string(&frame)?;
+        // A broken pipe means the reader went away; that is a normal exit here,
+        // not a crash to report.
+        if out.write_all(line.as_bytes()).is_err() || out.write_all(b"\n").is_err() {
+            return Ok(());
+        }
+        if out.flush().is_err() {
+            return Ok(());
+        }
+    }
+}
+
+/// `--diff`: compare two snapshots, or the two ends of one recording.
+fn print_diff(a: &str, b: Option<&str>, args: &Args) -> Result<()> {
+    let (before, after) = match b {
+        Some(b) => (
+            crabmon::diff::load(std::path::Path::new(a)).map_err(|e| anyhow::anyhow!("{e}"))?,
+            crabmon::diff::load(std::path::Path::new(b)).map_err(|e| anyhow::anyhow!("{e}"))?,
+        ),
+        // One path: the file's own first frame against its last.
+        None => {
+            crabmon::diff::load_ends(std::path::Path::new(a)).map_err(|e| anyhow::anyhow!("{e}"))?
+        }
+    };
+    let diff = crabmon::diff::compare(&before, &after);
+    let text = match args.format {
+        Some(export::ExportFormat::Json) => diff.to_json(),
+        _ => diff.to_text(),
+    };
+    print!("{text}");
+    io::stdout().flush()?;
+    Ok(())
+}
+
+/// `--watch`: block until processes match, then print them and exit non-zero.
+fn watch_for(query: &str, cfg: &Config, args: &Args) -> Result<()> {
+    let filter = crabmon::filter::parse(query).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let hold = args.watch_for.unwrap_or(0);
+    let timeout = args.watch_timeout.unwrap_or(0);
+    let interval = Duration::from_millis(cfg.refresh_ms.max(crabmon::MIN_REFRESH_MS));
+
+    let mut source = live_source(cfg);
+    source.snapshot(Duration::ZERO);
+    let started = Instant::now();
+    let mut holding = crabmon::watch::Holding::default();
+
+    let outcome = loop {
+        std::thread::sleep(interval);
+        let snap = source.snapshot(interval);
+        let now = Instant::now();
+        if let Some(rows) = holding.observe(&snap, &filter, hold, now) {
+            break crabmon::watch::Outcome::Matched(rows);
+        }
+        if crabmon::watch::timed_out(started, timeout, now) {
+            break crabmon::watch::Outcome::TimedOut;
+        }
+    };
+
+    if let crabmon::watch::Outcome::Matched(rows) = &outcome {
+        let format = args
+            .format
+            .or_else(|| export::ExportFormat::parse(&cfg.export.format))
+            .unwrap_or(export::ExportFormat::Json);
+        let snap = crabmon::Snapshot { procs: rows.clone(), ..Default::default() };
+        let mut out = io::stdout().lock();
+        out.write_all(export::render(&snap, format).as_bytes())?;
+        out.flush()?;
+    }
+    std::process::exit(outcome.exit_code());
 }
 
 /// Headless Prometheus exporter.
@@ -79,7 +183,9 @@ fn serve_metrics(addr: &str, cfg: &Config) -> Result<()> {
     source.snapshot(Duration::ZERO);
     std::thread::sleep(interval);
     let top = cfg.serve.top_procs;
-    crabmon::serve::serve(addr, top, move || source.snapshot(interval))?;
+    // `serve` measures the gap between scrapes and hands it over; the rates are
+    // deltas over that interval, not over the configured refresh.
+    crabmon::serve::serve(addr, top, move |elapsed| source.snapshot(elapsed))?;
     Ok(())
 }
 

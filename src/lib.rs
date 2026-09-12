@@ -10,6 +10,7 @@ pub mod audit;
 pub mod cli;
 pub mod clipboard;
 pub mod config;
+pub mod diff;
 pub mod export;
 pub mod filter;
 pub mod format;
@@ -17,11 +18,13 @@ pub mod history;
 pub mod metrics;
 pub mod record;
 pub mod remote;
+pub mod sampler;
 pub mod serve;
 pub mod sort;
 pub mod theme;
 pub mod tree;
 pub mod ui;
+pub mod watch;
 
 /// sysinfo needs 200 ms between CPU samples for the numbers to mean anything.
 pub const MIN_REFRESH_MS: u64 = 200;

@@ -34,6 +34,9 @@ src/
   app.rs             all state and input handling
   record.rs          JSONL recording and the replay source
   remote.rs          monitoring another host over SSH
+  sampler.rs         sampling on a worker thread
+  diff.rs            comparing two snapshots
+  watch.rs           the headless wait-for-a-condition mode
   serve.rs           the Prometheus exporter
   audit.rs           the local log of actions taken
   clipboard.rs       OSC 52 copy
@@ -76,6 +79,7 @@ pub trait MetricSource {
     fn seek(&mut self, _position: usize) {}
     fn peek(&self) -> Option<Snapshot> { None }
     fn label(&self) -> Option<String> { None }
+    fn frame_id(&self) -> Option<u64> { None }
 }
 ```
 
@@ -85,11 +89,13 @@ against canned frames. That last one is what lets `tests/render.rs` assert on a
 real rendered screen and `tests/app_behaviour.rs` drive the full interaction
 model with no terminal, no `/proc`, and no timing flakiness.
 
-The four defaulted methods exist for finite sources. `timeline` and `seek` make
-the scrub keys work; `peek` reads the current frame *without* advancing, which
-matters because calling `snapshot` after a `seek` would step straight past the
-frame just sought. Live sources inherit the defaults and the scrub keys are
-inert for them.
+The defaulted methods exist for sources that are not a plain synchronous poll.
+`timeline` and `seek` make the scrub keys work; `peek` reads the current frame
+*without* advancing, which matters because calling `snapshot` after a `seek`
+would step straight past the frame just sought. `frame_id` belongs to
+asynchronous sources: `None` means every call produces a genuinely new sample,
+and anything else lets `App` tell a fresh frame from the same one handed out
+again. Live sources inherit the defaults and the scrub keys are inert for them.
 
 `Snapshot` is plain data (`HostInfo`, `CpuSample`, `MemSample`, `ProcRow`,
 `NetIface`, `DiskRow`, `Sensor`, `GpuInfo`, `CgroupInfo`) and derives
@@ -230,6 +236,53 @@ hides threads by default the replay would then look almost empty.
 Every snapshot type carries `#[serde(default)]`, so a recording made by an older
 crabmon still loads when fields are added.
 
+## Sampling off the draw thread
+
+`App::tick()` called the metric source directly from the event loop, so anything
+slow in a sample froze the whole program — not only the numbers, but the
+keyboard, including the key that quits. Three real cases: an `nvidia-smi` that
+takes its time, a `statvfs` on a wedged NFS mount, and an SSH round trip.
+
+`sampler::ThreadedSource` wraps any `MetricSource + Send` and moves it onto a
+worker. `snapshot` drains whatever the worker has finished, asks for one more if
+nothing is outstanding, and returns immediately — so the loop is never slower
+than a redraw. Three details matter:
+
+- **The first sample is taken synchronously, in the constructor.** Otherwise the
+  dashboard opens blank for a whole refresh interval.
+- **Only one request is outstanding at a time,** and a backlog collapses to the
+  newest frame. Queueing work a slow source can never catch up on would turn a
+  brief stall into a permanent lag.
+- **A repeated frame is not recorded twice.** `frame_id` tells `App` the sample
+  has not changed, so the charts keep their last real point instead of growing a
+  flat line that looks measured. The status line says `sampling…` while this is
+  happening, because a dashboard that has quietly stopped moving is worse than
+  one that explains itself.
+
+A replay is deliberately *not* wrapped: it is instant anyway, and the scrub keys
+need `seek`/`peek` to be synchronous.
+
+## Remote monitoring
+
+`--remote` used to run `crabmon --once` over SSH for every sample, paying a TCP
+handshake, a key exchange and a full crabmon startup per frame. It now starts
+`crabmon --stream` once and reads JSON Lines from the session for as long as it
+lasts, with the reader on its own thread and stderr drained on another — a full
+stderr pipe would otherwise block the far end mid-frame and stall the stream
+with nothing to show for it.
+
+Falling back to the old behaviour is deliberately narrow: only the far end's
+argument parser refusing `--stream` triggers it. Falling back on any failure
+would paper over a genuinely broken host, and an explicit `--remote-command` is
+never second-guessed at all.
+
+The one-shot path is bounded by `FETCH_TIMEOUT`. `ConnectTimeout` only covers
+setting the connection up; once SSH is connected, a command that never returns
+hangs the fetch, and because the first sample is synchronous that meant the
+interface never appeared and there was nothing to press `q` in. The wait drains
+both pipes on threads, because a child that fills one and blocks never exits —
+polling `try_wait` alone cannot tell "slow" from "deadlocked on a full pipe".
+
 ## Layout
 
 `ui::draw` renders a header, one of four layouts, and a status line, then any
@@ -268,7 +321,7 @@ terminal or a runaway process:
 
 ## Testing
 
-Over 320 tests: the in-crate unit tests plus five integration suites. All
+Over 380 tests: the in-crate unit tests plus five integration suites. All
 are offline and deterministic except `proc_control`, which deliberately touches
 the kernel:
 
@@ -279,13 +332,16 @@ the kernel:
   round-trips and config round-trips.
 - **`tests/app_behaviour.rs`** — the interaction model against a fixture source:
   key handling in every mode, selection stability across re-sorts, PID-reuse
-  refusal for all three process actions, tagging and bulk actions, saved
-  filters, grouping, replay scrubbing, audit logging, mouse handling and
-  history bounds.
+  refusal for all three process actions, tagging and bulk actions, pinning,
+  saved filters, grouping and group drill-down, popup scrolling, replay
+  scrubbing, audit logging, mouse handling, history bounds, and that a repeated
+  frame from an asynchronous source never reaches the charts.
 - **`tests/render.rs`** — the real panels drawn onto a `TestBackend`, asserting
   on screen content, at sizes from 10×3 up to 300×100 and in every theme.
-- **`tests/cli.rs`** — the built binary: `--help`, `--version`, exit codes, and
-  `--once` JSON/CSV output.
+- **`tests/cli.rs`** — the built binary: `--help`, `--version`, exit codes,
+  `--once` JSON/CSV output, `--diff` in both formats, `--stream` read back
+  through the recording parser, `--watch`'s exit codes, and the refusal to
+  combine a headless mode with `--remote` or `--replay`.
 - **`tests/proc_control.rs`** — renice, CPU affinity and signals against a real
   spawned child, checked by reading the state back from the kernel. A unit test
   can only prove the arguments were well-formed, not that they were accepted.
@@ -324,10 +380,38 @@ cross-checks the cfg-gated code paths against aarch64 Linux and FreeBSD.
 ## The exporter
 
 `--serve` is a hand-rolled `TcpListener` loop rather than a framework, because
-the whole contract is one method and three routes. It samples per scrape, so the
-scrape interval is the sample interval. Per-process series are capped (default
-20) — one series per process on a 2000-task machine would dwarf every other
-metric in the scrape and make the exporter the most expensive thing on the box.
+the whole contract is one method and four routes (`/`, `/metrics`, `/healthz`,
+and 404 for everything else). It samples once per scrape, on the accepting
+thread. Per-process series are capped (default 20) — one series per process on
+a 2000-task machine would dwarf every other metric in the scrape and make the
+exporter the most expensive thing on the box.
+
+It always samples the host it runs on, as do `--once`, `--stream` and `--watch`.
+Combining any of them with `--replay` or `--remote` is refused rather than
+ignored: `crabmon --once --remote prod-db` used to print the *local* machine's
+snapshot with exit 0, which is a worse failure than an error, because a script
+gets plausible data about the wrong host and never finds out.
+
+`serve` measures the gap between scrapes and passes it to the source, because
+rates are deltas of monotonic counters divided by the interval they are handed.
+Passing the *configured* refresh instead — which is what it used to do —
+multiplied every rate series by `scrape_interval / refresh_ms`: 200 MiB pushed
+over loopback across an 18 s gap at the default 800 ms interval reported
+250 MiB/s rather than 11.6 MiB/s. Gauges carry no delta and were unaffected,
+which is what made it easy to miss.
+
+Each connection is handled on its own thread, capped at `MAX_CONNECTIONS` with
+a 503 past it, and both socket directions carry a timeout. Doing the socket IO
+on the accept loop meant a client that connected and never sent a request — a
+stalled load balancer health check will do — stopped the exporter answering
+anybody, with no error anywhere; a timeout alone only bounds how long that
+lasts. Sampling stays behind a mutex, so concurrent scrapes see consistent
+counter deltas instead of racing each other's `prev` state.
+
+A bare `--serve 9100` binds to loopback; `:9100` keeps its conventional "every
+interface" meaning and says so at startup. The per-process series name every
+running command and its arguments, and the shortest spelling should not be the
+one that publishes them.
 
 ## Known limitations
 
@@ -346,3 +430,21 @@ metric in the scrape and make the exporter the most expensive thing on the box.
   incrementally maintained. At ~2000 processes and an 800 ms interval this costs
   a low double-digit percentage of one core, which is in line with comparable
   monitors but is the obvious next thing to optimise.
+- A replay is parsed in full into memory before the first frame is drawn, so a
+  long capture costs roughly its JSON size several times over. Nothing indexes
+  the file by line offset.
+- The `ports` column walks one fd table per visible row, which is why it is off
+  by default and resolved only for rows actually on screen. A process holding
+  tens of thousands of descriptors is cut off at `MAX_FDS_SCANNED`.
+- Pins do not reorder the tree view. The ordering there is structural, and
+  hoisting a child out of its parent would draw a tree that is not one.
+- `--diff` holds both snapshots in memory, so diffing two ends of a large
+  recording costs what loading it costs.
+- The audit log grows without bound and `audit::tail` reads the whole file to
+  show its last 200 lines.
+- `config::save_to` is a plain write rather than write-and-rename, so a crash
+  during the save that `+`/`-` triggers can truncate the config. It falls back
+  to defaults on the next start, which limits the damage to the settings.
+- The streaming `--remote` path is unit-tested against a controlled child and
+  driven end to end through a stand-in `ssh`, but has not been run over a real
+  SSH connection; the same caveat the FreeBSD `iostat` path carries.

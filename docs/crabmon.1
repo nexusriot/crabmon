@@ -1,4 +1,4 @@
-.TH CRABMON 1 "2026-09-05" "crabmon 0.4.0" "User Commands"
+.TH CRABMON 1 "2026-09-12" "crabmon 0.6.0" "User Commands"
 .SH NAME
 crabmon \- terminal system monitor
 .SH SYNOPSIS
@@ -24,10 +24,14 @@ percentages to mean anything.
 .TP
 .BR \-s ", " \-\-sort " " \fIKEY\fR
 Initial sort column: \fBpid\fR, \fBname\fR, \fBcpu\fR, \fBmem\fR, \fBvirt\fR,
-\fBdisk\fR, \fBtime\fR, \fBuser\fR, \fBstate\fR or \fBthreads\fR.
+\fBdisk\fR, \fBtime\fR, \fBuser\fR, \fBstate\fR, \fBthreads\fR or \fBnice\fR.
 .TP
 .BR \-a ", " \-\-ascending
-Sort ascending. The default is descending.
+Sort ascending.
+.TP
+.BR \-d ", " \-\-descending
+Sort descending. This is the default; the flag exists to override a config file
+that asks for ascending.
 .TP
 .BR \-f ", " \-\-filter " " \fIQUERY\fR
 Initial process filter. See \fBFILTER LANGUAGE\fR.
@@ -50,6 +54,8 @@ Do not capture mouse events.
 .TP
 .BR \-1 ", " \-\-once
 Print one snapshot to standard output and exit instead of starting the TUI.
+Always samples the host it runs on; \fB\-\-remote\fR and \fB\-\-replay\fR are
+ignored.
 .TP
 .B \-\-format " " \fIFMT\fR
 Output format for \fB\-\-once\fR: \fBjson\fR (default) or \fBcsv\fR.
@@ -65,7 +71,8 @@ Aggregate the process table: \fBnone\fR, \fBservice\fR, \fBcontainer\fR or
 \fBuser\fR.
 .TP
 .B \-\-record " " \fIPATH\fR
-Append every sample to a JSON Lines recording. See \fBRECORDINGS\fR.
+Record every sample to a JSON Lines file, replacing any file already at that
+path. See \fBRECORDINGS\fR.
 .TP
 .B \-\-replay " " \fIPATH\fR
 Drive the interface from a recording instead of sampling this host.
@@ -80,7 +87,39 @@ Command to run on the remote host. Defaults to
 .TP
 .B \-\-serve " " \fIADDR\fR
 Run headless and serve Prometheus metrics on \fIADDR\fR, e.g. \fB:9100\fR.
-Routes: \fB/metrics\fR, \fB/healthz\fR.
+Routes: \fB/\fR, \fB/metrics\fR, \fB/healthz\fR. Always samples this host;
+combining it with \fB\-\-remote\fR or \fB\-\-replay\fR is an error.
+.PP
+A bare port binds to loopback; \fB:\fIPORT\fR binds to every interface. The
+per-process series carry command lines, so the difference matters. Connections
+are handled concurrently and capped; past the cap callers get 503.
+.TP
+.B \-\-stream
+Print one JSON snapshot per line, forever, trimmed by \fB[record]\fR exactly as
+a recording is. This is what \fB\-\-remote\fR runs on the far end, and it is
+usable on its own as a collector. Samples this host only.
+.TP
+.B \-\-diff " " \fIA\fR " " [\fIB\fR]
+Compare two snapshots and print what changed: CPU, load, memory, swap,
+per-filesystem usage, and the processes that started, exited and moved. Each
+path may be a \fB\-\-once\fR export or a recording, in which case its last
+frame is used. With one path, the recording's first frame is compared against
+its last. \fB\-\-format json\fR emits the report as JSON.
+.PP
+Processes are matched on PID \fIand\fR start time, so a recycled PID reads as
+one process exiting and another starting rather than as enormous growth.
+.TP
+.B \-\-watch " " \fIQUERY\fR
+Sample headlessly until processes match \fIQUERY\fR (see \fBFILTER LANGUAGE\fR),
+then print them and exit \fB1\fR. Exits \fB0\fR if \fB\-\-watch\-timeout\fR
+elapses first, so \fB&&\fR runs on a match and \fB||\fR on a clean run.
+.TP
+.B \-\-watch\-for " " \fISECS\fR
+Require the match to hold this many consecutive seconds. A condition that
+flickers in and out never accumulates credit across the gaps. Default 0.
+.TP
+.B \-\-watch\-timeout " " \fISECS\fR
+Give up after this long. 0, the default, waits forever.
 .TP
 .BR \-h ", " \-\-help
 Print usage and exit.
@@ -96,7 +135,8 @@ Quit.
 Move the selection.
 .TP
 .B Enter
-Open the process detail pane.
+Open the process detail pane, or — in the grouped view — open the selected
+group, filtering the process table down to the processes inside it.
 .TP
 .B /
 Filter processes. \fBEsc\fR clears the filter.
@@ -118,7 +158,8 @@ Toggle the process tree.
 Show or hide individual threads.
 .TP
 .B G
-Cycle grouping: none, systemd unit, container, user.
+Cycle grouping: none, systemd unit, container, user. The aggregate table has its
+own cursor; process actions are refused from it, since it shows no process rows.
 .TP
 .B Space
 Tag the selected process. Signals, renice and affinity then apply to every
@@ -126,6 +167,14 @@ tagged process instead of just the cursor.
 .TP
 .B U
 Untag everything.
+.TP
+.B f
+Pin the selected process. Pinned rows are held at the top of the table whatever
+the sort, and stay visible through a filter that would otherwise hide them, so
+one process can be watched while the rest churns.
+.TP
+.B F
+Unpin everything.
 .TP
 .B z
 Pause and resume sampling.
@@ -145,8 +194,11 @@ Copy the selected process's command line to the system clipboard using OSC 52,
 which works through SSH and tmux.
 .TP
 .B L
-Show the local log of actions crabmon has taken. On Linux the sampler reports every task, so
-threads are hidden by default and the list shows processes only.
+Show the local log of actions crabmon has taken.
+.TP
+.BR j ", " k ", " PgUp ", " PgDn " (in a popup)"
+Scroll it. The key list, the alert log and the action log are all longer than a
+short terminal can show; the title says which part is on screen.
 .TP
 .B Tab, Shift\-Tab
 Cycle layouts.
@@ -189,6 +241,8 @@ user:vlad          user name contains "vlad"
 pid:1234           exact PID
 ppid:1             exact parent PID
 state:R            process state letter
+service:sshd       systemd unit; service:\- means "no unit"
+container:abc123   container id; container:\- means "not in one"
 cmd:\-\-headless     substring of the full command line
 re:^chrom(e|ium)$  regular expression over the process name
 cpu>5              CPU percentage comparison (> >= < <= =)
@@ -210,8 +264,8 @@ Refresh interval in milliseconds, clamped to 200\-10000. Default 800.
 .TP
 .B sort_by
 Sort column: \fBpid\fR, \fBname\fR, \fBcpu\fR, \fBmem\fR, \fBvirt\fR,
-\fBdisk\fR, \fBtime\fR, \fBuser\fR, \fBstate\fR, \fBthreads\fR. Default
-\fBcpu\fR.
+\fBdisk\fR, \fBtime\fR, \fBuser\fR, \fBstate\fR, \fBthreads\fR, \fBnice\fR.
+Default \fBcpu\fR.
 .TP
 .B sort_desc
 Sort descending. Default true.
@@ -292,6 +346,23 @@ over threads (default 100; 0 keeps everything, at roughly 1.5 MB a frame).
 truncates command lines (default 200) and
 .B omit_paths
 drops them, along with executable paths and working directories, entirely.
+.SS [procs]
+.B columns
+fixes the column order instead of fitting the terminal width. Names are
+\fBmark\fR, \fBpid\fR, \fBuser\fR, \fBstate\fR, \fBcpu\fR, \fBtrend\fR,
+\fBmem\fR, \fBvirt\fR, \fBthr\fR, \fBni\fR, \fBdisk\fR, \fBtime\fR,
+\fBports\fR and \fBname\fR; COMMAND is always drawn last and unknown names are
+ignored. Empty (the default) fits as many as will go.
+.B ports
+looks up listening ports for the rows on screen — one fd table per visible row,
+so it is off by default.
+.B pin_marker
+draws the leading marker column (\fB\(bu\fR tagged, pinned).
+.SS [remote]
+.B stream
+holds one SSH session open and reads a stream of frames instead of starting a
+process per sample, falling back automatically when the far end predates
+\fB\-\-stream\fR. Default true.
 .SS [serve]
 .B top_procs
 per-process series are exported by \fB\-\-serve\fR (default 20; 0 disables
@@ -306,7 +377,10 @@ Each table binds a
 and a
 .B query
 to the next number key, in order. \fB$USER\fR is expanded. At most nine are
-used, since there are only nine number keys.
+used, since there are only nine number keys. Declaring any preset replaces the
+built-in five \(em \fBbusy\fR (\fBcpu>5\fR), \fBhungry\fR (\fBmem>500M\fR),
+\fBmine\fR (\fBuser:$USER\fR), \fBio\fR (\fBio>100K\fR) and \fBstuck\fR
+(\fBstate:D\fR) \(em rather than adding to them.
 .SS [colors]
 Overrides individual theme colours by name:
 .BR ok ", " warn ", " crit ", " accent ", " border ", " title ", " text ", "
@@ -316,9 +390,12 @@ indexes (\fB33\fR). Unknown keys and unparseable values are ignored.
 .SS [[alert]]
 Each table defines one rule:
 .IR name ", " kind " (" cpu ", " mem ", " swap ", " load ", " disk ", " temp ", "
-.IR gpu "), " threshold ", " for_secs ", " target " and " command .
+.IR gpu "), " threshold ", " for_secs ", " target ", " command " and "
+.IR command_clear .
 A rule fires only once its condition has held for \fIfor_secs\fR seconds, and
-its \fIcommand\fR runs once per activation.
+its \fIcommand\fR runs once per activation. \fIcommand_clear\fR runs once when
+it recovers, and the alert popup (\fB!\fR) logs every transition,
+so an alert that fired at 03:12 and cleared at 03:14 says both.
 .I target
 restricts disk rules to a mount point, temperature rules to a sensor prefix and
 GPU rules to a device name.

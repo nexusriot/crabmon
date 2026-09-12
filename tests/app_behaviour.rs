@@ -371,6 +371,7 @@ fn alerts_fire_once_their_hold_time_elapses() {
         for_secs: 0,
         target: "/boot".into(),
         command: String::new(),
+        command_clear: String::new(),
     }];
     let mut a = crabmon::App::new(cfg, Box::new(FakeSource::single(snapshot())));
     a.tick();
@@ -722,4 +723,258 @@ fn nice_is_sortable_like_any_other_column() {
     a.cfg.sort_desc = false;
     a.rebuild_view();
     assert_eq!(a.rows()[0].nice, Some(-5));
+}
+
+// ---------------------------------------------------------------- pinning
+
+#[test]
+fn a_pinned_process_stays_at_the_top_whatever_the_sort() {
+    let mut a = app();
+    // systemd is the quietest process in the fixture, so it sorts last by CPU.
+    a.select(a.index_of_pid(1).expect("systemd"));
+    a.on_key(key('f'));
+
+    assert!(a.pinned.contains(&1));
+    assert_eq!(a.rows()[0].pid, 1, "a pin floats to the top");
+
+    // ...and stays there when the ordering is inverted.
+    a.on_key(key('s'));
+    assert_eq!(a.rows()[0].pid, 1, "reversing the sort must not drop the pin");
+    a.on_key(key('m'));
+    assert_eq!(a.rows()[0].pid, 1, "nor must changing the column");
+}
+
+#[test]
+fn a_pinned_process_survives_a_filter_that_would_hide_it() {
+    // The point of pinning is to watch one process while the rest churns; a
+    // filter that hid it would defeat that.
+    let mut a = app();
+    a.select(a.index_of_pid(1).expect("systemd"));
+    a.on_key(key('f'));
+
+    a.on_key(key('/'));
+    for c in "firefox".chars() {
+        a.on_key(key(c));
+    }
+    assert!(a.rows().iter().any(|r| r.pid == 1), "the pinned row was filtered away");
+    assert_eq!(a.rows()[0].pid, 1);
+}
+
+#[test]
+fn pins_are_cleared_in_bulk_and_dropped_when_the_process_exits() {
+    let mut a = app();
+    a.on_key(key('f'));
+    assert_eq!(a.pinned.len(), 1);
+    a.on_key(key('F'));
+    assert!(a.pinned.is_empty(), "F unpins everything");
+
+    // A pin outliving its process would hoist whatever recycled the PID.
+    let mut before = snapshot();
+    before.procs.push(proc_row(999, Some(1), "doomed", 1.0, 1024));
+    let after = snapshot();
+    let mut a = crabmon::App::new(common::config(), Box::new(FakeSource::new(vec![before, after])));
+    a.select(a.index_of_pid(999).expect("doomed"));
+    a.on_key(key('f'));
+    assert!(a.pinned.contains(&999));
+
+    a.tick();
+    assert!(!a.pinned.contains(&999), "the pin outlived the process");
+}
+
+#[test]
+fn tags_are_also_dropped_when_their_process_exits() {
+    // The "[N tagged]" counter used to keep counting the dead.
+    let mut before = snapshot();
+    before.procs.push(proc_row(998, Some(1), "doomed", 1.0, 1024));
+    let after = snapshot();
+    let mut a = crabmon::App::new(common::config(), Box::new(FakeSource::new(vec![before, after])));
+    a.select(a.index_of_pid(998).expect("doomed"));
+    a.on_key(key(' '));
+    assert_eq!(a.tagged.len(), 1);
+
+    a.tick();
+    assert!(a.tagged.is_empty());
+}
+
+// ------------------------------------------------------------ grouped view
+
+#[test]
+fn the_grouped_view_has_its_own_cursor_and_viewport() {
+    let mut a = app();
+    a.on_key(key('G')); // → by service
+    assert!(a.grouped());
+    a.set_group_page(2, a.groups().len());
+
+    assert_eq!(a.group_selected, 0);
+    a.on_key(code(KeyCode::Down));
+    assert_eq!(a.group_selected, 1, "j/↓ moves the group cursor, not the process one");
+    a.on_key(code(KeyCode::End));
+    assert_eq!(a.group_selected, a.groups().len() - 1);
+    assert!(a.group_scroll > 0, "the viewport followed the cursor past the panel height");
+    a.on_key(code(KeyCode::Home));
+    assert_eq!((a.group_selected, a.group_scroll), (0, 0));
+}
+
+#[test]
+fn opening_a_group_filters_the_process_table_down_to_it() {
+    // Without this the grouped view is a dead end: it can say docker.service is
+    // eating the machine but not which process inside it.
+    let mut a = app();
+    a.on_key(key('G'));
+    a.set_group_page(10, a.groups().len());
+    let name = a.groups()[0].name.clone();
+
+    a.on_key(code(KeyCode::Enter));
+    assert!(!a.grouped(), "opening a group returns to the process table");
+    assert_eq!(a.filter_text, format!("service:{}", name.to_lowercase()));
+    assert!(!a.rows().is_empty());
+    assert!(a.rows().iter().all(|r| r.service.as_deref() == Some(name.as_str())));
+}
+
+#[test]
+fn process_actions_refuse_to_fire_from_the_aggregate_table() {
+    // The grouped table shows no process rows, so acting from it would signal
+    // whichever process the invisible cursor happened to be on.
+    for k in ['t', 'r', 'A', ' '] {
+        let mut a = app();
+        a.on_key(key('G'));
+        a.set_group_page(10, a.groups().len());
+        a.on_key(key(k));
+        assert_eq!(a.mode, Mode::Normal, "'{k}' opened a prompt from the grouped view");
+        assert!(a.tagged.is_empty(), "'{k}' tagged an invisible row");
+        assert!(
+            a.status_text().unwrap_or_default().contains("press Enter"),
+            "'{k}' gave no explanation"
+        );
+    }
+}
+
+// --------------------------------------------------------- popup scrolling
+
+#[test]
+fn the_help_popup_scrolls_instead_of_truncating() {
+    let mut a = app();
+    a.on_key(key('?'));
+    assert_eq!(a.mode, Mode::Help);
+    assert_eq!(a.popup_scroll, 0);
+    a.popup_height = 5;
+
+    a.on_key(code(KeyCode::Down));
+    assert_eq!(a.popup_scroll, 1);
+    a.on_key(code(KeyCode::PageDown));
+    assert_eq!(a.popup_scroll, 6);
+    a.on_key(code(KeyCode::End));
+    assert_eq!(a.popup_scroll, a.popup_lines() - 5, "End lands on the last page");
+    a.on_key(code(KeyCode::Up));
+    assert_eq!(a.popup_scroll, a.popup_lines() - 6);
+    a.on_key(code(KeyCode::Home));
+    assert_eq!(a.popup_scroll, 0);
+}
+
+#[test]
+fn a_popup_always_opens_at_the_top() {
+    let mut a = app();
+    a.popup_height = 4;
+    a.on_key(key('?'));
+    a.on_key(code(KeyCode::End));
+    assert!(a.popup_scroll > 0);
+    a.on_key(code(KeyCode::Esc));
+
+    a.on_key(key('?'));
+    assert_eq!(a.popup_scroll, 0, "reopening mid-scroll reads as a rendering bug");
+}
+
+#[test]
+fn scrolling_stops_at_both_ends_of_every_popup() {
+    for k in ['?', '!', 'L'] {
+        let mut a = app();
+        a.on_key(key(k));
+        a.popup_height = 3;
+        for _ in 0..200 {
+            a.on_key(code(KeyCode::Down));
+        }
+        assert!(a.popup_scroll <= a.popup_lines(), "{k} scrolled past the end");
+        for _ in 0..200 {
+            a.on_key(code(KeyCode::Up));
+        }
+        assert_eq!(a.popup_scroll, 0, "{k} scrolled above the start");
+    }
+}
+
+#[test]
+fn q_and_esc_still_close_a_scrolled_popup() {
+    for closer in [KeyCode::Esc, KeyCode::Enter, KeyCode::Char('q')] {
+        let mut a = app();
+        a.on_key(key('?'));
+        a.on_key(code(KeyCode::Down));
+        a.on_key(code(closer));
+        assert_eq!(a.mode, Mode::Normal, "{closer:?} did not close the popup");
+        assert_eq!(a.popup_scroll, 0);
+    }
+}
+
+// ------------------------------------------------------------ bulk prompts
+
+#[test]
+fn a_bulk_renice_prompt_says_how_many_processes_it_will_change() {
+    // Signals get a confirmation step that names the count; renice and affinity
+    // apply on one keystroke, so the count has to be in the prompt itself.
+    let mut a = app();
+    for _ in 0..3 {
+        a.on_key(key(' '));
+    }
+    assert_eq!(a.tagged.len(), 3);
+
+    a.on_key(key('r'));
+    assert_eq!(a.mode, Mode::Renice);
+    assert_eq!(a.prompt_subject(), "3 tagged processes");
+
+    let mut a = app();
+    a.on_key(key('r'));
+    assert!(a.prompt_subject().contains('('), "a single target still names itself");
+}
+
+// ------------------------------------------------------- async sampling
+
+#[test]
+fn a_repeated_frame_is_not_recorded_into_the_history_twice() {
+    // A source that samples on another thread hands back the same frame until a
+    // new one is ready; charting it would draw a flat line that looks measured.
+    struct Stuck(crabmon::Snapshot);
+    impl crabmon::MetricSource for Stuck {
+        fn snapshot(&mut self, _dt: std::time::Duration) -> crabmon::Snapshot {
+            self.0.clone()
+        }
+        fn frame_id(&self) -> Option<u64> {
+            Some(7) // never advances
+        }
+    }
+
+    let mut a = crabmon::App::new(common::config(), Box::new(Stuck(snapshot())));
+    let before = a.cpu_hist.len();
+    a.tick();
+    a.tick();
+    assert_eq!(a.cpu_hist.len(), before, "a stale frame reached the chart");
+    assert!(a.is_stale(), "and the status line should say so");
+}
+
+#[test]
+fn pausing_clears_a_stale_sampler_notice() {
+    // `tick` stops while paused, so a leftover "sampling…" would sit in the
+    // status line for the rest of the session.
+    struct Stuck(crabmon::Snapshot);
+    impl crabmon::MetricSource for Stuck {
+        fn snapshot(&mut self, _dt: std::time::Duration) -> crabmon::Snapshot {
+            self.0.clone()
+        }
+        fn frame_id(&self) -> Option<u64> {
+            Some(1)
+        }
+    }
+    let mut a = crabmon::App::new(common::config(), Box::new(Stuck(snapshot())));
+    a.tick();
+    assert!(a.is_stale());
+    a.on_key(key('z'));
+    assert!(a.paused);
+    assert!(!a.is_stale());
 }

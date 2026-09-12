@@ -1,6 +1,6 @@
 [package]
 name = "crabmon"
-version = "0.4.0"
+version = "0.6.0"
 edition = "2021"
 description = "A fast, keyboard-driven terminal system monitor"
 repository = "https://github.com/nexusriot/crabmon"
@@ -40,11 +40,13 @@ copyright = "2025, Vladislav Ananyev"
 license-file = ["LICENSE", "0"]
 extended-description = """\
 crabmon is a Rust TUI system monitor: per-core CPU history, a process table \
-with tree view, grouping by systemd unit or container, per-process disk IO and \
-open sockets, renice/affinity/signal control in bulk, network and disk \
-throughput charts, temperature sensors, GPU, cgroup, pressure-stall and \
-battery panels, threshold alerts, JSON/CSV snapshot export, session recording \
-and replay, a Prometheus exporter and remote monitoring over SSH.
+with tree view, grouping by systemd unit or container, per-process disk IO, \
+listening ports and open sockets, renice/affinity/signal control in bulk, \
+network and disk throughput charts, temperature sensors, GPU, cgroup, \
+pressure-stall and battery panels, threshold alerts with recovery hooks, \
+JSON/CSV snapshot export, snapshot diffing, a headless watch mode, session \
+recording and replay, a Prometheus exporter and streaming remote monitoring \
+over SSH.
 """
 assets = [
   ["target/release/crabmon", "/usr/bin/", "755"],

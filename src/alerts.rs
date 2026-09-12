@@ -33,6 +33,10 @@ pub struct AlertRule {
     /// Shell command run once when the alert becomes active.
     #[serde(default)]
     pub command: String,
+    /// Shell command run once when it recovers. Without this an alert fires,
+    /// pages someone, and never says it is over.
+    #[serde(default)]
+    pub command_clear: String,
 }
 
 /// A rule that is currently over threshold and past its hold time.
@@ -51,23 +55,41 @@ struct RuleState {
     fired: bool,
 }
 
+/// A rule crossing into or out of its alarm state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlertEvent {
+    pub name: String,
+    pub fired: bool,
+    /// Wall-clock time of the snapshot that caused the transition, for display.
+    pub at_unix: u64,
+    pub value: f64,
+}
+
+/// Transitions kept for the `!` popup. Enough to cover a night, small enough
+/// that a flapping rule cannot grow the process without bound.
+pub const MAX_HISTORY: usize = 200;
+
 #[derive(Debug, Default)]
 pub struct AlertEngine {
     pub rules: Vec<AlertRule>,
     state: HashMap<String, RuleState>,
     /// Commands the engine wants run; drained by the caller.
     pending_commands: Vec<String>,
+    /// Newest-last transitions, bounded by `MAX_HISTORY`.
+    history: Vec<AlertEvent>,
 }
 
 impl AlertEngine {
     pub fn new(rules: Vec<AlertRule>) -> Self {
-        Self { rules, state: HashMap::new(), pending_commands: Vec::new() }
+        Self { rules, state: HashMap::new(), pending_commands: Vec::new(), history: Vec::new() }
     }
 
     /// Evaluate every rule against `snap`. `now_secs` is a monotonic clock,
     /// injected so the hold-time logic is testable.
     pub fn evaluate(&mut self, snap: &Snapshot, now_secs: u64) -> Vec<ActiveAlert> {
         let mut active = Vec::new();
+        let at_unix = snap.taken_at_unix;
+        let mut events: Vec<AlertEvent> = Vec::new();
         for rule in &self.rules {
             let Some((value, unit)) = measure(rule, snap) else {
                 continue;
@@ -75,7 +97,19 @@ impl AlertEngine {
             let st = self.state.entry(rule.name.clone()).or_default();
             if value < rule.threshold {
                 st.over_since = None;
-                st.fired = false;
+                // Recovering is a transition worth reporting: an alert that
+                // only ever says "started" leaves you guessing when it ended.
+                if std::mem::take(&mut st.fired) {
+                    if !rule.command_clear.is_empty() {
+                        self.pending_commands.push(rule.command_clear.clone());
+                    }
+                    events.push(AlertEvent {
+                        name: rule.name.clone(),
+                        fired: false,
+                        at_unix,
+                        value,
+                    });
+                }
                 continue;
             }
             let since = *st.over_since.get_or_insert(now_secs);
@@ -87,6 +121,7 @@ impl AlertEngine {
                 if !rule.command.is_empty() {
                     self.pending_commands.push(rule.command.clone());
                 }
+                events.push(AlertEvent { name: rule.name.clone(), fired: true, at_unix, value });
             }
             active.push(ActiveAlert {
                 name: rule.name.clone(),
@@ -98,11 +133,32 @@ impl AlertEngine {
                 threshold: rule.threshold,
             });
         }
+        self.record(events);
         active
+    }
+
+    fn record(&mut self, events: Vec<AlertEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        self.history.extend(events);
+        let overflow = self.history.len().saturating_sub(MAX_HISTORY);
+        if overflow > 0 {
+            self.history.drain(..overflow);
+        }
     }
 
     pub fn take_commands(&mut self) -> Vec<String> {
         std::mem::take(&mut self.pending_commands)
+    }
+
+    /// Transitions newest first, which is the order the popup reads them in.
+    pub fn history(&self) -> impl Iterator<Item = &AlertEvent> {
+        self.history.iter().rev()
+    }
+
+    pub fn history_len(&self) -> usize {
+        self.history.len()
     }
 }
 
@@ -155,6 +211,7 @@ pub fn default_rules() -> Vec<AlertRule> {
             for_secs: 30,
             target: String::new(),
             command: String::new(),
+            command_clear: String::new(),
         },
         AlertRule {
             name: "disk-nearly-full".into(),
@@ -163,6 +220,7 @@ pub fn default_rules() -> Vec<AlertRule> {
             for_secs: 0,
             target: String::new(),
             command: String::new(),
+            command_clear: String::new(),
         },
     ]
 }
@@ -180,6 +238,7 @@ mod tests {
             for_secs,
             target: String::new(),
             command: String::new(),
+            command_clear: String::new(),
         }
     }
 

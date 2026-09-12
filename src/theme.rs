@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier, Style};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Theme {
@@ -157,6 +157,19 @@ impl Theme {
         self
     }
 
+    /// How a selected row is painted.
+    ///
+    /// `mono` (and `--no-color`) leave both selection colours at `Reset`, which
+    /// used to make the highlight bold-only — invisible on any terminal that
+    /// renders bold as plain. Reversing the cell is the one way to mark a row
+    /// without using a colour.
+    pub fn selection(&self) -> Style {
+        if self.sel_fg == Color::Reset && self.sel_bg == Color::Reset {
+            return Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
+        }
+        Style::default().fg(self.sel_fg).bg(self.sel_bg).add_modifier(Modifier::BOLD)
+    }
+
     pub fn series_at(&self, i: usize) -> Color {
         if self.series.is_empty() {
             Color::Reset
@@ -250,6 +263,17 @@ mod tests {
         assert_eq!(t.crit, Color::Reset);
         assert_eq!(t.usage(1.0, 0.7, 0.9), Color::Reset);
         assert_eq!(t.temp(200.0, Some(100.0), 0.75, 0.9), Color::Reset);
+    }
+
+    #[test]
+    fn a_colourless_theme_still_marks_the_selected_row() {
+        // Bold alone is not a highlight: plenty of terminals render it as plain.
+        let mono = Theme::preset("mono").unwrap().selection();
+        assert!(mono.add_modifier.contains(Modifier::REVERSED), "{mono:?}");
+
+        let default = Theme::default().selection();
+        assert!(!default.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(default.bg, Some(Theme::default().sel_bg));
     }
 
     #[test]

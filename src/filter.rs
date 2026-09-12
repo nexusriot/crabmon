@@ -8,6 +8,8 @@
 //! user:vlad          user name contains "vlad"
 //! pid:1234           exact pid       ppid:1  exact parent
 //! state:R            process state letter
+//! service:sshd       systemd unit contains "sshd"
+//! container:abc123   container id contains "abc123"
 //! cmd:--headless     substring of the full command line
 //! re:^chrom(e|ium)$  regex over the name
 //! cpu>5  mem>100M    numeric comparisons (> >= < <= =)
@@ -47,6 +49,10 @@ pub enum Term {
     Pid(u32),
     Ppid(u32),
     State(char),
+    /// systemd unit; `service:-` matches processes with no unit at all.
+    Service(String),
+    /// Container id; `container:-` matches processes outside any container.
+    Container(String),
     Regex(Regex),
     Cpu(Cmp, f64),
     Mem(Cmp, f64),
@@ -85,6 +91,16 @@ fn split_cmp(s: &str) -> Option<(&str, Cmp, &str)> {
     None
 }
 
+/// Match an optional grouping field. `-` is how the grouped view labels the
+/// rows that have no value, so it has to mean the same thing here — otherwise
+/// drilling into the "-" group would filter to nothing.
+fn field_matches(field: Option<&str>, want: &str) -> bool {
+    match field {
+        Some(v) => want == v.to_lowercase() || v.to_lowercase().contains(want),
+        None => want == "-",
+    }
+}
+
 impl Term {
     fn matches(&self, p: &ProcRow) -> bool {
         match self {
@@ -96,6 +112,8 @@ impl Term {
             Term::Pid(pid) => p.pid == *pid,
             Term::Ppid(pid) => p.ppid == Some(*pid),
             Term::State(s) => p.state.eq_ignore_ascii_case(s),
+            Term::Service(v) => field_matches(p.service.as_deref(), v),
+            Term::Container(v) => field_matches(p.container.as_deref(), v),
             Term::Regex(re) => re.is_match(&p.name),
             Term::Cpu(c, v) => c.test(p.cpu as f64, *v),
             Term::Mem(c, v) => c.test(p.mem as f64, *v),
@@ -136,6 +154,12 @@ fn parse_term(body: &str) -> Result<Term, String> {
     }
     if let Some(rest) = body.strip_prefix("ppid:") {
         return rest.parse().map(Term::Ppid).map_err(|_| format!("bad ppid: {rest}"));
+    }
+    if let Some(rest) = body.strip_prefix("service:") {
+        return Ok(Term::Service(rest.to_lowercase()));
+    }
+    if let Some(rest) = body.strip_prefix("container:") {
+        return Ok(Term::Container(rest.to_lowercase()));
     }
     if let Some(rest) = body.strip_prefix("state:") {
         return rest
@@ -212,6 +236,28 @@ mod tests {
         let f = parse("!kworker").unwrap();
         assert!(f.matches(&p(1, "firefox", 0.0, 0)));
         assert!(!f.matches(&p(2, "kworker/3:1", 0.0, 0)));
+    }
+
+    #[test]
+    fn grouping_fields_are_filterable_so_a_group_can_be_drilled_into() {
+        let mut p = p(1, "dockerd", 0.0, 0);
+        p.service = Some("docker.service".into());
+        p.container = Some("abc123def456".into());
+        assert!(parse("service:docker.service").unwrap().matches(&p));
+        assert!(parse("service:DOCKER").unwrap().matches(&p));
+        assert!(parse("container:abc123def456").unwrap().matches(&p));
+        assert!(!parse("service:sshd").unwrap().matches(&p));
+
+        // `-` is what the grouped view calls "no value", so it has to filter
+        // to the same set the group displayed.
+        let bare = p2(2, "kworker");
+        assert!(parse("service:-").unwrap().matches(&bare));
+        assert!(parse("container:-").unwrap().matches(&bare));
+        assert!(!parse("service:-").unwrap().matches(&p));
+    }
+
+    fn p2(pid: u32, name: &str) -> ProcRow {
+        ProcRow { pid, name: name.into(), ..ProcRow::default() }
     }
 
     #[test]

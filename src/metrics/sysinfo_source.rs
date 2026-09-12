@@ -516,6 +516,15 @@ pub fn parse_cpu_list(s: &str, max_cpu: usize) -> Result<Vec<usize>, String> {
                 if a > b {
                     return Err(format!("reversed range: {part}"));
                 }
+                // Bound-check *before* materialising: `0-4000000000` would
+                // otherwise try to allocate 32 GB and abort the process, which
+                // skips the panic hook and leaves the terminal in raw mode.
+                if b >= max_cpu {
+                    return Err(format!(
+                        "cpu {b} does not exist (0-{})",
+                        max_cpu.saturating_sub(1)
+                    ));
+                }
                 out.extend(a..=b);
             }
             None => out.push(part.parse().map_err(|_| format!("bad cpu: {part}"))?),
@@ -549,6 +558,17 @@ mod tests {
         assert!(parse_cpu_list("3-1", 16).is_err());
         assert!(parse_cpu_list("x", 16).is_err());
         assert!(parse_cpu_list("0-99", 16).is_err(), "must not pin to CPUs that do not exist");
+    }
+
+    #[test]
+    fn an_enormous_range_is_rejected_without_being_materialised() {
+        // The affinity prompt accepts digits and `-`, so this is three
+        // keystrokes away. Expanding it first meant a 32 GB allocation and an
+        // abort that skips the panic hook, leaving the terminal in raw mode.
+        let start = std::time::Instant::now();
+        assert!(parse_cpu_list("0-4000000000", 16).is_err());
+        assert!(parse_cpu_list("0-18446744073709551615", 16).is_err());
+        assert!(start.elapsed() < Duration::from_secs(2), "the range was expanded anyway");
     }
 
     #[test]

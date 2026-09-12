@@ -295,6 +295,17 @@ pub trait MetricSource {
     fn label(&self) -> Option<String> {
         None
     }
+
+    /// Identifies the frame `snapshot` last returned, for sources that sample
+    /// asynchronously and hand the same frame out more than once.
+    ///
+    /// `None` — the default, and what every in-process source returns — means
+    /// every call produces a genuinely new sample. `App` uses this to avoid
+    /// recording one sample into the history several times while a slow source
+    /// is still working on the next.
+    fn frame_id(&self) -> Option<u64> {
+        None
+    }
 }
 
 pub fn ratio(used: u64, total: u64) -> f64 {

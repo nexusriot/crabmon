@@ -144,6 +144,29 @@ pub struct App {
     pub paused: bool,
     /// PIDs tagged for a bulk action.
     pub tagged: HashSet<u32>,
+    /// PIDs held at the top of the table, and shown even when the filter would
+    /// hide them, so one process can be watched while the rest churns.
+    pub pinned: HashSet<u32>,
+    /// Listening ports for the rows last drawn, when the PORTS column is on.
+    pub ports: HashMap<u32, Vec<u16>>,
+    /// Which tick `ports` was filled for, and for which rows.
+    ports_at: (u64, Vec<u32>),
+    /// Bumped once per sample, so the port lookup runs per tick rather than
+    /// per draw — the UI redraws several times a second even when idle.
+    generation: u64,
+    /// Selection and viewport of the grouped view, kept apart from the process
+    /// table's so switching back and forth does not lose either.
+    pub group_selected: usize,
+    pub group_scroll: usize,
+    group_page: usize,
+    group_len: usize,
+    /// First visible line of whichever popup is open, and how many lines it
+    /// last had room for.
+    pub popup_scroll: usize,
+    pub popup_height: usize,
+    /// The frame the last tick saw, for sources that sample asynchronously.
+    last_frame_id: Option<u64>,
+    stale: bool,
     /// Per-PID CPU history for the sparkline column.
     cpu_spark: HashMap<u32, Vec<f32>>,
     /// Sockets of the process whose detail pane is open, fetched on demand.
@@ -199,6 +222,18 @@ impl App {
             config_path: None,
             paused: false,
             tagged: HashSet::new(),
+            pinned: HashSet::new(),
+            ports: HashMap::new(),
+            ports_at: (0, Vec::new()),
+            generation: 0,
+            group_selected: 0,
+            group_scroll: 0,
+            group_page: 1,
+            group_len: 0,
+            popup_scroll: 0,
+            popup_height: 1,
+            last_frame_id: None,
+            stale: false,
             cpu_spark: HashMap::new(),
             detail_sockets: Vec::new(),
             audit_path: None,
@@ -207,6 +242,7 @@ impl App {
             snap,
             cfg,
         };
+        app.last_frame_id = app.source.frame_id();
         app.rebuild_view();
         app
     }
@@ -230,9 +266,30 @@ impl App {
         let dt = self.last_refresh.elapsed();
         self.snap = self.source.snapshot(dt);
         self.last_refresh = Instant::now();
+        self.generation = self.generation.wrapping_add(1);
+
+        // A source that samples on another thread hands back the same frame
+        // until a new one is ready. Pushing that into the charts would draw a
+        // flat line that looks like real measurement; skipping it leaves the
+        // last real sample on screen, which is what actually happened.
+        let id = self.source.frame_id();
+        let fresh = id.is_none() || id != self.last_frame_id;
+        self.last_frame_id = id;
+        self.stale = !fresh;
+        if !fresh {
+            return;
+        }
+
         self.record_history();
         self.active_alerts = self.alerts.evaluate(&self.snap, self.started.elapsed().as_secs());
         self.rebuild_view();
+    }
+
+    /// Whether the last tick produced nothing new, i.e. the source is still
+    /// working on a sample. Shown in the status line so a frozen-looking
+    /// dashboard says why.
+    pub fn is_stale(&self) -> bool {
+        self.stale
     }
 
     fn record_history(&mut self) {
@@ -259,6 +316,11 @@ impl App {
     fn record_process_history(&mut self) {
         let live: HashSet<u32> = self.snap.procs.iter().map(|p| p.pid).collect();
         self.cpu_spark.retain(|pid, _| live.contains(pid));
+        // Tags and pins outlive their processes otherwise: the "[N tagged]"
+        // counter kept counting the dead, and a pinned PID could be recycled
+        // onto an unrelated process and quietly hoisted to the top.
+        self.tagged.retain(|pid| live.contains(pid));
+        self.pinned.retain(|pid| live.contains(pid));
         for p in &self.snap.procs {
             let series = self.cpu_spark.entry(p.pid).or_default();
             if series.len() >= PROC_SPARK_LEN {
@@ -280,8 +342,12 @@ impl App {
             .snap
             .procs
             .iter()
-            .filter(|p| !hide_threads || p.threads.is_some())
-            .filter(|p| self.filter.matches(p))
+            // A pinned process stays visible through the filter and the thread
+            // hiding: pinning it is a more specific instruction than either.
+            .filter(|p| {
+                self.pinned.contains(&p.pid)
+                    || ((!hide_threads || p.threads.is_some()) && self.filter.matches(p))
+            })
             .cloned()
             .collect();
 
@@ -297,6 +363,16 @@ impl App {
         } else {
             self.tree_rows.clear();
             sort::sort_rows(&mut rows, self.cfg.sort_by, self.cfg.sort_desc);
+            // Pins float to the top of a flat list. In tree view they do not:
+            // the ordering there is structural, and hoisting a child out of its
+            // parent would draw a tree that is not one.
+            if !self.pinned.is_empty() {
+                let pinned = &self.pinned;
+                let (mut top, rest): (Vec<ProcRow>, Vec<ProcRow>) =
+                    rows.into_iter().partition(|r| pinned.contains(&r.pid));
+                top.extend(rest);
+                rows = top;
+            }
         }
 
         self.rows = rows;
@@ -312,6 +388,91 @@ impl App {
     /// The aggregate table shown when grouping is active.
     pub fn groups(&self) -> Vec<GroupRow> {
         group_rows(self.rows(), self.cfg.group_by)
+    }
+
+    pub fn grouped(&self) -> bool {
+        self.cfg.group_by != GroupBy::None
+    }
+
+    /// Listening ports for the rows on screen, refreshed at most once per
+    /// sample. The draw loop runs several times a second even when nothing
+    /// changes, and this is the one column that costs syscalls.
+    pub fn refresh_ports(&mut self, visible: &[u32]) {
+        if self.ports_at.0 == self.generation && self.ports_at.1 == visible {
+            return;
+        }
+        self.ports = sockets::listening_ports(visible);
+        self.ports_at = (self.generation, visible.to_vec());
+    }
+
+    /// Told by the grouped view how many rows it can show, and how many there
+    /// are, so the selection and viewport stay inside the table.
+    pub fn set_group_page(&mut self, page: usize, len: usize) {
+        self.group_page = page.max(1);
+        self.group_len = len;
+        self.clamp_group_scroll();
+    }
+
+    fn clamp_group_scroll(&mut self) {
+        if self.group_len == 0 {
+            self.group_selected = 0;
+            self.group_scroll = 0;
+            return;
+        }
+        self.group_selected = self.group_selected.min(self.group_len - 1);
+        if self.group_selected < self.group_scroll {
+            self.group_scroll = self.group_selected;
+        } else if self.group_selected >= self.group_scroll + self.group_page {
+            self.group_scroll = self.group_selected + 1 - self.group_page;
+        }
+        self.group_scroll = self.group_scroll.min(self.group_len.saturating_sub(self.group_page));
+    }
+
+    fn move_group_selection(&mut self, delta: isize) {
+        if self.group_len == 0 {
+            return;
+        }
+        let next = (self.group_selected as isize + delta).clamp(0, self.group_len as isize - 1);
+        self.group_selected = next as usize;
+        self.clamp_group_scroll();
+    }
+
+    /// Open the selected group: filter the process table down to it and leave
+    /// the aggregate view. Without this the grouped view is a dead end — it can
+    /// tell you docker.service is eating the machine but not which process.
+    fn open_group(&mut self) {
+        let groups = self.groups();
+        let Some(group) = groups.get(self.group_selected) else { return };
+        let name = group.name.clone();
+        // Filter terms are whitespace-separated, so a name with a space in it
+        // cannot be expressed as one. Say so rather than filtering to nonsense.
+        if name.split_whitespace().count() > 1 {
+            self.set_status(format!("cannot filter on a name with spaces: {name}"));
+            return;
+        }
+        let field = match self.cfg.group_by {
+            GroupBy::Service => "service",
+            GroupBy::Container => "container",
+            GroupBy::User => "user",
+            GroupBy::None => return,
+        };
+        self.filter_text = format!("{field}:{}", name.to_lowercase());
+        self.apply_filter();
+        self.cfg.group_by = GroupBy::None;
+        self.set_status(format!("{field}: {name}"));
+    }
+
+    /// Pin or unpin the selected process.
+    fn toggle_pin(&mut self) {
+        let Some(row) = self.selected_row() else { return };
+        let (pid, name) = (row.pid, row.name.clone());
+        if self.pinned.remove(&pid) {
+            self.set_status(format!("unpinned {name}"));
+        } else {
+            self.pinned.insert(pid);
+            self.set_status(format!("pinned {name} ({pid})"));
+        }
+        self.rebuild_view();
     }
 
     pub fn index_of_pid(&self, pid: u32) -> Option<usize> {
@@ -368,6 +529,10 @@ impl App {
     }
 
     pub fn move_selection(&mut self, delta: isize) {
+        if self.grouped() {
+            self.move_group_selection(delta);
+            return;
+        }
         let next = (self.selected as isize + delta).max(0) as usize;
         self.select(next);
     }
@@ -402,15 +567,59 @@ impl App {
                 Action::None
             }
             Mode::Detail | Mode::Help | Mode::Alerts | Mode::AuditLog => {
-                if matches!(
-                    key.code,
-                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?')
-                ) {
-                    self.mode = Mode::Normal;
-                }
+                self.on_popup_key(key);
                 Action::None
             }
         }
+    }
+
+    /// Enter a popup, always from the top: leaving a scrolled help open and
+    /// coming back to the middle of it reads as a rendering bug.
+    fn open_popup(&mut self, mode: Mode) {
+        self.popup_scroll = 0;
+        self.mode = mode;
+    }
+
+    /// Popups scroll rather than truncating. The key list alone is longer than
+    /// an 80x24 terminal can show, so the rows past the bottom used to be
+    /// simply unreachable.
+    fn on_popup_key(&mut self, key: KeyEvent) {
+        let page = self.popup_page();
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?') => {
+                self.popup_scroll = 0;
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Down | KeyCode::Char('j') => self.scroll_popup(1),
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_popup(-1),
+            KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_popup(page),
+            KeyCode::PageUp => self.scroll_popup(-page),
+            KeyCode::Home => self.popup_scroll = 0,
+            KeyCode::End => self.scroll_popup(isize::MAX / 2),
+            _ => {}
+        }
+    }
+
+    fn scroll_popup(&mut self, delta: isize) {
+        let max = self.popup_lines().saturating_sub(self.popup_page().max(1) as usize);
+        let next = (self.popup_scroll as isize).saturating_add(delta).clamp(0, max as isize);
+        self.popup_scroll = next as usize;
+    }
+
+    /// Rows the open popup holds, so scrolling can stop at the end of them.
+    pub fn popup_lines(&self) -> usize {
+        match self.mode {
+            Mode::Help => crate::ui::popups::KEYS.len(),
+            Mode::Alerts => self.alerts.rules.len() + self.alerts.history_len(),
+            Mode::AuditLog => self.audit_entries.len(),
+            Mode::Detail => crate::ui::popups::DETAIL_FIELDS + self.detail_sockets.len(),
+            _ => 0,
+        }
+    }
+
+    /// Set by the popup as it draws, so paging matches what is on screen.
+    pub fn popup_page(&self) -> isize {
+        self.popup_height.max(1) as isize
     }
 
     fn on_normal_key(&mut self, key: KeyEvent) -> Action {
@@ -430,8 +639,20 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::PageDown => self.move_selection(self.page as isize),
             KeyCode::PageUp => self.move_selection(-(self.page as isize)),
-            KeyCode::Home => self.select(0),
-            KeyCode::End => self.select(self.rows.len().saturating_sub(1)),
+            KeyCode::Home => {
+                if self.grouped() {
+                    self.move_group_selection(isize::MIN / 2);
+                } else {
+                    self.select(0);
+                }
+            }
+            KeyCode::End => {
+                if self.grouped() {
+                    self.move_group_selection(isize::MAX / 2);
+                } else {
+                    self.select(self.rows.len().saturating_sub(1));
+                }
+            }
 
             KeyCode::Char('c') => self.set_sort(SortBy::Cpu),
             KeyCode::Char('m') => self.set_sort(SortBy::Mem),
@@ -490,6 +711,9 @@ impl App {
             // Pause sampling so a spike can actually be read.
             KeyCode::Char('z') => {
                 self.paused = !self.paused;
+                // A pause stops `tick`, so a "sampling…" left over from the
+                // last one would sit in the status line for good.
+                self.stale = false;
                 self.set_status(if self.paused { "paused" } else { "resumed" });
             }
             // Scrub a recording.
@@ -500,6 +724,10 @@ impl App {
 
             // Tag the selected process for a bulk action.
             KeyCode::Char(' ') => {
+                if self.grouped() {
+                    self.set_status("grouped view: press Enter to open a group first");
+                    return Action::None;
+                }
                 if let Some(pid) = self.selected_row().map(|r| r.pid) {
                     if !self.tagged.remove(&pid) {
                         self.tagged.insert(pid);
@@ -515,6 +743,8 @@ impl App {
 
             KeyCode::Char('G') => {
                 self.cfg.group_by = self.cfg.group_by.next();
+                self.group_selected = 0;
+                self.group_scroll = 0;
                 self.set_status(format!("group by {}", self.cfg.group_by.label()));
             }
             KeyCode::Char('y') => self.yank(),
@@ -543,18 +773,27 @@ impl App {
             KeyCode::Char('-') | KeyCode::Char('_') => self.nudge_refresh(200),
 
             KeyCode::Enter => {
-                if let Some(pid) = self.selected_row().map(|r| r.pid) {
+                if self.grouped() {
+                    self.open_group();
+                } else if let Some(pid) = self.selected_row().map(|r| r.pid) {
                     // Fetched here rather than every tick: joining /proc/net
                     // against a process's fd table is only cheap for one PID.
                     self.detail_sockets = sockets::for_pid(pid);
-                    self.mode = Mode::Detail;
+                    self.open_popup(Mode::Detail);
                 }
             }
-            KeyCode::Char('?') | KeyCode::F(1) => self.mode = Mode::Help,
+            KeyCode::Char('f') => self.toggle_pin(),
+            KeyCode::Char('F') => {
+                let n = self.pinned.len();
+                self.pinned.clear();
+                self.set_status(format!("unpinned {n}"));
+                self.rebuild_view();
+            }
+            KeyCode::Char('?') | KeyCode::F(1) => self.open_popup(Mode::Help),
             KeyCode::Char('A') => self.open_affinity(),
             KeyCode::Char('r') => self.open_renice(),
             KeyCode::Char('t') => self.open_signal_menu(),
-            KeyCode::Char('!') => self.mode = Mode::Alerts,
+            KeyCode::Char('!') => self.open_popup(Mode::Alerts),
             KeyCode::Char('P') => return Action::Export,
             _ => {}
         }
@@ -596,7 +835,7 @@ impl App {
             Some(path) => audit::tail(path, 200),
             None => Vec::new(),
         };
-        self.mode = Mode::AuditLog;
+        self.open_popup(Mode::AuditLog);
     }
 
     /// Record an action in the audit log, if one is configured.
@@ -624,6 +863,37 @@ impl App {
             return self.selected_row().map(Target::from).into_iter().collect();
         }
         self.rows().iter().filter(|r| self.tagged.contains(&r.pid)).map(Target::from).collect()
+    }
+
+    /// Targets for a prompt about to open, or `None` when the grouped view is
+    /// on. The aggregate table shows no process rows, so acting from it would
+    /// signal whichever process the invisible cursor happened to be on.
+    fn targets_for_prompt(&mut self) -> Option<Vec<Target>> {
+        if self.grouped() {
+            self.set_status("grouped view: press Enter to open a group first");
+            return None;
+        }
+        let targets = self.current_targets();
+        if targets.is_empty() {
+            return None;
+        }
+        Some(targets)
+    }
+
+    /// What the renice and affinity prompts call the thing they will change.
+    /// Unlike signals these apply on one keystroke with no confirmation step,
+    /// so the count has to be in the title or a bulk renice looks single.
+    pub fn prompt_subject(&self) -> String {
+        let targets = &self.pending_targets;
+        match targets.len() {
+            0 => "<none>".to_string(),
+            1 => format!(
+                "{} ({})",
+                crate::format::truncate_fit(&targets[0].name, 20),
+                targets[0].pid
+            ),
+            n => format!("{n} tagged processes"),
+        }
     }
 
     /// Leave any prompt, forgetting what it had captured.
@@ -688,7 +958,7 @@ impl App {
     }
 
     fn open_signal_menu(&mut self) {
-        let targets = self.current_targets();
+        let Some(targets) = self.targets_for_prompt() else { return };
         let Some(first) = targets.first().cloned() else { return };
         self.pending_targets = targets;
         self.target = Some(first);
@@ -786,7 +1056,7 @@ impl App {
     }
 
     fn open_renice(&mut self) {
-        let targets = self.current_targets();
+        let Some(targets) = self.targets_for_prompt() else { return };
         let Some(first) = targets.first().cloned() else { return };
         let pid = first.pid;
         self.pending_targets = targets;
@@ -853,7 +1123,7 @@ impl App {
     }
 
     fn open_affinity(&mut self) {
-        let targets = self.current_targets();
+        let Some(targets) = self.targets_for_prompt() else { return };
         let Some(first) = targets.first().cloned() else { return };
         self.pending_targets = targets;
         self.target = Some(first);
@@ -945,7 +1215,12 @@ impl App {
                     }
                 } else if ev.row > header_row {
                     let offset = (ev.row - header_row - 1) as usize;
-                    self.select(self.scroll + offset);
+                    if self.grouped() {
+                        self.group_selected = self.group_scroll + offset;
+                        self.clamp_group_scroll();
+                    } else {
+                        self.select(self.scroll + offset);
+                    }
                 }
             }
             _ => {}

@@ -7,8 +7,21 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::metrics::Snapshot;
+
+/// How long a client gets to send its request line, and to take its response.
+/// Generous for anything that actually means to scrape, short enough that a
+/// connection which opens and says nothing is not a resource.
+pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Connections handled at once. Past this, callers get 503 rather than an
+/// unbounded pile of threads: the point is to stay answerable under abuse, not
+/// to serve everybody.
+pub const MAX_CONNECTIONS: usize = 16;
 
 /// Escape a Prometheus label value.
 pub fn escape_label(value: &str) -> String {
@@ -121,6 +134,30 @@ pub fn render(snap: &Snapshot, top_procs: usize) -> String {
     );
     metric(
         &mut out,
+        "disk_inodes_total",
+        "Inodes on the filesystem.",
+        "gauge",
+        &snap
+            .disks
+            .iter()
+            .filter(|d| d.inodes_total > 0)
+            .map(|d| (disk_label(d), d.inodes_total as f64))
+            .collect::<Vec<_>>(),
+    );
+    metric(
+        &mut out,
+        "disk_inodes_used",
+        "Inodes in use.",
+        "gauge",
+        &snap
+            .disks
+            .iter()
+            .filter(|d| d.inodes_total > 0)
+            .map(|d| (disk_label(d), d.inodes_used as f64))
+            .collect::<Vec<_>>(),
+    );
+    metric(
+        &mut out,
         "disk_inodes_used_ratio",
         "Inode usage, 0..1.",
         "gauge",
@@ -160,6 +197,35 @@ pub fn render(snap: &Snapshot, top_procs: usize) -> String {
         "Interface transmit rate.",
         "gauge",
         &snap.nets.iter().map(|n| (iface(n), n.tx_bps)).collect::<Vec<_>>(),
+    );
+
+    metric(
+        &mut out,
+        "network_receive_errors_total",
+        "Receive errors since boot.",
+        "counter",
+        &snap.nets.iter().map(|n| (iface(n), n.errors_rx as f64)).collect::<Vec<_>>(),
+    );
+    metric(
+        &mut out,
+        "network_transmit_errors_total",
+        "Transmit errors since boot.",
+        "counter",
+        &snap.nets.iter().map(|n| (iface(n), n.errors_tx as f64)).collect::<Vec<_>>(),
+    );
+    metric(
+        &mut out,
+        "network_receive_bytes_total",
+        "Bytes received since boot.",
+        "counter",
+        &snap.nets.iter().map(|n| (iface(n), n.rx_total as f64)).collect::<Vec<_>>(),
+    );
+    metric(
+        &mut out,
+        "network_transmit_bytes_total",
+        "Bytes transmitted since boot.",
+        "counter",
+        &snap.nets.iter().map(|n| (iface(n), n.tx_total as f64)).collect::<Vec<_>>(),
     );
 
     metric(
@@ -227,6 +293,7 @@ pub fn render(snap: &Snapshot, top_procs: usize) -> String {
         metric(&mut out, "package_watts", "CPU package power draw.", "gauge", &plain(w));
     }
 
+    let gpu_label = |g: &crate::metrics::GpuInfo| format!("gpu=\"{}\"", escape_label(&g.name));
     metric(
         &mut out,
         "gpu_busy_percent",
@@ -235,11 +302,76 @@ pub fn render(snap: &Snapshot, top_procs: usize) -> String {
         &snap
             .gpus
             .iter()
-            .filter_map(|g| {
-                g.busy_percent.map(|b| (format!("gpu=\"{}\"", escape_label(&g.name)), b as f64))
-            })
+            .filter_map(|g| g.busy_percent.map(|b| (gpu_label(g), b as f64)))
             .collect::<Vec<_>>(),
     );
+    metric(
+        &mut out,
+        "gpu_memory_used_bytes",
+        "GPU memory in use.",
+        "gauge",
+        &snap
+            .gpus
+            .iter()
+            .filter_map(|g| g.vram_used.map(|v| (gpu_label(g), v as f64)))
+            .collect::<Vec<_>>(),
+    );
+    metric(
+        &mut out,
+        "gpu_memory_total_bytes",
+        "GPU memory installed.",
+        "gauge",
+        &snap
+            .gpus
+            .iter()
+            .filter_map(|g| g.vram_total.map(|v| (gpu_label(g), v as f64)))
+            .collect::<Vec<_>>(),
+    );
+    metric(
+        &mut out,
+        "gpu_temperature_celsius",
+        "GPU temperature.",
+        "gauge",
+        &snap
+            .gpus
+            .iter()
+            .filter_map(|g| g.temp_c.map(|t| (gpu_label(g), t as f64)))
+            .collect::<Vec<_>>(),
+    );
+
+    // The cgroup the exporter itself runs in. On a container host this is the
+    // only view of the limit the process is actually up against; the host
+    // totals above say nothing about it.
+    if let Some(cg) = &snap.cgroup {
+        let label = format!("path=\"{}\"", escape_label(&cg.path));
+        if let Some(used) = cg.mem_current {
+            metric(
+                &mut out,
+                "cgroup_memory_used_bytes",
+                "Memory charged to this process's cgroup.",
+                "gauge",
+                &[(label.clone(), used as f64)],
+            );
+        }
+        if let Some(max) = cg.mem_max {
+            metric(
+                &mut out,
+                "cgroup_memory_limit_bytes",
+                "This cgroup's memory limit.",
+                "gauge",
+                &[(label.clone(), max as f64)],
+            );
+        }
+        if let Some(quota) = cg.cpu_quota_cores {
+            metric(
+                &mut out,
+                "cgroup_cpu_quota_cores",
+                "This cgroup's CPU quota, in cores.",
+                "gauge",
+                &[(label, quota)],
+            );
+        }
+    }
 
     if top_procs > 0 {
         let proc_label = |p: &crate::metrics::ProcRow| {
@@ -298,6 +430,10 @@ pub fn route(method: &str, path: &str, body: impl FnOnce() -> String) -> String 
 }
 
 fn handle(mut stream: TcpStream, body: impl FnOnce() -> String) {
+    // Both directions: a client that stops reading mid-response would otherwise
+    // block the write just as effectively as one that never sends a request.
+    let _ = stream.set_read_timeout(Some(CLIENT_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(CLIENT_TIMEOUT));
     let mut line = String::new();
     let peer = stream.try_clone();
     if BufReader::new(peer.as_ref().unwrap_or(&stream)).read_line(&mut line).is_err() {
@@ -311,34 +447,98 @@ fn handle(mut stream: TcpStream, body: impl FnOnce() -> String) {
     let _ = stream.flush();
 }
 
-/// Normalise `:9100`, `9100` and `0.0.0.0:9100` to a bindable address.
+fn reject(mut stream: TcpStream) {
+    let _ = stream.set_write_timeout(Some(CLIENT_TIMEOUT));
+    let _ = stream
+        .write_all(http_response("503 Service Unavailable", "text/plain", "busy\n").as_bytes());
+}
+
+/// Normalise an address to something bindable.
+///
+/// `:9100` is the conventional spelling for "every interface" and keeps meaning
+/// that. A bare `9100` binds to loopback instead: process metrics name every
+/// running command and its arguments, and the lazy spelling should not be the
+/// one that publishes them to the network by accident.
 pub fn normalise_addr(addr: &str) -> String {
     let addr = addr.trim();
     if let Some(port) = addr.strip_prefix(':') {
         return format!("0.0.0.0:{port}");
     }
     if !addr.contains(':') {
-        return format!("0.0.0.0:{addr}");
+        return format!("127.0.0.1:{addr}");
     }
     addr.to_string()
 }
 
+/// Whether a bound address is reachable from off the machine, for the warning
+/// printed at startup.
+pub fn is_public(bind: &str) -> bool {
+    bind.starts_with("0.0.0.0:") || bind.starts_with("[::]:") || bind.starts_with("*:")
+}
+
 /// Serve until the process is killed, re-sampling for each scrape.
+///
+/// `sample` is handed the real time since the previous scrape. Rates are
+/// deltas of monotonic counters divided by that interval, so passing a fixed
+/// configured interval instead — which is what this used to do — multiplied
+/// every rate series by `scrape_interval / refresh_ms`.
+///
+/// Each connection is handled on its own thread. Doing the socket IO on the
+/// accept loop meant one client that connected and never sent a request stopped
+/// the exporter answering anybody; a timeout alone only bounds how long that
+/// lasts. Sampling stays behind a mutex, so concurrent scrapes still see
+/// consistent counter deltas rather than racing each other's `prev` state.
 pub fn serve(
     addr: &str,
     top_procs: usize,
-    mut sample: impl FnMut() -> Snapshot,
+    sample: impl FnMut(Duration) -> Snapshot + Send + 'static,
 ) -> std::io::Result<()> {
     let bind = normalise_addr(addr);
     let listener = TcpListener::bind(&bind)?;
     eprintln!("crabmon: serving metrics on http://{bind}/metrics");
+    if is_public(&bind) {
+        eprintln!(
+            "crabmon: {bind} is reachable from the network; \
+             per-process metrics include command lines"
+        );
+    }
+
+    let sampler = Arc::new(Mutex::new((sample, std::time::Instant::now())));
+    let live = Arc::new(AtomicUsize::new(0));
+
     for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let snap = sample();
-                handle(stream, || render(&snap, top_procs));
+        let stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("crabmon: accept failed: {e}");
+                continue;
             }
-            Err(e) => eprintln!("crabmon: accept failed: {e}"),
+        };
+        if live.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+            reject(stream);
+            continue;
+        }
+        live.fetch_add(1, Ordering::Relaxed);
+        let sampler = Arc::clone(&sampler);
+        let counter = Arc::clone(&live);
+        let spawned = std::thread::Builder::new().name("crabmon-http".into()).spawn(move || {
+            handle(stream, || {
+                let mut guard = match sampler.lock() {
+                    Ok(g) => g,
+                    // A panic in a previous handler must not take the exporter
+                    // down with it; the sampler state is still usable.
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                let (sample, last) = &mut *guard;
+                let elapsed = last.elapsed();
+                *last = std::time::Instant::now();
+                let snap = sample(elapsed);
+                render(&snap, top_procs)
+            });
+            counter.fetch_sub(1, Ordering::Relaxed);
+        });
+        if spawned.is_err() {
+            live.fetch_sub(1, Ordering::Relaxed);
         }
     }
     Ok(())
@@ -460,6 +660,43 @@ mod tests {
     }
 
     #[test]
+    fn one_silent_client_cannot_stop_the_exporter_answering_others() {
+        use std::io::Read;
+        use std::net::TcpStream;
+
+        // Bind ourselves so the test never guesses a port, then let `serve`
+        // take the listener's address.
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap().to_string();
+        drop(probe);
+
+        let bound = addr.clone();
+        std::thread::spawn(move || {
+            let _ = serve(&bound, 0, |_| Snapshot::default());
+        });
+        // Wait for the listener rather than sleeping a guess.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while TcpStream::connect(&addr).is_err() {
+            assert!(std::time::Instant::now() < deadline, "exporter never came up");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Connections that open and say nothing. Before connections were
+        // handled off the accept loop, one of these was enough to wedge the
+        // exporter for everybody, forever.
+        let _silent: Vec<TcpStream> =
+            (0..4).filter_map(|_| TcpStream::connect(&addr).ok()).collect();
+        std::thread::sleep(Duration::from_millis(50));
+
+        let mut client = TcpStream::connect(&addr).expect("connect");
+        client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        client.write_all(b"GET /healthz HTTP/1.1\r\n\r\n").unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).expect("the exporter was blocked");
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    }
+
+    #[test]
     fn responses_carry_an_accurate_content_length() {
         let body = "hello\n";
         let response = http_response("200 OK", "text/plain", body);
@@ -469,9 +706,54 @@ mod tests {
 
     #[test]
     fn addresses_are_normalised_to_something_bindable() {
+        // `:port` keeps its conventional "all interfaces" meaning...
         assert_eq!(normalise_addr(":9100"), "0.0.0.0:9100");
-        assert_eq!(normalise_addr("9100"), "0.0.0.0:9100");
-        assert_eq!(normalise_addr("127.0.0.1:9100"), "127.0.0.1:9100");
         assert_eq!(normalise_addr(" :9100 "), "0.0.0.0:9100");
+        // ...but a bare port stays on loopback: per-process series carry
+        // command lines, and the shortest spelling should not publish them.
+        assert_eq!(normalise_addr("9100"), "127.0.0.1:9100");
+        assert_eq!(normalise_addr("127.0.0.1:9100"), "127.0.0.1:9100");
+        assert_eq!(normalise_addr("0.0.0.0:9100"), "0.0.0.0:9100");
+
+        assert!(is_public("0.0.0.0:9100"));
+        assert!(is_public("[::]:9100"));
+        assert!(!is_public("127.0.0.1:9100"));
+    }
+
+    #[test]
+    fn a_scrape_carries_the_series_every_panel_draws() {
+        let mut s = snap();
+        s.cgroup = Some(crate::metrics::CgroupInfo {
+            path: "/docker/abc".into(),
+            containerized: true,
+            mem_current: Some(100),
+            mem_max: Some(200),
+            cpu_quota_cores: Some(1.5),
+        });
+        s.gpus = vec![crate::metrics::GpuInfo {
+            name: "amdgpu".into(),
+            busy_percent: Some(42.0),
+            vram_used: Some(1024),
+            vram_total: Some(4096),
+            temp_c: Some(55.0),
+            ..Default::default()
+        }];
+        s.nets[0].errors_rx = 7;
+        let text = render(&s, 0);
+        for needle in [
+            "crabmon_cgroup_memory_used_bytes",
+            "crabmon_cgroup_memory_limit_bytes",
+            "crabmon_cgroup_cpu_quota_cores",
+            "crabmon_gpu_memory_used_bytes",
+            "crabmon_gpu_memory_total_bytes",
+            "crabmon_gpu_temperature_celsius",
+            "crabmon_disk_inodes_total",
+            "crabmon_network_receive_errors_total",
+            "crabmon_network_receive_bytes_total",
+        ] {
+            assert!(text.contains(needle), "{needle} missing from the scrape");
+        }
+        // A host with none of that hardware still exports no empty series.
+        assert!(!render(&Snapshot::default(), 0).contains("cgroup_memory"));
     }
 }

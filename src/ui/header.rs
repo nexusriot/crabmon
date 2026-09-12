@@ -98,27 +98,45 @@ pub fn draw_status(f: &mut Frame<'_>, area: Rect, app: &App) {
     } else if let Some(label) = app.source_label() {
         // A non-live source names itself, and says so loudly when it is broken:
         // otherwise an unreachable `--remote` host is just an empty dashboard.
+        // This outranks the sampling notice: hiding UNREACHABLE behind
+        // "sampling…" is exactly the unexplained blank it exists to prevent.
         let broken = label.contains("UNREACHABLE");
         let style = if broken {
             Style::default().fg(app.theme.sel_fg).bg(app.theme.crit).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(app.theme.accent)
         };
-        Line::from(Span::styled(format!(" {label} "), style))
+        Line::from(vec![
+            Span::styled(format!(" {label} "), style),
+            Span::styled(sampling_note(app), Style::default().fg(app.theme.warn)),
+        ])
     } else {
-        Line::from(Span::styled(
-            format!(
-                " {} shown of {} tasks · sort {}{} · {} ms · [?] help",
-                app.rows().len(),
-                app.snap.procs.len(),
-                app.cfg.sort_by.label(),
-                if app.cfg.sort_desc { "↓" } else { "↑" },
-                app.refresh.as_millis(),
+        Line::from(vec![
+            Span::styled(
+                format!(
+                    " {} shown of {} tasks · sort {}{} · {} ms · [?] help",
+                    app.rows().len(),
+                    app.snap.procs.len(),
+                    app.cfg.sort_by.label(),
+                    if app.cfg.sort_desc { "↓" } else { "↑" },
+                    app.refresh.as_millis(),
+                ),
+                Style::default().fg(app.theme.dim),
             ),
-            Style::default().fg(app.theme.dim),
-        ))
+            Span::styled(sampling_note(app), Style::default().fg(app.theme.warn)),
+        ])
     };
     f.render_widget(Paragraph::new(line), area);
+}
+
+/// Appended while the source is still working on a sample, so a dashboard that
+/// has stopped changing explains itself rather than looking broken.
+fn sampling_note(app: &App) -> &'static str {
+    if app.is_stale() {
+        " · sampling…"
+    } else {
+        ""
+    }
 }
 
 /// Memory summary reused by the header of the memory panel.

@@ -46,25 +46,49 @@ pub fn parse_address(hex: &str) -> Option<String> {
         }
         32 => {
             // Four little-endian 32-bit words.
-            let mut groups = Vec::with_capacity(8);
+            let mut groups = [0u16; 8];
             for word in 0..4 {
                 let v = u32::from_str_radix(&addr[word * 8..word * 8 + 8], 16).ok()?;
                 let b = v.to_le_bytes();
-                groups.push(u16::from_be_bytes([b[0], b[1]]));
-                groups.push(u16::from_be_bytes([b[2], b[3]]));
+                groups[word * 2] = u16::from_be_bytes([b[0], b[1]]);
+                groups[word * 2 + 1] = u16::from_be_bytes([b[2], b[3]]);
             }
             if groups.iter().all(|g| *g == 0) {
                 "::".to_string()
             } else {
-                format!(
-                    "[{}]",
-                    groups.iter().map(|g| format!("{g:x}")).collect::<Vec<_>>().join(":")
-                )
+                format!("[{}]", format_v6(&groups))
             }
         }
         _ => return None,
     };
     Some(format!("{ip}:{port}"))
+}
+
+/// RFC 5952 text form: lowercase hex, with the longest run of two or more zero
+/// groups collapsed to `::`. Writing all eight groups out turns `::1` into
+/// `0:0:0:0:0:0:0:1`, which nobody recognises at a glance.
+pub fn format_v6(groups: &[u16; 8]) -> String {
+    let (mut best_at, mut best_len, mut run_at, mut run_len) = (0usize, 0usize, 0usize, 0usize);
+    for (i, g) in groups.iter().enumerate() {
+        if *g == 0 {
+            if run_len == 0 {
+                run_at = i;
+            }
+            run_len += 1;
+            if run_len > best_len {
+                (best_at, best_len) = (run_at, run_len);
+            }
+        } else {
+            run_len = 0;
+        }
+    }
+    // A single zero group is written out; `::` must stand for at least two.
+    if best_len < 2 {
+        return groups.iter().map(|g| format!("{g:x}")).collect::<Vec<_>>().join(":");
+    }
+    let head: Vec<String> = groups[..best_at].iter().map(|g| format!("{g:x}")).collect();
+    let tail: Vec<String> = groups[best_at + best_len..].iter().map(|g| format!("{g:x}")).collect();
+    format!("{}::{}", head.join(":"), tail.join(":"))
 }
 
 /// Parse one `/proc/net/{tcp,udp}` table into inode → socket.
@@ -116,6 +140,50 @@ pub fn parse_socket_link(target: &str) -> Option<u64> {
     target.strip_prefix("socket:[")?.strip_suffix(']')?.parse().ok()
 }
 
+/// How many fds one process is walked for before giving up. A busy server can
+/// hold tens of thousands; the column is a hint, not an inventory.
+pub const MAX_FDS_SCANNED: usize = 4096;
+
+/// Listening local ports per process, for the rows currently on screen.
+///
+/// The `/proc/net` tables are read once and the fd tables only for `pids`, so
+/// the cost is bounded by how many rows the process table can show rather than
+/// by how many processes the machine has.
+pub fn listening_ports(pids: &[u32]) -> HashMap<u32, Vec<u16>> {
+    let mut out = HashMap::new();
+    if !cfg!(target_os = "linux") || pids.is_empty() {
+        return out;
+    }
+    let table = all_sockets();
+    // Only listeners are interesting, and on most machines there are a few dozen.
+    let listening: HashMap<u64, u16> = table
+        .iter()
+        .filter(|(_, s)| s.state == "LISTEN" || s.protocol.starts_with("udp"))
+        .filter_map(|(inode, s)| port_of(&s.local).map(|p| (*inode, p)))
+        .collect();
+    if listening.is_empty() {
+        return out;
+    }
+    for pid in pids {
+        let mut ports: Vec<u16> = socket_inodes_of(*pid)
+            .into_iter()
+            .take(MAX_FDS_SCANNED)
+            .filter_map(|i| listening.get(&i).copied())
+            .collect();
+        ports.sort_unstable();
+        ports.dedup();
+        if !ports.is_empty() {
+            out.insert(*pid, ports);
+        }
+    }
+    out
+}
+
+/// The port from a rendered `addr:port`, which may itself contain colons.
+pub fn port_of(local: &str) -> Option<u16> {
+    local.rsplit_once(':').and_then(|(_, p)| p.parse().ok())
+}
+
 /// Every socket held by `pid`, listening sockets first. Linux-only.
 pub fn for_pid(pid: u32) -> Vec<Socket> {
     if !cfg!(target_os = "linux") {
@@ -157,10 +225,36 @@ mod tests {
         let wildcard = "0".repeat(32);
         assert_eq!(parse_address(&format!("{wildcard}:0050")).as_deref(), Some(":::80"));
 
+        // ::1 — the form anyone actually recognises, not 0:0:0:0:0:0:0:1.
         let loopback = "00000000000000000000000001000000";
-        let rendered = parse_address(&format!("{loopback}:1F90")).unwrap();
-        assert!(rendered.starts_with('['), "{rendered}");
-        assert!(rendered.ends_with(":8080"), "{rendered}");
+        assert_eq!(parse_address(&format!("{loopback}:1F90")).as_deref(), Some("[::1]:8080"));
+    }
+
+    #[test]
+    fn ipv6_groups_collapse_the_longest_zero_run_only() {
+        assert_eq!(format_v6(&[0, 0, 0, 0, 0, 0, 0, 1]), "::1");
+        assert_eq!(format_v6(&[0x2001, 0xdb8, 0, 0, 0, 0, 0, 1]), "2001:db8::1");
+        assert_eq!(format_v6(&[0xfe80, 0, 0, 0, 0x1, 0x2, 0x3, 0x4]), "fe80::1:2:3:4");
+        // A lone zero group is spelled out; `::` must cover at least two.
+        assert_eq!(format_v6(&[1, 0, 2, 3, 4, 5, 6, 7]), "1:0:2:3:4:5:6:7");
+        // Ties take the first run, as RFC 5952 requires.
+        assert_eq!(format_v6(&[1, 0, 0, 2, 0, 0, 3, 4]), "1::2:0:0:3:4");
+        assert_eq!(format_v6(&[0, 0, 0, 0, 0, 0, 0, 0]), "::");
+    }
+
+    #[test]
+    fn ports_are_taken_from_the_right_side_of_a_v6_address() {
+        assert_eq!(port_of("[::1]:8080"), Some(8080));
+        assert_eq!(port_of("127.0.0.1:22"), Some(22));
+        assert_eq!(port_of("nonsense"), None);
+    }
+
+    #[test]
+    fn listening_ports_are_looked_up_without_scanning_every_process() {
+        // No listener is guaranteed in a test harness; what matters is that the
+        // call is bounded by `pids` and never panics on a dead one.
+        assert!(listening_ports(&[]).is_empty());
+        assert!(!listening_ports(&[u32::MAX / 2]).contains_key(&(u32::MAX / 2)));
     }
 
     #[test]
