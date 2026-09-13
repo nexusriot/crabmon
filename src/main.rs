@@ -235,7 +235,10 @@ fn print_once(cfg: &Config, args: &Args, source: &mut SysinfoSource) -> Result<(
     std::thread::sleep(interval);
     let mut snap = source.snapshot(interval);
 
-    let filter = crabmon::filter::parse(&cfg.filter).unwrap_or_default();
+    // A filter from the config file reaches here unvalidated; silently
+    // degrading to "match everything" is the failure a script cannot see.
+    let filter =
+        crabmon::filter::parse(&cfg.filter).map_err(|e| anyhow::anyhow!("bad filter: {e}"))?;
     snap.procs.retain(|p| filter.matches(p));
     crabmon::sort::sort_rows(&mut snap.procs, cfg.sort_by, cfg.sort_desc);
     let snap = export::trim_procs(&snap, cfg.export.top_n);
@@ -257,6 +260,9 @@ fn run_tui(
     config_path: std::path::PathBuf,
 ) -> Result<()> {
     let mouse = !args.no_mouse;
+    // What the file itself says about the filter, before `apply_args` folded a
+    // one-off `--filter` over it. Restored before `persist()` below.
+    let file_filter = crabmon::config::load_from(&config_path).filter;
     install_panic_hook(mouse);
     let stop = install_signal_handler();
 
@@ -290,6 +296,13 @@ fn run_tui(
 
     // Always restore the terminal, even if the loop failed.
     restore(mouse);
+    // The filter is session state: it comes from `/` or from a one-off
+    // `--filter`, and persisting it silently poisoned every later run — a
+    // config left holding `filter = "..."` makes `crabmon --once` print an
+    // empty process list with exit 0, and the TUI open on an empty table with
+    // no visible cause. Everything else the user changed in the TUI still
+    // persists; only what the file itself said about the filter is written.
+    app.cfg.filter = file_filter;
     app.persist();
     if let Some(rec) = &recorder {
         eprintln!("crabmon: wrote {} frames to {}", rec.frames(), rec.path().display());
@@ -309,13 +322,17 @@ fn audit_path(cfg: &Config) -> Option<std::path::PathBuf> {
     })
 }
 
+/// Longest the event loop will block for input. Bounds how late a transient
+/// status message can be to expire, and is what a paused UI waits out.
+const MAX_POLL: Duration = Duration::from_millis(250);
+
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     stop: &StopFlag,
     mut recorder: Option<&mut Recorder>,
 ) -> Result<()> {
-    let mut last_draw = Instant::now();
+    let mut last_tick = Instant::now();
     loop {
         if stop.triggered() {
             break;
@@ -324,11 +341,20 @@ fn event_loop(
 
         // Wake up in time for the next metric refresh, but at least often
         // enough that a transient status message can expire on screen.
-        let timeout = app
-            .refresh
-            .checked_sub(last_draw.elapsed())
-            .unwrap_or(Duration::ZERO)
-            .min(Duration::from_millis(250));
+        //
+        // The "no tick is due and the deadline has passed" arm is what pausing
+        // (`z`) and replay scrubbing land in — `App::scrub` pauses too — and
+        // there `last_tick` stops advancing, so the countdown is expired
+        // forever. Falling through to a zero timeout made `event::poll` return
+        // instantly and turned the loop into a redraw spin: a pegged core and
+        // several MB/s of escape sequences at the terminal, for a UI that is by
+        // definition not changing. A paused screen has nothing to do until a
+        // key arrives, so wait out the cap.
+        let timeout = match app.refresh.checked_sub(last_tick.elapsed()) {
+            Some(remaining) => remaining.min(MAX_POLL),
+            None if app.due() => Duration::ZERO,
+            None => MAX_POLL,
+        };
 
         if event::poll(timeout)? {
             let action = match event::read()? {
@@ -349,7 +375,7 @@ fn event_loop(
         }
         if app.due() {
             app.tick();
-            last_draw = Instant::now();
+            last_tick = Instant::now();
             if let Some(rec) = recorder.as_deref_mut() {
                 if let Err(e) = rec.write(&app.snap) {
                     app.set_status(format!("recording failed: {e}"));

@@ -286,10 +286,19 @@ impl Config {
     pub fn sanitize(mut self) -> Config {
         self.refresh_ms = self.refresh_ms.clamp(crate::MIN_REFRESH_MS, crate::MAX_REFRESH_MS);
         self.history_len = self.history_len.clamp(16, 4096);
-        self.thresholds.warn = self.thresholds.warn.clamp(0.0, 1.0);
-        self.thresholds.crit = self.thresholds.crit.clamp(self.thresholds.warn, 1.0);
-        self.thresholds.temp_warn = self.thresholds.temp_warn.clamp(0.0, 1.0);
-        self.thresholds.temp_crit = self.thresholds.temp_crit.clamp(self.thresholds.temp_warn, 1.0);
+        // TOML has a real `nan` literal, and `NaN.clamp(0.0, 1.0)` returns NaN
+        // rather than repairing it — which then hits `clamp(NaN, 1.0)`, whose
+        // `min <= max` assertion aborts the process. A hand-edited file must
+        // degrade to defaults, not stop crabmon from starting at all.
+        let defaults = Thresholds::default();
+        let sane = |v: f64, fallback: f64| if v.is_finite() { v } else { fallback };
+        self.thresholds.warn = sane(self.thresholds.warn, defaults.warn).clamp(0.0, 1.0);
+        self.thresholds.crit =
+            sane(self.thresholds.crit, defaults.crit).clamp(self.thresholds.warn, 1.0);
+        self.thresholds.temp_warn =
+            sane(self.thresholds.temp_warn, defaults.temp_warn).clamp(0.0, 1.0);
+        self.thresholds.temp_crit = sane(self.thresholds.temp_crit, defaults.temp_crit)
+            .clamp(self.thresholds.temp_warn, 1.0);
         if crate::theme::Theme::preset(&self.theme).is_none() {
             self.theme = "default".into();
         }
@@ -420,5 +429,59 @@ mod tests {
     fn loading_a_missing_file_yields_defaults() {
         let missing = PathBuf::from("/nonexistent/crabmon/config.toml");
         assert_eq!(load_from(&missing), Config::default());
+    }
+
+    /// The shipped `mine` filter is `user:$USER`. Without the expansion it
+    /// matches a user literally called `$USER`, i.e. nothing, and the number
+    /// key bound to it silently empties the table.
+    #[test]
+    fn a_saved_filter_expands_the_user_placeholder() {
+        let cfg = Config {
+            saved_filters: vec![
+                SavedFilter { name: "mine".into(), query: "user:$USER".into() },
+                SavedFilter { name: "busy".into(), query: "cpu>5".into() },
+            ],
+            ..Default::default()
+        };
+        let user = std::env::var("USER").or_else(|_| std::env::var("LOGNAME")).unwrap_or_default();
+
+        let mine = cfg.saved_filter_query(0).unwrap();
+        assert_eq!(mine, format!("user:{user}"));
+        assert!(!mine.contains("$USER"), "the placeholder reached the filter parser");
+
+        // A query with no placeholder is passed through untouched.
+        assert_eq!(cfg.saved_filter_query(1).as_deref(), Some("cpu>5"));
+    }
+
+    #[test]
+    fn a_number_key_with_no_saved_filter_behind_it_does_nothing() {
+        // The keys 1..9 are always bound; only the first few have a filter.
+        let cfg = Config { saved_filters: vec![], ..Default::default() };
+        assert_eq!(cfg.saved_filter_query(0), None);
+        assert_eq!(Config::default().saved_filter_query(99), None);
+    }
+
+    /// TOML has a real `nan` literal, and `NaN.clamp(0.0, 1.0)` returns NaN
+    /// rather than repairing it — which then tripped `clamp`'s `min <= max`
+    /// assertion and aborted every mode before the UI existed.
+    #[test]
+    fn a_non_finite_threshold_falls_back_instead_of_aborting_the_process() {
+        for field in ["warn", "crit", "temp_warn", "temp_crit"] {
+            for value in ["nan", "inf", "-inf"] {
+                let cfg = Config::parse(&format!("[thresholds]\n{field} = {value}\n")).sanitize();
+                let t = &cfg.thresholds;
+                for (name, v) in [
+                    ("warn", t.warn),
+                    ("crit", t.crit),
+                    ("temp_warn", t.temp_warn),
+                    ("temp_crit", t.temp_crit),
+                ] {
+                    assert!(v.is_finite(), "{field}={value} left {name} at {v}");
+                    assert!((0.0..=1.0).contains(&v), "{field}={value} left {name} at {v}");
+                }
+                assert!(t.warn <= t.crit, "{field}={value} inverted the pair");
+                assert!(t.temp_warn <= t.temp_crit, "{field}={value} inverted the temp pair");
+            }
+        }
     }
 }

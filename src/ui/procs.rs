@@ -68,14 +68,20 @@ const MIN_NAME: u16 = 10;
 
 /// Choose the columns that fit in `width`, always keeping the marker, PID,
 /// CPU%, MEM and COMMAND.
-pub fn plan_columns(width: u16) -> Vec<Col> {
+pub fn plan_columns(width: u16, with_ports: bool) -> Vec<Col> {
     let mut chosen = vec![MARK, PID, CPU, MEM];
     let cost = |cols: &[Col]| -> u16 {
         // One space of ratatui column spacing between every pair, plus the
         // flexible name column and its own spacing.
         cols.iter().map(|c| c.width + 1).sum::<u16>() + MIN_NAME
     };
-    for col in OPTIONAL {
+    // PORTS is not in OPTIONAL: it costs an fd-table walk per visible row, so
+    // it never joins the automatic set on its own. `[procs] ports` is how you
+    // ask for it, and having asked, it outranks the other optional columns for
+    // the width that is going.
+    let optional: Vec<Col> =
+        if with_ports { [PORTS].into_iter().chain(OPTIONAL).collect() } else { OPTIONAL.to_vec() };
+    for col in optional {
         let mut trial = chosen.clone();
         trial.push(col);
         if cost(&trial) <= width {
@@ -93,9 +99,9 @@ pub fn plan_columns(width: u16) -> Vec<Col> {
 /// An explicit list is honoured as written — someone who asked for a column has
 /// a reason — except that COMMAND is always appended if it was left out, since
 /// a table of numbers with no process names is not a process table.
-pub fn columns_for(width: u16, configured: &[String]) -> Vec<Col> {
+pub fn columns_for(width: u16, configured: &[String], ports: bool) -> Vec<Col> {
     if configured.is_empty() {
-        return plan_columns(width);
+        return plan_columns(width, ports);
     }
     let mut out: Vec<Col> = Vec::new();
     for name in configured {
@@ -106,7 +112,7 @@ pub fn columns_for(width: u16, configured: &[String]) -> Vec<Col> {
         }
     }
     if out.is_empty() {
-        return plan_columns(width);
+        return plan_columns(width, ports);
     }
     // COMMAND flexes, so it has to be last wherever it was asked for.
     out.retain(|c| c.id != NAME.id);
@@ -262,7 +268,7 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
 
-    let cols = columns_for(inner.width, &app.cfg.procs.columns);
+    let cols = columns_for(inner.width, &app.cfg.procs.columns, app.cfg.procs.ports);
     app.proc_area = area;
     app.header_cols = column_ranges(inner, &cols);
 
@@ -429,7 +435,7 @@ mod tests {
 
     #[test]
     fn essential_columns_survive_a_narrow_terminal() {
-        let cols = plan_columns(30);
+        let cols = plan_columns(30, false);
         let keys: Vec<SortBy> = cols.iter().map(|c| c.key).collect();
         assert!(keys.contains(&SortBy::Pid));
         assert!(keys.contains(&SortBy::Cpu));
@@ -439,7 +445,7 @@ mod tests {
 
     #[test]
     fn a_wide_terminal_shows_every_column_once() {
-        let cols = plan_columns(200);
+        let cols = plan_columns(200, false);
         assert_eq!(
             cols.len(),
             OPTIONAL.len() + 5,
@@ -454,7 +460,7 @@ mod tests {
 
     #[test]
     fn the_trend_column_sorts_by_cpu_since_that_is_what_it_draws() {
-        let cols = plan_columns(200);
+        let cols = plan_columns(200, false);
         let spark = cols.iter().find(|c| c.title == "TREND").expect("TREND column");
         assert_eq!(spark.key, SortBy::Cpu);
     }
@@ -479,16 +485,16 @@ mod tests {
 
     #[test]
     fn columns_are_added_by_priority_as_width_grows() {
-        let narrow = plan_columns(40).len();
-        let medium = plan_columns(80).len();
-        let wide = plan_columns(160).len();
+        let narrow = plan_columns(40, false).len();
+        let medium = plan_columns(80, false).len();
+        let wide = plan_columns(160, false).len();
         assert!(narrow <= medium && medium <= wide, "{narrow} {medium} {wide}");
     }
 
     #[test]
     fn planned_columns_always_fit_the_available_width() {
         for w in 20u16..200 {
-            let cols = plan_columns(w);
+            let cols = plan_columns(w, false);
             let fixed: u16 = cols.iter().map(|c| c.width + 1).sum::<u16>();
             assert!(fixed <= w + MIN_NAME, "columns overflow at width {w}");
         }
@@ -497,7 +503,7 @@ mod tests {
     #[test]
     fn header_ranges_are_contiguous_and_inside_the_panel() {
         let inner = Rect { x: 1, y: 1, width: 100, height: 20 };
-        let cols = plan_columns(inner.width);
+        let cols = plan_columns(inner.width, false);
         let ranges = column_ranges(inner, &cols);
         assert_eq!(
             ranges.len(),
@@ -542,18 +548,18 @@ mod tests {
 
     #[test]
     fn an_explicit_column_list_is_honoured_and_typos_are_dropped() {
-        let cols = columns_for(200, &["pid".into(), "ports".into(), "nonsense".into()]);
+        let cols = columns_for(200, &["pid".into(), "ports".into(), "nonsense".into()], false);
         let ids: Vec<&str> = cols.iter().map(|c| c.id).collect();
         assert_eq!(ids, vec!["pid", "ports", "name"], "COMMAND is appended, typos are not");
 
         // Asking for COMMAND in the middle still puts it last: it is the column
         // that flexes, so anything after it would have no width left.
-        let cols = columns_for(200, &["name".into(), "cpu".into()]);
+        let cols = columns_for(200, &["name".into(), "cpu".into()], false);
         assert_eq!(cols.iter().map(|c| c.id).collect::<Vec<_>>(), vec!["cpu", "name"]);
 
         // An all-typo list falls back rather than drawing an empty table.
-        assert_eq!(columns_for(200, &["nope".into()]).len(), plan_columns(200).len());
-        assert_eq!(columns_for(200, &[]).len(), plan_columns(200).len());
+        assert_eq!(columns_for(200, &["nope".into()], false).len(), plan_columns(200, false).len());
+        assert_eq!(columns_for(200, &[], false).len(), plan_columns(200, false).len());
     }
 
     #[test]
@@ -570,7 +576,7 @@ mod tests {
         // Clicking PORTS has no ordering to apply; the old code would have
         // silently re-sorted by whatever key the column borrowed.
         let inner = Rect { x: 0, y: 0, width: 120, height: 20 };
-        let cols = columns_for(120, &["pid".into(), "ports".into(), "cpu".into()]);
+        let cols = columns_for(120, &["pid".into(), "ports".into(), "cpu".into()], false);
         let ranges = column_ranges(inner, &cols);
         assert_eq!(ranges.len(), 3, "mark and ports contribute no clickable range");
     }
@@ -597,5 +603,33 @@ mod tests {
         assert_eq!(cell_text(DISK, &p, "x", 10).trim(), "-");
         assert_eq!(cell_text(USER, &p, "x", 10), "-");
         assert_eq!(cell_text(THR, &p, "x", 10), "-");
+    }
+
+    /// `[procs] ports` is documented as the switch that turns the lookup on.
+    /// It had no reader anywhere in the crate: the column was gated solely on
+    /// `[procs] columns`, so setting it did nothing at all.
+    #[test]
+    fn the_ports_option_adds_the_column_the_automatic_set_leaves_out() {
+        let off = plan_columns(200, false);
+        assert!(!off.iter().any(|c| c.id == PORTS.id), "ports must stay off by default");
+
+        let on = plan_columns(200, true);
+        assert!(on.iter().any(|c| c.id == PORTS.id), "[procs] ports did not add the column");
+
+        // An explicit column list still wins over the switch either way.
+        let explicit = columns_for(200, &["pid".into(), "name".into()], true);
+        assert!(!explicit.iter().any(|c| c.id == PORTS.id), "an explicit list was overridden");
+    }
+
+    /// Having asked for ports, the column must survive the width competition
+    /// rather than being the first thing dropped.
+    #[test]
+    fn the_ports_column_outranks_the_other_optional_columns() {
+        for width in [60u16, 80, 100, 200] {
+            let cols = plan_columns(width, true);
+            assert!(cols.iter().any(|c| c.id == PORTS.id), "width {width} dropped ports");
+            let fixed: u16 = cols.iter().map(|c| c.width + 1).sum();
+            assert!(fixed <= width, "width {width}: columns do not fit");
+        }
     }
 }

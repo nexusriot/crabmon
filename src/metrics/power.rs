@@ -156,6 +156,15 @@ pub fn scan_supplies(root: &Path) -> (Vec<Battery>, Option<bool>) {
     for dir in dirs {
         match read_trim(dir.join("type")).as_deref() {
             Some("Battery") => {
+                // Wireless mice, styluses and headsets all publish
+                // `type=Battery` here. The kernel's discriminator is `scope`:
+                // `Device` for a peripheral, `System` or absent for the
+                // machine's own cell. Without this a desktop with a Logitech
+                // receiver grew a Power panel reporting a mouse's charge.
+                let scope = read_trim(dir.join("scope")).unwrap_or_default();
+                if scope == "Device" {
+                    continue;
+                }
                 if let Some(b) = read_battery(&dir) {
                     batteries.push(b);
                 }
@@ -182,6 +191,16 @@ pub fn read_rapl_energy_uj(root: &Path) -> Option<u64> {
         // Top-level packages only (`intel-rapl:0`), not their subdomains
         // (`intel-rapl:0:1`), which would double-count.
         if !name.starts_with("intel-rapl:") || name.matches(':').count() != 1 {
+            continue;
+        }
+        // ...and not every top-level domain is a package. Machines that expose
+        // `psys` present it as a sibling (`intel-rapl:1`), but it measures the
+        // whole platform — CPU, DRAM, display — and therefore already contains
+        // package-0. Summing both reported roughly double the real package
+        // draw. The domain's own `name` file is the only thing that tells them
+        // apart, so read it rather than inferring from the directory.
+        let domain = read_trim(entry.path().join("name")).unwrap_or_default();
+        if !domain.starts_with("package-") {
             continue;
         }
         if let Some(uj) =
@@ -323,23 +342,81 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
+    /// Write one RAPL domain the way sysfs lays it out: a `name` file saying
+    /// what the domain actually is, beside the counter.
+    fn rapl_domain(root: &Path, dir: &str, name: &str, uj: &str) {
+        write(root.join(dir).join("name"), &format!("{name}\n"));
+        write(root.join(dir).join("energy_uj"), &format!("{uj}\n"));
+    }
+
     #[test]
     fn rapl_sums_packages_but_not_their_subdomains() {
         let root = tmpdir("rapl");
-        write(root.join("intel-rapl:0/energy_uj"), "1000000\n");
-        write(root.join("intel-rapl:0:0/energy_uj"), "400000\n"); // core, inside :0
-        write(root.join("intel-rapl:0:1/energy_uj"), "100000\n"); // uncore, inside :0
-        write(root.join("intel-rapl:1/energy_uj"), "500000\n"); // second package
+        rapl_domain(&root, "intel-rapl:0", "package-0", "1000000");
+        rapl_domain(&root, "intel-rapl:0:0", "core", "400000"); // inside :0
+        rapl_domain(&root, "intel-rapl:0:1", "uncore", "100000"); // inside :0
+        rapl_domain(&root, "intel-rapl:1", "package-1", "500000"); // a real 2nd socket
         assert_eq!(read_rapl_energy_uj(&root), Some(1_500_000));
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The layout on the development machine: `intel-rapl:1` is `psys`, not a
+    /// second socket. psys meters the whole platform and already includes
+    /// package-0, so adding it reported roughly twice the real package draw.
+    #[test]
+    fn the_platform_domain_is_not_counted_as_another_package() {
+        let root = tmpdir("rapl-psys");
+        rapl_domain(&root, "intel-rapl:0", "package-0", "1000000");
+        rapl_domain(&root, "intel-rapl:1", "psys", "2800000");
+        assert_eq!(read_rapl_energy_uj(&root), Some(1_000_000));
+
+        // A machine that exposes *only* psys has no package counter to report.
+        let only = tmpdir("rapl-psys-only");
+        rapl_domain(&only, "intel-rapl:0", "psys", "2800000");
+        assert_eq!(read_rapl_energy_uj(&only), None);
+
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&only).unwrap();
     }
 
     #[test]
     fn unreadable_rapl_counters_yield_none_rather_than_zero_watts() {
         // The real case on this machine: energy_uj is mode 0400, root-owned.
         let root = tmpdir("rapl-denied");
-        fs::create_dir_all(root.join("intel-rapl:0")).unwrap();
+        write(root.join("intel-rapl:0/name"), "package-0\n");
         assert_eq!(read_rapl_energy_uj(&root), None);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A wireless mouse is not the machine's battery. Both are `type=Battery`
+    /// under `/sys/class/power_supply`; only `scope` tells them apart.
+    #[test]
+    fn peripheral_batteries_are_not_reported_as_the_machines_own() {
+        let root = tmpdir("scope");
+        energy_battery(&root, "Discharging", "12000000");
+        write(root.join("BAT0/scope"), "System\n");
+
+        let mouse = root.join("hidpp_battery_0");
+        write(mouse.join("type"), "Battery\n");
+        write(mouse.join("scope"), "Device\n");
+        write(mouse.join("capacity"), "42\n");
+        write(mouse.join("status"), "Discharging\n");
+
+        let (batteries, _) = scan_supplies(&root);
+        assert_eq!(batteries.len(), 1, "the mouse was counted as a system battery");
+        assert_eq!(batteries[0].name, "BAT0");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A laptop cell usually has no `scope` file at all, so an absent one must
+    /// mean "the machine's own" rather than being treated as a peripheral.
+    #[test]
+    fn a_battery_without_a_scope_file_is_still_the_machines_own() {
+        let root = tmpdir("scope-absent");
+        energy_battery(&root, "Discharging", "12000000");
+        let (batteries, _) = scan_supplies(&root);
+        assert_eq!(batteries.len(), 1);
+        assert_eq!(batteries[0].name, "BAT0");
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -356,5 +433,29 @@ mod tests {
         assert_eq!(time_remaining(50.0, 0.0), None);
         assert_eq!(time_remaining(50.0, 0.001), None, "a week+ is noise, not an estimate");
         assert!(time_remaining(50.0, 10.0).is_some());
+    }
+
+    /// The kernel's spelling of the status is not guaranteed: sysfs reports
+    /// `Discharging`, some ACPI firmware reports `discharging`, and a battery
+    /// that is neither charging nor draining reports `Full` or `Not charging`.
+    /// Only the first two mean the charge is moving, and the panel draws a
+    /// direction arrow off the answer.
+    #[test]
+    fn charge_direction_reads_the_status_whatever_its_case() {
+        let bat = |status: &str| Battery { status: status.into(), ..Default::default() };
+
+        assert!(bat("Charging").is_charging());
+        assert!(bat("charging").is_charging());
+        assert!(!bat("Charging").is_discharging());
+
+        assert!(bat("Discharging").is_discharging());
+        assert!(bat("DISCHARGING").is_discharging());
+        assert!(!bat("Discharging").is_charging());
+
+        for idle in ["Full", "Not charging", "Unknown", ""] {
+            let b = bat(idle);
+            assert!(!b.is_charging(), "{idle} is not charging");
+            assert!(!b.is_discharging(), "{idle} is not discharging");
+        }
     }
 }

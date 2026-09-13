@@ -95,9 +95,17 @@ fn split_cmp(s: &str) -> Option<(&str, Cmp, &str)> {
 /// rows that have no value, so it has to mean the same thing here — otherwise
 /// drilling into the "-" group would filter to nothing.
 fn field_matches(field: Option<&str>, want: &str) -> bool {
+    // "-" means *absent*, and only absent. Letting it fall through to the
+    // substring arm made `service:-` match every unit with a hyphen in its
+    // name — `systemd-journald.service`, `user-1000.slice`, `docker-<id>.scope`
+    // — so drilling into the "no unit" group listed most of the machine, and
+    // `!service:-` hid it.
+    if want == "-" {
+        return field.is_none_or(|v| v.trim().is_empty());
+    }
     match field {
         Some(v) => want == v.to_lowercase() || v.to_lowercase().contains(want),
-        None => want == "-",
+        None => false,
     }
 }
 
@@ -307,5 +315,29 @@ mod tests {
         assert!(parse("cpu<=5").unwrap().matches(&p(1, "x", 5.0, 0)));
         assert!(parse("cpu=5").unwrap().matches(&p(1, "x", 5.0, 0)));
         assert!(!parse("cpu>5").unwrap().matches(&p(1, "x", 5.0, 0)));
+    }
+
+    /// The grouped view labels rows with no unit "-", and drilling into that
+    /// group filters on `service:-`. Falling through to the substring arm made
+    /// it match every unit with a hyphen in its name, i.e. most of the machine.
+    #[test]
+    fn the_absent_value_sentinel_does_not_match_hyphenated_names() {
+        let f = parse("service:-").unwrap();
+        let with = |unit: Option<&str>| ProcRow {
+            service: unit.map(String::from),
+            ..ProcRow { pid: 1, name: "x".into(), ..Default::default() }
+        };
+
+        assert!(f.matches(&with(None)), "a process in no unit must match");
+        assert!(f.matches(&with(Some(""))), "an empty unit is also no unit");
+        for unit in ["systemd-journald.service", "user-1000.slice", "docker-abc.scope"] {
+            assert!(!f.matches(&with(Some(unit))), "{unit} is not an absent unit");
+        }
+        assert!(!f.matches(&with(Some("nginx.service"))));
+
+        // ...and the negation is the exact complement.
+        let neg = parse("!service:-").unwrap();
+        assert!(neg.matches(&with(Some("systemd-journald.service"))));
+        assert!(!neg.matches(&with(None)));
     }
 }

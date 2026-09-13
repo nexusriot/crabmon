@@ -1346,3 +1346,199 @@ impl Layout {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metrics::Snapshot;
+    use crate::record::ReplaySource;
+
+    fn proc(pid: u32, name: &str, cpu: f32, mem: u64) -> ProcRow {
+        ProcRow { pid, name: name.into(), cpu, mem, ..Default::default() }
+    }
+
+    fn app_from(snap: Snapshot) -> App {
+        App::new(Config::default(), Box::new(ReplaySource::from_frames(vec![snap], "t")))
+    }
+
+    /// The menu and the resolver are two hand-written lists. A signal added to
+    /// one and not the other gives a menu entry that silently does nothing.
+    #[cfg(unix)]
+    #[test]
+    fn every_signal_the_menu_offers_can_actually_be_sent() {
+        for name in SIGNAL_NAMES {
+            assert!(signal_by_name(name).is_some(), "{name} is offered but does not resolve");
+        }
+        assert_eq!(signal_by_name("SIGWINCH"), None, "only the menu's signals are accepted");
+        assert_eq!(signal_by_name("sigterm"), None, "the menu spells them in upper case");
+        assert_eq!(signal_by_name(""), None);
+    }
+
+    #[test]
+    fn the_signal_menu_leads_with_the_polite_one() {
+        // SIGKILL first would make the most destructive option the default
+        // press. It is second on purpose.
+        assert_eq!(SIGNAL_NAMES[0], "SIGTERM");
+        assert_eq!(SIGNAL_NAMES[1], "SIGKILL");
+    }
+
+    #[test]
+    fn grouping_sums_each_key_and_ranks_the_busiest_first() {
+        let rows = vec![
+            ProcRow { service: Some("web.service".into()), ..proc(1, "nginx", 5.0, 100) },
+            ProcRow { service: Some("web.service".into()), ..proc(2, "nginx", 7.0, 200) },
+            ProcRow { service: Some("db.service".into()), ..proc(3, "postgres", 40.0, 900) },
+        ];
+        let groups = group_rows(&rows, GroupBy::Service);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].name, "db.service", "40% should outrank 12%");
+        assert_eq!(groups[1].name, "web.service");
+        assert_eq!(groups[1].procs, 2);
+        assert_eq!(groups[1].cpu, 12.0);
+        assert_eq!(groups[1].mem, 300);
+    }
+
+    #[test]
+    fn ungrouped_processes_are_collected_rather_than_dropped() {
+        // Kernel threads have no unit and no container. Dropping them would
+        // make the aggregate table quietly disagree with the machine.
+        let rows = vec![
+            ProcRow { service: Some("web.service".into()), ..proc(1, "nginx", 5.0, 100) },
+            proc(2, "kworker/0:1", 1.5, 0),
+            proc(3, "ksoftirqd/0", 0.5, 0),
+        ];
+        let groups = group_rows(&rows, GroupBy::Service);
+
+        assert_eq!(groups.len(), 2);
+        let placeholder = groups.iter().find(|g| g.name == "-").expect("no placeholder group");
+        assert_eq!(placeholder.procs, 2);
+        assert_eq!(placeholder.cpu, 2.0);
+
+        let total: f32 = groups.iter().map(|g| g.cpu).sum();
+        assert_eq!(total, 7.0, "the groups must still add up to the machine");
+    }
+
+    #[test]
+    fn grouping_is_off_until_a_key_is_chosen() {
+        let rows = vec![proc(1, "nginx", 5.0, 100)];
+        assert!(group_rows(&rows, GroupBy::None).is_empty());
+        assert!(group_rows(&[], GroupBy::Service).is_empty());
+    }
+
+    #[test]
+    fn each_grouping_key_reads_its_own_field() {
+        let rows = vec![
+            ProcRow {
+                service: Some("web.service".into()),
+                container: Some("c0ffee".into()),
+                user: Some("www-data".into()),
+                ..proc(1, "nginx", 5.0, 100)
+            },
+            ProcRow { user: Some("root".into()), ..proc(2, "sshd", 1.0, 50) },
+        ];
+
+        let names = |by| group_rows(&rows, by).into_iter().map(|g| g.name).collect::<Vec<_>>();
+        assert_eq!(names(GroupBy::Service), vec!["web.service", "-"]);
+        assert_eq!(names(GroupBy::Container), vec!["c0ffee", "-"]);
+        assert_eq!(names(GroupBy::User), vec!["www-data", "root"]);
+    }
+
+    #[test]
+    fn a_group_carries_the_io_of_everything_in_it() {
+        let rows = vec![
+            ProcRow {
+                service: Some("db.service".into()),
+                read_bps: 1024.0,
+                write_bps: 512.0,
+                ..proc(1, "postgres", 1.0, 10)
+            },
+            ProcRow {
+                service: Some("db.service".into()),
+                read_bps: 0.0,
+                write_bps: 2048.0,
+                ..proc(2, "postgres", 1.0, 10)
+            },
+        ];
+        assert_eq!(group_rows(&rows, GroupBy::Service)[0].io_bps, 3584.0);
+    }
+
+    /// A status message is a receipt for something that just happened. Left on
+    /// screen it reads as state — "wrote /tmp/x.json" an hour after the fact.
+    #[test]
+    fn a_status_message_fades_instead_of_looking_like_state() {
+        let mut app = app_from(Snapshot::default());
+        app.set_status("wrote /tmp/crabmon-1.json");
+        assert_eq!(app.status_text(), Some("wrote /tmp/crabmon-1.json"));
+
+        let Some(stale) = Instant::now().checked_sub(Duration::from_secs(6)) else {
+            return; // the machine booted seconds ago; nothing to assert against
+        };
+        app.status = Some(("wrote /tmp/crabmon-1.json".into(), stale));
+        assert_eq!(app.status_text(), None, "a six-second-old receipt is still shown");
+    }
+
+    #[test]
+    fn an_unreadable_export_format_falls_back_to_json_rather_than_refusing() {
+        let mut cfg = Config::default();
+        cfg.export.format = "yaml".into();
+        let app =
+            App::new(cfg, Box::new(ReplaySource::from_frames(vec![Snapshot::default()], "t")));
+        assert_eq!(app.export_format(), ExportFormat::Json);
+
+        let mut cfg = Config::default();
+        cfg.export.format = "CSV".into();
+        let app =
+            App::new(cfg, Box::new(ReplaySource::from_frames(vec![Snapshot::default()], "t")));
+        assert_eq!(app.export_format(), ExportFormat::Csv);
+    }
+
+    #[test]
+    fn the_selection_cannot_be_walked_off_either_end_of_the_table() {
+        let snap = Snapshot {
+            procs: (1..=5).map(|p| proc(p, "p", 0.0, 0)).collect(),
+            ..Default::default()
+        };
+        let mut app = app_from(snap);
+        app.set_page(10);
+        assert_eq!(app.rows().len(), 5);
+
+        app.move_selection(-100);
+        assert_eq!(app.selected, 0, "a negative delta must not underflow");
+        app.move_selection(1000);
+        assert_eq!(app.selected, 4, "the cursor stops on the last row");
+        assert_eq!(app.selected_row().map(|r| r.pid), Some(5));
+    }
+
+    #[test]
+    fn an_empty_table_has_no_selection_to_move() {
+        let mut app = app_from(Snapshot::default());
+        assert!(app.rows().is_empty());
+        app.move_selection(1);
+        app.move_selection(-1);
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected_row(), None);
+    }
+
+    /// Paging is by what is on screen, not by a fixed guess, so the popup has
+    /// to report a height even before it has first drawn.
+    #[test]
+    fn a_popup_pages_by_at_least_one_row_before_it_has_been_drawn() {
+        let mut app = app_from(Snapshot::default());
+        assert!(app.popup_page() >= 1);
+        app.popup_height = 0;
+        assert_eq!(app.popup_page(), 1);
+        app.popup_height = 17;
+        assert_eq!(app.popup_page(), 17);
+    }
+
+    #[test]
+    fn a_closed_popup_holds_no_rows_to_scroll() {
+        let mut app = app_from(Snapshot::default());
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.popup_lines(), 0);
+
+        app.mode = Mode::Help;
+        assert_eq!(app.popup_lines(), crate::ui::popups::KEYS.len());
+    }
+}

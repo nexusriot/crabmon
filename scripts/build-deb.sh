@@ -1,15 +1,8 @@
 #!/usr/bin/env bash
-set -euxo pipefail
+#
+# Kept as the name CI and the README have always used. The packaging itself
+# lives in build.sh, so there is one implementation of it rather than two.
 
-cd "$(dirname "$0")/.."
+set -euo pipefail
 
-
-if ! command -v cargo-deb >/dev/null 2>&1; then
-  cargo install cargo-deb
-fi
-
-cargo build --release
-cargo deb
-
-echo "Built debs:"
-ls -1 target/debian/*.deb
+exec "$(dirname "$0")/build.sh" deb

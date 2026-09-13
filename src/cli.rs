@@ -160,7 +160,17 @@ where
             Some(v) => Ok(v),
             None => {
                 *i += 1;
-                args.get(*i).cloned().ok_or_else(|| format!("{flag} needs a value"))
+                let v = args.get(*i).cloned().ok_or_else(|| format!("{flag} needs a value"))?;
+                // `crabmon --serve --stream` used to read "--stream" as the
+                // bind address: the exclusivity checks below then never saw
+                // --stream at all, and the run died much later with an
+                // unrelated "invalid port". Only crabmon's own long flags are
+                // refused here — `--ssh-option -oBatchMode=yes` is a real and
+                // legitimate value that begins with a dash.
+                if LONG_FLAGS.contains(&v.as_str()) {
+                    return Err(format!("{flag} needs a value, but {v} is a flag"));
+                }
+                Ok(v)
             }
         };
 
@@ -185,7 +195,15 @@ where
             }
             "-a" | "--ascending" => out.sort_desc = Some(false),
             "-d" | "--descending" => out.sort_desc = Some(true),
-            "-f" | "--filter" => out.filter = Some(take_value(&mut i, &args, inline, &flag)?),
+            "-f" | "--filter" => {
+                let v = take_value(&mut i, &args, inline, &flag)?;
+                // An unparseable filter used to degrade to the empty filter,
+                // which matches *everything* — so `--once --filter 'cpu>'`
+                // printed the whole process table with exit 0. Its sibling
+                // `--watch` has always rejected the same string.
+                crate::filter::parse(&v).map_err(|e| format!("bad --filter: {e}"))?;
+                out.filter = Some(v);
+            }
             "-t" | "--tree" => out.tree = Some(true),
             "-l" | "--layout" => {
                 let v = take_value(&mut i, &args, inline, &flag)?;
@@ -265,9 +283,15 @@ where
     // them used to print the *local* machine's snapshot with exit 0, which is a
     // worse failure than refusing: a script gets plausible data about the wrong
     // host and never finds out.
-    for (name, on) in
-        [("--once", out.once), ("--serve", out.serve.is_some()), ("--stream", out.stream)]
-    {
+    for (name, on) in [
+        ("--once", out.once),
+        ("--serve", out.serve.is_some()),
+        ("--stream", out.stream),
+        // --watch calls live_source() exactly as the other three do; leaving it
+        // out meant `--remote box --watch 'state:D'` paged on the *local*
+        // machine's processes while naming the remote host.
+        ("--watch", out.watch.is_some()),
+    ] {
         if !on {
             continue;
         }
@@ -380,5 +404,59 @@ mod tests {
         ] {
             assert!(help.contains(flag), "{flag} is undocumented");
         }
+    }
+
+    /// `--version` is what a bug report quotes; it has to name the build that
+    /// is actually running, not a string frozen at the last manual edit.
+    #[test]
+    fn the_version_string_comes_from_the_crate_itself() {
+        let text = version_text();
+        assert_eq!(text, format!("crabmon {}", env!("CARGO_PKG_VERSION")));
+        assert!(!text.ends_with(' '), "a trailing space breaks scripted parsing");
+        assert!(text.starts_with("crabmon "), "{text}");
+    }
+
+    /// `--watch` samples this host exactly as `--once` does, so combining it
+    /// with `--remote` used to page on the wrong machine and never say so.
+    #[test]
+    fn every_mode_that_samples_this_host_refuses_remote_and_replay() {
+        for mode in
+            [vec!["--once"], vec!["--serve", "9100"], vec!["--stream"], vec!["--watch", "state:D"]]
+        {
+            for elsewhere in [vec!["--remote", "box"], vec!["--replay", "r.jsonl"]] {
+                let argv: Vec<&str> = mode.iter().chain(elsewhere.iter()).copied().collect();
+                assert!(parse(&argv).is_err(), "{argv:?} was accepted");
+            }
+        }
+    }
+
+    /// An unparseable filter used to degrade to the empty filter, which matches
+    /// everything: `--once --filter 'cpu>'` printed the whole process table
+    /// with exit 0, while `--watch 'cpu>'` rejected the identical string.
+    #[test]
+    fn a_malformed_filter_is_refused_rather_than_matching_everything() {
+        for bad in ["cpu>", "cpu>abc", "mem>>5"] {
+            let err = parse(["--filter", bad]).unwrap_err();
+            assert!(err.contains("--filter"), "{bad}: {err}");
+        }
+        assert_eq!(run(&["--filter", "cpu>5"]).filter.as_deref(), Some("cpu>5"));
+        assert_eq!(run(&["--filter=cpu>5"]).filter.as_deref(), Some("cpu>5"));
+    }
+
+    /// A value-taking flag that swallows the next flag skips the mutual
+    /// exclusion checks entirely and fails much later for an unrelated reason.
+    #[test]
+    fn a_flag_is_never_consumed_as_another_flags_value() {
+        for argv in [
+            ["--serve", "--stream"],
+            ["--filter", "--once"],
+            ["--record", "--once"],
+            ["--config", "--tree"],
+        ] {
+            let err = parse(argv).unwrap_err();
+            assert!(err.contains("is a flag"), "{argv:?} gave: {err}");
+        }
+        // A value that merely looks flag-ish is still a value.
+        assert_eq!(run(&["--filter", "name:-x"]).filter.as_deref(), Some("name:-x"));
     }
 }

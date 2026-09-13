@@ -142,4 +142,16 @@ mod tests {
         assert!(super::tail(Path::new("/nonexistent"), 5).is_empty());
         let _ = std::fs::remove_file(&path);
     }
+
+    /// Where the log goes when `[audit] path` is left empty. It must be a
+    /// per-user location and not the working directory, or running crabmon from
+    /// a checkout scatters `actions.log` through whatever tree you happened to
+    /// be in.
+    #[test]
+    fn the_default_log_path_is_namespaced_under_a_state_directory() {
+        let path = default_path();
+        assert_eq!(path.file_name().unwrap(), "actions.log");
+        assert_eq!(path.parent().unwrap().file_name().unwrap(), "crabmon");
+        assert!(path.parent().unwrap().parent().is_some(), "no directory above crabmon/");
+    }
 }

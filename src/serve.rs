@@ -240,28 +240,36 @@ pub fn render(snap: &Snapshot, top_procs: usize) -> String {
             .collect::<Vec<_>>(),
     );
 
+    // One HELP/TYPE pair per metric family, with the resources as labelled
+    // samples underneath it. Emitting them inside the loop gave three HELP lines
+    // for `crabmon_pressure_some_ratio`, and Prometheus rejects the *entire*
+    // scrape on a repeated HELP — so every other series here was dropped too.
+    let mut some_samples: Vec<(String, f64)> = Vec::new();
+    let mut full_samples: Vec<(String, f64)> = Vec::new();
     for (name, pressure) in
         [("cpu", snap.psi.cpu), ("memory", snap.psi.memory), ("io", snap.psi.io)]
     {
         if let Some(p) = pressure {
-            metric(
-                &mut out,
-                "pressure_some_ratio",
-                "Share of time with at least one task stalled, 10s average.",
-                "gauge",
-                &[(format!("resource=\"{name}\""), p.some.avg10 / 100.0)],
-            );
+            some_samples.push((format!("resource=\"{name}\""), p.some.avg10 / 100.0));
             if let Some(full) = p.full {
-                metric(
-                    &mut out,
-                    "pressure_full_ratio",
-                    "Share of time with every task stalled, 10s average.",
-                    "gauge",
-                    &[(format!("resource=\"{name}\""), full.avg10 / 100.0)],
-                );
+                full_samples.push((format!("resource=\"{name}\""), full.avg10 / 100.0));
             }
         }
     }
+    metric(
+        &mut out,
+        "pressure_some_ratio",
+        "Share of time with at least one task stalled, 10s average.",
+        "gauge",
+        &some_samples,
+    );
+    metric(
+        &mut out,
+        "pressure_full_ratio",
+        "Share of time with every task stalled, 10s average.",
+        "gauge",
+        &full_samples,
+    );
 
     metric(
         &mut out,
@@ -377,7 +385,19 @@ pub fn render(snap: &Snapshot, top_procs: usize) -> String {
         let proc_label = |p: &crate::metrics::ProcRow| {
             format!("pid=\"{}\",name=\"{}\"", p.pid, escape_label(&p.name))
         };
-        let top: Vec<_> = snap.procs.iter().take(top_procs).collect();
+        // `snap.procs` arrives in the sampler's hash order, so taking the first
+        // N exported an arbitrary handful — on a 2400-process box, every series
+        // was an idle kernel thread and not one of the busiest tasks appeared.
+        // `--once` and the recorder both sort before truncating; so must this.
+        let mut ranked: Vec<&crate::metrics::ProcRow> = snap.procs.iter().collect();
+        ranked.sort_by(|a, b| {
+            b.cpu
+                .partial_cmp(&a.cpu)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.mem.cmp(&a.mem))
+                .then_with(|| a.pid.cmp(&b.pid))
+        });
+        let top: Vec<_> = ranked.into_iter().take(top_procs).collect();
         metric(
             &mut out,
             "process_cpu_percent",
@@ -755,5 +775,60 @@ mod tests {
         }
         // A host with none of that hardware still exports no empty series.
         assert!(!render(&Snapshot::default(), 0).contains("cgroup_memory"));
+    }
+
+    /// Prometheus aborts an entire scrape on a repeated HELP line for one
+    /// metric name. Emitting the pair inside the per-resource loop gave three,
+    /// so on any host with /proc/pressure not one crabmon series was ingested.
+    #[test]
+    fn each_metric_family_declares_itself_exactly_once() {
+        use crate::metrics::psi::{Pressure, PressureLine, PsiSample};
+        let line = PressureLine { avg10: 1.0, ..Default::default() };
+        let p = Pressure { some: line, full: Some(line) };
+        let mut snap = snap();
+        snap.psi = PsiSample { cpu: Some(p), memory: Some(p), io: Some(p) };
+
+        let out = render(&snap, 5);
+        let mut help: Vec<&str> = out
+            .lines()
+            .filter_map(|l| l.strip_prefix("# HELP "))
+            .map(|l| l.split(' ').next().unwrap_or(""))
+            .collect();
+        let before = help.len();
+        help.sort_unstable();
+        help.dedup();
+        assert_eq!(help.len(), before, "a metric family declared HELP more than once");
+
+        // All three resources still reach the scrape, as labelled samples.
+        for resource in ["cpu", "memory", "io"] {
+            assert!(
+                out.contains(&format!("crabmon_pressure_some_ratio{{resource=\"{resource}\"}}")),
+                "{resource} is missing from the scrape"
+            );
+        }
+    }
+
+    /// `snap.procs` arrives in the sampler's hash order, so taking the first N
+    /// exported an arbitrary handful of idle tasks and none of the busiest.
+    #[test]
+    fn the_exported_processes_are_the_busiest_ones() {
+        let mut snap = snap();
+        snap.procs = (0..50)
+            .map(|i| ProcRow {
+                pid: 1000 + i,
+                name: format!("p{i}"),
+                cpu: i as f32,
+                ..Default::default()
+            })
+            .collect();
+        snap.procs.rotate_left(17); // whatever order the map handed back
+
+        let out = render(&snap, 3);
+        let exported: Vec<&str> =
+            out.lines().filter(|l| l.starts_with("crabmon_process_cpu_percent{")).collect();
+        assert_eq!(exported.len(), 3);
+        for (i, name) in ["p49", "p48", "p47"].iter().enumerate() {
+            assert!(exported[i].contains(&format!("name=\"{name}\"")), "{:?}", exported[i]);
+        }
     }
 }

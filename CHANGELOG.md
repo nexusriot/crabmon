@@ -3,6 +3,111 @@
 Notable changes to crabmon. Versions follow [semantic versioning](https://semver.org),
 with the usual 0.x caveat that minor releases may change behaviour.
 
+## 0.7.0 — unreleased
+
+Building, testing and installing crabmon is one command each, and the tooling
+that does it is checked by the suite like everything else.
+
+### Added
+
+- **A `Makefile` and `scripts/build.sh`** covering `build`, `release`, `bin`,
+  `run`, `test`, `test-unit`, `check`, `fmt`, `lint`, `ci`, `deb`, `dist`,
+  `install`/`uninstall` under a `PREFIX` (honouring `DESTDIR`) and `clean`. The
+  Makefile is a front end to the script — one line per target — rather than a
+  second implementation of it, so `make test` and `./scripts/build.sh test`
+  cannot come to mean different things, and every command works on a machine
+  with no make.
+- **`tests/build_script.rs`**, which fails the build if the two drift apart: a
+  `make` target with nothing behind it, a command make cannot reach, or one
+  missing from the script's own help. It also runs the script, which is the only
+  way to catch a syntax error or a dispatcher that resolves nothing before
+  someone needs a build.
+- **Thirty unit tests** over the gaps a `pub fn`-by-`pub fn` audit turned up:
+  `group_rows` and the selection and popup helpers in `app.rs`, which had no
+  in-crate tests at all; the recorder's configured limits actually reaching the
+  frames on disk; `$USER` expansion in saved filters; inode starvation, absent
+  clock readings and swapless machines in the metric model; battery charge
+  direction; popup scroll titles and audit timestamps.
+
+### Fixed
+
+- **The Prometheus exporter was rejected outright by Prometheus.** The PSI loop
+  emitted a fresh `# HELP`/`# TYPE` pair per resource, so
+  `crabmon_pressure_some_ratio` was declared three times — and a repeated HELP
+  makes Prometheus abort the *whole* scrape, so none of the other ~40 series
+  were ingested either. On any host with `/proc/pressure`, i.e. every modern
+  Linux. The resources are now labelled samples under one declaration.
+- **`--serve` exported an arbitrary 20 processes, never the busiest.**
+  `snap.procs` arrives in the sampler's hash order and nothing sorted it, so on
+  a 2400-process machine every exported series was an idle kernel thread.
+  `--once` and the recorder both sort before truncating; now this does too.
+- **Pausing, or scrubbing a replay, pegged a core.** `last_tick` only advances
+  when a tick actually runs, so while paused the countdown to the next refresh
+  stayed expired and the poll timeout collapsed to zero — a redraw spin
+  measured at 100% CPU and 4.4 MB/s of escape sequences, in a system monitor.
+  `App::scrub` pauses too, so this was replay mode's primary interaction.
+- **A malformed `--filter` matched everything instead of failing.**
+  `--once --filter 'cpu>'` printed all 2515 processes with exit 0, while
+  `--watch 'cpu>'` rejected the identical string. The parser now validates it,
+  and `--once` propagates a bad filter from the config file rather than
+  degrading to the empty filter.
+- **`--remote host --watch …` watched the local machine.** `--watch` was the
+  one host-sampling mode missing from the `--remote`/`--replay` refusal — and
+  the one whose exit code drives `&&` in scripts. README and `main.rs` both
+  already documented the guarantee.
+- **A value-taking flag swallowed the next flag.** `--serve --stream` read
+  `--stream` as the bind address, so the exclusivity check never saw it and the
+  run died later at bind time; `--filter --once` started the TUI. Only
+  crabmon's own long flags are refused, so dash-leading values still work.
+- **`service:-` matched most of the machine.** The "no unit" sentinel fell
+  through to a substring match, so drilling into the grouped view's `-` row
+  listed `systemd-journald.service`, `user-1000.slice` and every other
+  hyphenated unit.
+- **Package power was roughly doubled on machines exposing `psys`.** RAPL
+  summed every top-level domain, but `psys` meters the whole platform and
+  already contains `package-0`. The domain's `name` file now decides. The test
+  that covered this had labelled `intel-rapl:1` "second package", certifying
+  the double-count.
+- **A wireless mouse could appear as the machine's battery.** Peripherals
+  publish `type=Battery` too; `scope = Device` now excludes them, so a desktop
+  with a Logitech receiver no longer grows a Power panel.
+- **`MAX_FDS_SCANNED` bounded nothing.** The cap was applied to the finished
+  Vec, after every fd had already been `read_link`ed, so a process holding
+  200k sockets cost 200k syscalls per sample — in the render path.
+- **The interactive filter is no longer persisted.** A `/` query, or a one-off
+  `--filter`, was written into the config on exit, after which every later
+  `crabmon --once` printed an empty process list with exit 0 and the TUI opened
+  on an empty table with no visible cause.
+- **`[procs] ports` did nothing.** It is documented in the README and the man
+  page as the switch that turns the listening-ports lookup on, but nothing in
+  the crate ever read it — the column was gated solely on `[procs] columns`.
+  It now adds the PORTS column to the automatic set, and having been asked for,
+  the column outranks the other optional ones for the width available.
+- **The `--watch` shell example was inverted.** Both the README and the man
+  page said "`&&` runs on a match and `||` on a clean run". A match exits 1, so
+  it is the other way round, and the shipped `… && notify-send 'stuck IO'`
+  fired exactly when nothing was stuck.
+- The man page's EXIT STATUS listed only 0 and 2, never mentioning 1 — which is
+  the code `--watch` exists to return.
+- DESIGN.md's limitations contradicted themselves about `--remote`: one entry
+  said a streaming mode "is not implemented" while another discussed testing
+  the streaming path. Streaming has been the default since 0.6.0.
+- Three panics reachable from ordinary input: a `nan` threshold in the config
+  file tripped `clamp`'s `min <= max` assertion and aborted every mode at
+  startup; a non-ASCII `[colors]` value passed a byte-length guard and then
+  sliced across a char boundary; and `centered_rect` overflowed `u16` from
+  about 860 columns up, collapsing popups to a sliver on wide terminals. An
+  empty `ReplaySource` also underflowed on first use.
+
+### Changed
+
+- `scripts/build-deb.sh` still works — CI and the README have always used that
+  name — but it now delegates to `build.sh deb` rather than being a second copy
+  of the packaging steps.
+- `make install` installs with `mkdir -p` and `install -m` rather than
+  `install -D`, which is a GNU extension the BSDs do not have; and it always
+  rebuilds first, so it cannot ship a stale binary from an earlier checkout.
+
 ## 0.6.0 — unreleased
 
 Nothing in the interface blocks any more, the exporter's rates are correct, and

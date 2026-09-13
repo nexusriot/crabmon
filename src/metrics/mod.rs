@@ -374,6 +374,76 @@ mod tests {
     }
 
     #[test]
+    fn a_swapless_machine_reports_no_swap_pressure_rather_than_dividing_by_zero() {
+        let mem = MemSample { total: 16_000_000_000, used: 8_000_000_000, ..Default::default() };
+        assert_eq!(mem.swap_ratio(), 0.0);
+        assert_eq!(mem.ratio(), 0.5);
+    }
+
+    #[test]
+    fn the_clock_readout_is_absent_rather_than_zero_when_the_platform_hides_it() {
+        // sysinfo reports 0 MHz per core on platforms with no cpufreq; a header
+        // that prints "0 MHz" looks like a stalled CPU rather than no data.
+        assert_eq!(CpuSample { freq_mhz: vec![0, 0, 0], ..Default::default() }.max_freq(), None);
+        assert_eq!(CpuSample::default().max_freq(), None);
+        assert_eq!(
+            CpuSample { freq_mhz: vec![800, 3800, 2400], ..Default::default() }.max_freq(),
+            Some(3800),
+        );
+    }
+
+    #[test]
+    fn a_process_io_rate_is_the_two_directions_added_together() {
+        let p = ProcRow { read_bps: 1024.0, write_bps: 2048.0, ..Default::default() };
+        assert_eq!(p.io_bps(), 3072.0);
+        assert_eq!(ProcRow::default().io_bps(), 0.0);
+    }
+
+    #[test]
+    fn inode_exhaustion_is_only_flagged_when_it_is_worse_than_the_bytes() {
+        // The failure mode a bytes-only gauge hides: 12% full, 99% of inodes
+        // gone. `df` says there is room; the next write still fails.
+        let starved = DiskRow {
+            total: 100_000_000_000,
+            used: 12_000_000_000,
+            inodes_total: 65_536,
+            inodes_used: 64_900,
+            ..Default::default()
+        };
+        assert!(starved.inodes_are_the_problem());
+        assert!(starved.inode_ratio() > starved.ratio());
+
+        // A disk whose inodes track its bytes has nothing extra to say.
+        let ordinary = DiskRow {
+            total: 100,
+            used: 50,
+            inodes_total: 100,
+            inodes_used: 52,
+            ..Default::default()
+        };
+        assert!(!ordinary.inodes_are_the_problem(), "within the 10-point margin");
+
+        // Filesystems that do not have inodes at all (FAT, and every mount on
+        // Windows) must not be reported as starved of them.
+        let inodeless = DiskRow { total: 100, used: 99, ..Default::default() };
+        assert_eq!(inodeless.inode_ratio(), 0.0);
+        assert!(!inodeless.inodes_are_the_problem());
+    }
+
+    #[test]
+    fn aggregate_disk_io_adds_every_mount() {
+        let snap = Snapshot {
+            disks: vec![
+                DiskRow { read_bps: 2048.0, write_bps: 1_048_576.0, ..Default::default() },
+                DiskRow { read_bps: 1024.0, write_bps: 0.0, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(snap.disk_io_totals(), (3072.0, 1_048_576.0));
+        assert_eq!(Snapshot::default().disk_io_totals(), (0.0, 0.0));
+    }
+
+    #[test]
     fn aggregate_network_excludes_virtual_interfaces_by_default() {
         let snap = Snapshot {
             nets: vec![

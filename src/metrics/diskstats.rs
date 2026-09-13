@@ -214,4 +214,19 @@ ada1 1 2 3 4
         assert_eq!(resolve_device_key("/dev/sdz1", &stats, |_| None), None);
         assert_eq!(resolve_device_key("tmpfs", &stats, |_| None), None);
     }
+
+    /// The resolver the other tests stand in for. `resolve_device_key` hands it
+    /// whatever the mount table says the device is, which on a machine with no
+    /// `/dev` at all — a minimal container, or Windows — is not a path.
+    #[test]
+    fn the_production_symlink_resolver_answers_none_instead_of_failing() {
+        assert_eq!(canonicalize_dev("/dev/does-not-exist-crabmon"), None);
+        assert_eq!(canonicalize_dev("tmpfs"), None);
+        assert_eq!(canonicalize_dev(""), None);
+
+        // A path that does exist comes back absolute, which is what the lookup
+        // against /proc/diskstats needs in order to take the last component.
+        let real = canonicalize_dev(".").expect("the working directory resolves");
+        assert!(real.starts_with('/') || cfg!(windows), "{real} is not absolute");
+    }
 }

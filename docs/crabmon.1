@@ -1,4 +1,4 @@
-.TH CRABMON 1 "2026-09-12" "crabmon 0.6.0" "User Commands"
+.TH CRABMON 1 "2026-09-13" "crabmon 0.7.0" "User Commands"
 .SH NAME
 crabmon \- terminal system monitor
 .SH SYNOPSIS
@@ -112,7 +112,8 @@ one process exiting and another starting rather than as enormous growth.
 .B \-\-watch " " \fIQUERY\fR
 Sample headlessly until processes match \fIQUERY\fR (see \fBFILTER LANGUAGE\fR),
 then print them and exit \fB1\fR. Exits \fB0\fR if \fB\-\-watch\-timeout\fR
-elapses first, so \fB&&\fR runs on a match and \fB||\fR on a clean run.
+elapses first. A match is the non-zero exit, so \fB||\fR runs on a match and
+\fB&&\fR on a clean run.
 .TP
 .B \-\-watch\-for " " \fISECS\fR
 Require the match to hold this many consecutive seconds. A condition that
@@ -254,9 +255,11 @@ Settings live in
 .I $XDG_CONFIG_HOME/crabmon/config.toml
 (usually
 .IR ~/.config/crabmon/config.toml ).
-The file is written when the refresh interval changes and on exit. Missing or
-malformed files fall back to defaults; out-of-range values are clamped rather
-than rejected.
+The file is written when the refresh interval changes and on exit. The active
+filter is session state and is not written back, so a query typed at
+.B /
+does not silently narrow later runs. Missing or malformed files fall back to
+defaults; out-of-range values are clamped rather than rejected.
 .SS Top-level keys
 .TP
 .B refresh_ms
@@ -365,8 +368,8 @@ process per sample, falling back automatically when the far end predates
 \fB\-\-stream\fR. Default true.
 .SS [serve]
 .B top_procs
-per-process series are exported by \fB\-\-serve\fR (default 20; 0 disables
-them).
+per-process series are exported by \fB\-\-serve\fR, busiest first (default
+20; 0 disables them).
 .SS [audit]
 .B enabled
 records every signal, renice and affinity change; \fBpath\fR overrides the
@@ -431,7 +434,11 @@ processes read as zero unless crabmon runs as root.
 .SH EXIT STATUS
 .TP
 .B 0
-Success.
+Success. For \fB\-\-watch\fR, this means the condition was never met before
+\fB\-\-watch\-timeout\fR elapsed.
+.TP
+.B 1
+A \fB\-\-watch\fR condition matched, or the run failed.
 .TP
 .B 2
 Invalid command line.

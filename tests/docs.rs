@@ -472,11 +472,21 @@ fn gitignore_does_not_swallow_the_projects_own_files() {
         "completions/crabmon.bash",
         ".github/workflows/ci.yml",
         "scripts/build-deb.sh",
+        "scripts/build.sh",
+        "Makefile",
         "rustfmt.toml",
     ] {
         if git_ignores(path) == Some(true) {
             panic!("{path} is a tracked project file but .gitignore hides it");
         }
+    }
+}
+
+#[test]
+fn the_readme_documents_the_build_driver() {
+    let readme = read("README.md");
+    for target in ["make test", "make bin", "make install", "make clean"] {
+        assert!(readme.contains(target), "the README never mentions `{target}`");
     }
 }
 

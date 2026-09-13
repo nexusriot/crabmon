@@ -321,7 +321,7 @@ terminal or a runaway process:
 
 ## Testing
 
-Over 380 tests: the in-crate unit tests plus five integration suites. All
+Over 450 tests: the in-crate unit tests plus six integration suites. All
 are offline and deterministic except `proc_control`, which deliberately touches
 the kernel:
 
@@ -345,6 +345,12 @@ the kernel:
 - **`tests/proc_control.rs`** — renice, CPU affinity and signals against a real
   spawned child, checked by reading the state back from the kernel. A unit test
   can only prove the arguments were well-formed, not that they were accepted.
+- **`tests/build_script.rs`** — the build tooling against itself: that every
+  `make` target has a command behind it, that every command is reachable through
+  make and described in the script's own help, and that the script runs, reports
+  the crate's version and fails with a status on a mistyped command. `make` is a
+  front end to `scripts/build.sh`, and a front end that has drifted from what it
+  fronts is found when you need the command, not before.
 - **`tests/docs.rs`** — that the man page, completions and README still describe
   the flags, sort keys, themes, layouts, groupings, panels, config fields and key
   bindings the code actually has; that the aliases documented in one place are
@@ -372,10 +378,19 @@ must never write to the user's real config file as a side effect of being used.
 
 ## Packaging
 
-`scripts/build-deb.sh` builds a release binary and runs `cargo-deb`, which
-installs the binary, the man page and bash/zsh/fish completions. CI runs the
-test-suite on Linux, macOS and Windows, checks formatting and clippy, and
-cross-checks the cfg-gated code paths against aarch64 Linux and FreeBSD.
+`scripts/build.sh` is the build driver: building, testing, linting, packaging,
+installing under a `PREFIX` and cleaning up after itself. The `Makefile` is a
+front end to it — one line per target — rather than a second implementation, so
+`make test` and `./scripts/build.sh test` cannot come to mean different things.
+A pair of tests in `tests/docs.rs` assert that the two lists agree and that the
+script's own help covers every command it accepts.
+
+`make deb` (still reachable as `scripts/build-deb.sh`, the name CI uses) builds
+a release binary and runs `cargo-deb`, which installs the binary, the man page
+and bash/zsh/fish completions. `make dist` produces the same file set as a
+tarball for the platforms the deb does not cover. CI runs the test-suite on
+Linux, macOS and Windows, checks formatting and clippy, and cross-checks the
+cfg-gated code paths against aarch64 Linux and FreeBSD.
 
 ## The exporter
 
@@ -423,9 +438,11 @@ one that publishes them.
   since-boot averages rather than instantaneous rates. It is compile-checked in
   CI and unit-tested against captured output, but has never run on real FreeBSD
   hardware.
-- `--remote` re-runs `crabmon --once` over SSH for every sample, so the refresh
-  rate is bounded by the round trip and the far end pays a full startup each
-  time. A streaming mode would be better and is not implemented.
+- `--remote` streams by default (`[remote] stream`, on): one SSH session and
+  one `crabmon --stream` for the whole session. The one-shot fallback, taken
+  when the far end is too old to understand the flag, does re-run
+  `crabmon --once` per sample, and there the refresh rate is bounded by the
+  round trip and the far end pays a full startup each time.
 - The process list is rebuilt and re-sorted on every refresh rather than
   incrementally maintained. At ~2000 processes and an 800 ms interval this costs
   a low double-digit percentage of one core, which is in line with comparable
@@ -434,8 +451,10 @@ one that publishes them.
   long capture costs roughly its JSON size several times over. Nothing indexes
   the file by line offset.
 - The `ports` column walks one fd table per visible row, which is why it is off
-  by default and resolved only for rows actually on screen. A process holding
-  tens of thousands of descriptors is cut off at `MAX_FDS_SCANNED`.
+  by default — `[procs] ports`, or naming it in `[procs] columns`, is what asks
+  for it — and resolved only for rows actually on screen. A process holding tens
+  of thousands of descriptors is cut off at `MAX_FDS_SCANNED`, which bounds the
+  walk itself rather than the list it returns.
 - Pins do not reorder the tree view. The ordering there is structural, and
   hoisting a child out of its parent would draw a tree that is not one.
 - `--diff` holds both snapshots in memory, so diffing two ends of a large
@@ -448,3 +467,28 @@ one that publishes them.
 - The streaming `--remote` path is unit-tested against a controlled child and
   driven end to end through a stand-in `ssh`, but has not been run over a real
   SSH connection; the same caveat the FreeBSD `iostat` path carries.
+
+Open defects, found by review and not yet fixed:
+
+- `ThreadedSource::frame_id` counts frames *delivered*, not distinct samples,
+  and does not consult the source it wraps. Since `RemoteSource` re-hands its
+  last good frame when the far end stalls, an outage is charted as flat,
+  real-looking measurement rather than a gap, and `is_stale()` never raises the
+  `sampling…` notice. `ReplaySource` has the same shape from the other end: it
+  holds the final frame forever while reporting `frame_id() == None`, so a
+  finished replay keeps feeding copies into the history until the recorded
+  incident scrolls out of it.
+- An explicit `[procs] columns` list is never width-checked, so on a narrow
+  terminal `name_width` can reach zero and every process name renders blank.
+  The automatic planner reserves `MIN_NAME`; the configured path does not.
+- Alert rule state is keyed by `rule.name` and nothing enforces that names are
+  unique. Two rules sharing one — one over threshold, one under — clear each
+  other's `fired` flag, so the hook command re-spawns every refresh.
+- The detail popup reads the *local* host for the nice value and socket list
+  rather than the snapshot, so under `--replay` they are missing and under
+  `--remote` they belong to whatever local process holds that PID. The same
+  applies to the `ports` column.
+- Aggregate disk throughput is summed per mount, so a device carrying several
+  mounts — the normal btrfs subvolume layout — is counted once per mount.
+- `MATCHED = 1` is also the exit code a failed run returns, so a `--watch`
+  caller cannot distinguish a match from a typo in the query.

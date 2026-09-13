@@ -184,7 +184,13 @@ impl ReplaySource {
     }
 
     fn current(&self) -> Snapshot {
-        self.frames[self.position.min(self.frames.len() - 1)].clone()
+        // `seek`/`step` already use saturating arithmetic; this did not, so an
+        // empty frame list underflowed to usize::MAX and indexed out of bounds.
+        // `from_frames` is public and accepts any Vec.
+        match self.frames.get(self.position.min(self.frames.len().saturating_sub(1))) {
+            Some(f) => f.clone(),
+            None => Snapshot::default(),
+        }
     }
 }
 
@@ -449,5 +455,62 @@ mod tests {
         let src = ReplaySource::from_frames((0..4).map(frame).collect(), "run.jsonl");
         assert_eq!(src.timeline(), Some((0, 4)));
         assert_eq!(src.label().as_deref(), Some("replay run.jsonl"));
+    }
+
+    /// `trim_frame` is tested directly above, but the recorder is what carries
+    /// the configured limits into it. A builder that set the wrong field would
+    /// leave every one of those tests passing while `[record] top_n`,
+    /// `omit_paths` and `max_cmd_len` did nothing at all.
+    #[test]
+    fn the_configured_limits_reach_the_frames_on_disk() {
+        let path = tmpfile("limits");
+        let mut busy = frame(0);
+        busy.procs = (0..10)
+            .map(|n| ProcRow {
+                pid: n,
+                name: format!("p{n}"),
+                cpu: n as f32,
+                threads: Some(1),
+                cmd: "/usr/bin/something --with-a-very-long-argument-list".into(),
+                exe: "/usr/bin/something".into(),
+                cwd: "/home/vlad/workspace".into(),
+                ..Default::default()
+            })
+            .collect();
+
+        let mut rec = Recorder::create(&path).unwrap().with_limits(3, false, 12);
+        assert_eq!(rec.path(), path);
+        rec.write(&busy).unwrap();
+        drop(rec);
+
+        let replay = ReplaySource::open(&path).unwrap();
+        let stored = replay.peek().unwrap();
+        assert_eq!(stored.procs.len(), 3, "top_n did not reach the writer");
+        assert_eq!(stored.procs[0].pid, 9, "the busiest process should be kept");
+        assert!(stored.procs[0].cmd.chars().count() <= 12, "{:?}", stored.procs[0].cmd);
+        assert!(!stored.procs[0].exe.is_empty(), "paths were not asked to be omitted");
+
+        // ...and omitting paths wins over truncating them.
+        let mut rec = Recorder::create(&path).unwrap().with_limits(0, true, 200);
+        rec.write(&busy).unwrap();
+        drop(rec);
+
+        let stored = ReplaySource::open(&path).unwrap().peek().unwrap();
+        assert_eq!(stored.procs.len(), 10, "top_n = 0 means keep everything");
+        assert!(stored.procs.iter().all(|p| p.cmd.is_empty() && p.exe.is_empty()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `from_frames` is public and takes any Vec; `len() - 1` on an empty one
+    /// underflowed to usize::MAX and indexed out of bounds on first use.
+    #[test]
+    fn an_empty_replay_source_does_not_panic_on_first_use() {
+        let mut src = ReplaySource::from_frames(Vec::new(), "empty");
+        assert!(src.is_empty());
+        let snap = src.snapshot(Duration::from_millis(100));
+        assert!(snap.procs.is_empty());
+        assert!(src.peek().is_some());
+        src.seek(5);
+        let _ = src.snapshot(Duration::from_millis(100));
     }
 }

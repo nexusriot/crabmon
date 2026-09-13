@@ -128,8 +128,13 @@ pub fn socket_inodes_of(pid: u32) -> Vec<u64> {
     let Ok(entries) = fs::read_dir(format!("/proc/{pid}/fd")) else {
         return Vec::new();
     };
+    // The cap belongs here, before the walk. Applying it to the returned Vec
+    // (as `listening_ports` used to) bounded nothing: every fd had already been
+    // read_link'd, so one process holding 200k sockets cost 200k syscalls per
+    // sample and wedged the sampler.
     entries
         .flatten()
+        .take(MAX_FDS_SCANNED)
         .filter_map(|e| fs::read_link(e.path()).ok())
         .filter_map(|target| parse_socket_link(&target.to_string_lossy()))
         .collect()
@@ -165,11 +170,8 @@ pub fn listening_ports(pids: &[u32]) -> HashMap<u32, Vec<u16>> {
         return out;
     }
     for pid in pids {
-        let mut ports: Vec<u16> = socket_inodes_of(*pid)
-            .into_iter()
-            .take(MAX_FDS_SCANNED)
-            .filter_map(|i| listening.get(&i).copied())
-            .collect();
+        let mut ports: Vec<u16> =
+            socket_inodes_of(*pid).into_iter().filter_map(|i| listening.get(&i).copied()).collect();
         ports.sort_unstable();
         ports.dedup();
         if !ports.is_empty() {

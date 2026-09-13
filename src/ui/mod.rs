@@ -200,8 +200,13 @@ fn draw_io(f: &mut Frame<'_>, area: Rect, app: &mut App) {
 
 /// Centred popup rect, clamped so it always fits on screen.
 pub fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
-    let w = (area.width * pct_x / 100).clamp(10, area.width);
-    let h = (area.height * pct_y / 100).clamp(3, area.height);
+    // Widen before multiplying: `area.width * pct_x` overflows u16 from about
+    // 860 columns up, so on an ultrawide or a large tmux pane the popup wrapped
+    // to a sliver instead of growing. The clamp floors are themselves capped by
+    // the area, because `clamp` asserts `min <= max`.
+    let w = ((area.width as u32 * pct_x as u32 / 100) as u16).clamp(10.min(area.width), area.width);
+    let h =
+        ((area.height as u32 * pct_y as u32 / 100) as u16).clamp(3.min(area.height), area.height);
     Rect {
         x: area.x + (area.width - w) / 2,
         y: area.y + (area.height - h) / 2,
@@ -236,5 +241,31 @@ mod tests {
         assert!(p.x + p.width <= area.width);
         assert!(p.y + p.height <= area.height);
         assert!(p.width >= 10 && p.height >= 3);
+    }
+
+    /// `area.width * pct` is u16 arithmetic, so it overflowed from about 860
+    /// columns up and the popup collapsed to a sliver on a wide terminal.
+    #[test]
+    fn popups_scale_on_terminals_wide_enough_to_overflow_the_arithmetic() {
+        for width in [80u16, 862, 863, 1024, 2000, u16::MAX] {
+            let area = Rect { x: 0, y: 0, width, height: 60 };
+            let r = centered_rect(72, 60, area);
+            assert!(r.width <= width, "{width}: popup is wider than the screen");
+            assert!(
+                r.width as u32 >= (width as u32 * 72 / 100).min(width as u32) - 1,
+                "{width}: popup collapsed to {} columns",
+                r.width
+            );
+            assert!(r.x + r.width <= width, "{width}: popup runs off the right edge");
+        }
+    }
+
+    /// `clamp` asserts `min <= max`, so the floors must themselves be capped.
+    #[test]
+    fn a_popup_on_a_terminal_smaller_than_its_floor_does_not_panic() {
+        for (w, h) in [(1u16, 1u16), (5, 2), (9, 3), (0, 0)] {
+            let r = centered_rect(72, 60, Rect { x: 0, y: 0, width: w, height: h });
+            assert!(r.width <= w && r.height <= h);
+        }
     }
 }

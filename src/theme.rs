@@ -211,7 +211,11 @@ impl Theme {
 pub fn parse_color(s: &str) -> Option<Color> {
     let s = s.trim().to_ascii_lowercase();
     if let Some(hex) = s.strip_prefix('#') {
-        if hex.len() != 6 {
+        // `len()` is bytes but the slices below are byte ranges, so a 6-byte
+        // value whose first char is multi-byte ("#日本") passed the guard and
+        // then panicked on a char boundary — taking the whole session down from
+        // a typo in `[colors]`.
+        if hex.len() != 6 || !hex.is_ascii() {
             return None;
         }
         let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
@@ -320,5 +324,16 @@ mod tests {
         assert_eq!(t.series_at(0), t.series_at(t.series.len()));
         let empty = Theme { series: vec![], ..Theme::default() };
         assert_eq!(empty.series_at(3), Color::Reset);
+    }
+
+    /// The `#rrggbb` guard counted bytes and the parse sliced bytes, so a
+    /// 6-byte value whose first char is multi-byte got through and panicked on
+    /// a char boundary — killing the session over a typo in `[colors]`.
+    #[test]
+    fn a_non_ascii_colour_value_is_rejected_rather_than_panicking() {
+        for bad in ["#日本", "#😀ab", "#ＡＢＣ", "#ff88ää"] {
+            assert_eq!(parse_color(bad), None, "{bad} was accepted");
+        }
+        assert_eq!(parse_color("#ff8800"), Some(Color::Rgb(255, 136, 0)));
     }
 }

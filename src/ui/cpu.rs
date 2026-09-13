@@ -221,6 +221,34 @@ mod tests {
         assert_eq!(without.chars().count(), 12 + bar_w);
     }
 
+    /// The detail popup has no room for the per-core grid, so it says how many
+    /// cores the percentages it shows are spread over. Reading the count off
+    /// the snapshot rather than the host is what makes a replay of an 8-core
+    /// machine still say 8 on a 4-core laptop.
+    #[test]
+    fn the_detail_legend_counts_the_cores_in_the_snapshot() {
+        let mut snap = crate::metrics::Snapshot::default();
+        snap.cpu.per_core = vec![0.0; 8];
+        let app = App::new(
+            crate::Config::default(),
+            Box::new(crate::record::ReplaySource::from_frames(vec![snap], "t")),
+        );
+        let text: String = core_legend(&app).spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(text, "8 cores");
+
+        // A source that reports no cores at all must not print a bare "cores".
+        let empty = App::new(
+            crate::Config::default(),
+            Box::new(crate::record::ReplaySource::from_frames(
+                vec![crate::metrics::Snapshot::default()],
+                "t",
+            )),
+        );
+        let text: String =
+            core_legend(&empty).spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(text, "0 cores");
+    }
+
     #[test]
     fn bars_are_exactly_the_requested_width() {
         for pct in [0.0, 13.0, 50.0, 99.9, 100.0, 250.0] {

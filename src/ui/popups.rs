@@ -470,4 +470,71 @@ mod tests {
     fn short_mem_is_compact() {
         assert_eq!(short_mem(475_815_936), "454M");
     }
+
+    fn app_with_popup(height: usize, scroll: usize) -> App {
+        let mut app = App::new(
+            crate::Config::default(),
+            Box::new(crate::record::ReplaySource::from_frames(
+                vec![crate::metrics::Snapshot::default()],
+                "t",
+            )),
+        );
+        app.popup_height = height;
+        app.popup_scroll = scroll;
+        app
+    }
+
+    /// A popup that fits says nothing; one that does not tells you where in it
+    /// you are, because the border is the only place there is room to say so.
+    #[test]
+    fn a_popup_title_only_advertises_scrolling_when_there_is_something_to_scroll() {
+        let app = app_with_popup(20, 0);
+        assert_eq!(scroll_title(" Help ", &app, 20), " Help ", "exactly fits");
+        assert_eq!(scroll_title(" Help ", &app, 3), " Help ", "shorter than the popup");
+
+        let app = app_with_popup(10, 0);
+        assert_eq!(scroll_title(" Help ", &app, 42), " Help 1-10 of 42  [j/k] scroll ");
+    }
+
+    #[test]
+    fn the_visible_range_follows_the_scroll_and_stops_at_the_last_row() {
+        let app = app_with_popup(10, 5);
+        assert!(scroll_title(" Help ", &app, 42).contains("6-15 of 42"));
+
+        // Scrolled to the end: the window would run past the last row, and a
+        // title reading "38-47 of 42" is how that used to look.
+        let app = app_with_popup(10, 37);
+        assert!(scroll_title(" Help ", &app, 42).contains("38-42 of 42"));
+
+        // A popup drawn before it has ever been given a height must not divide
+        // the list into zero-row pages.
+        let app = app_with_popup(0, 0);
+        assert!(scroll_title(" Help ", &app, 42).contains("1-1 of 42"));
+    }
+
+    /// The audit log stores unix seconds; the viewer shows an age, because
+    /// "3m ago" answers "did I do that just now?" and a timestamp does not.
+    #[test]
+    fn audit_timestamps_are_shown_as_an_age() {
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let ago = |secs: u64| relative_time(&(now - secs).to_string());
+
+        assert_eq!(ago(0), "0s ago");
+        assert_eq!(ago(45), "45s ago");
+        assert_eq!(ago(60), "1m ago");
+        assert_eq!(ago(59 * 60), "59m ago");
+        assert_eq!(ago(3600), "1h ago");
+        assert_eq!(ago(25 * 3600), "1d ago");
+        assert_eq!(ago(400 * 86_400), "400d ago");
+    }
+
+    #[test]
+    fn an_unparsable_timestamp_is_shown_as_written_rather_than_as_the_epoch() {
+        // Old logs, a hand-edited file, or a line from some other tool.
+        assert_eq!(relative_time("not-a-time"), "not-a-time");
+        assert_eq!(relative_time(""), "");
+        // A clock that has gone backwards must not underflow into 584 billion years.
+        assert_eq!(relative_time("99999999999"), "0s ago");
+    }
 }

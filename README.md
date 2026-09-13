@@ -81,16 +81,25 @@ and it can print all of it as JSON or CSV for scripts.
 ### From source
 
 ```sh
-cargo build --release
-./target/release/crabmon
+make bin
+./bin/crabmon
 ```
 
-Requires a recent stable Rust toolchain (edition 2021).
+Requires a recent stable Rust toolchain (edition 2021). `make` on its own lists
+every target. To put the binary, the man page and the shell completions on the
+system:
+
+```sh
+sudo make install                    # under /usr/local
+make install PREFIX="$HOME/.local"   # ...or somewhere that needs no root
+```
+
+`make uninstall` takes the same variables and removes exactly those files.
 
 ### Debian package
 
 ```sh
-./scripts/build-deb.sh
+make deb
 ```
 
 The result is `target/debian/crabmon_<version>_<arch>.deb`, which installs the
@@ -268,14 +277,16 @@ four gigabytes.
 ## Waiting for something
 
 ```sh
-crabmon --watch 'state:D' --watch-for 30 --watch-timeout 600 && notify-send 'stuck IO'
+crabmon --watch 'state:D' --watch-for 30 --watch-timeout 600 || notify-send 'stuck IO'
 ```
 
 `--watch` samples headlessly until the query matches. It exits **1** when it
 does, printing the matching processes, and **0** if `--watch-timeout` elapses
-first — so `&&` runs on a match and `||` on a clean run. `--watch-for` requires
-the match to hold that many *consecutive* seconds, so a condition that flickers
-once a minute does not count.
+first. A match is the *non-zero* exit, so it is `||` that runs on a match and
+`&&` that runs on a clean run — the shell's convention, where zero means
+nothing went wrong. `--watch-for` requires the match to hold that many
+*consecutive* seconds, so a condition that flickers once a minute does not
+count.
 
 ## Streaming
 
@@ -291,8 +302,10 @@ crabmon --stream --refresh 5000 | while read -r frame; do ... ; done
 
 Settings live at `$XDG_CONFIG_HOME/crabmon/config.toml`, typically
 `~/.config/crabmon/config.toml`. The file is written when the refresh interval
-changes and on exit. Missing or malformed files fall back to defaults, and
-out-of-range values are clamped rather than rejected.
+changes and on exit — except for the active filter, which is session state and
+is never written back, so a query typed at `/` cannot silently narrow later
+runs. Missing or malformed files fall back to defaults, and out-of-range values
+are clamped rather than rejected.
 
 ```toml
 refresh_ms = 800            # clamped to 200..=10000
@@ -336,7 +349,8 @@ power = true
 # for. Names: mark pid user state cpu trend mem virt thr ni disk time ports name
 # COMMAND is always drawn last, and unknown names are ignored.
 columns = []
-ports = false               # look up listening ports for the rows on screen
+ports = false               # add the PORTS column and look up ports for the
+                            # rows on screen (one fd-table walk per visible row)
 pin_marker = true           # show the ▸ pinned / • tagged marker column
 
 [remote]
@@ -359,7 +373,8 @@ omit_paths = false          # drop command lines, exe and cwd entirely
 max_cmd_len = 200           # truncate argv; Chromium's runs to kilobytes
 
 [serve]
-top_procs = 20              # per-process series exported by --serve; 0 disables
+top_procs = 20              # per-process series exported by --serve, busiest
+                            # first; 0 disables
 
 [audit]
 enabled = true
@@ -419,10 +434,24 @@ that fires at 03:12 and clears at 03:14 says both.
 ## Development
 
 ```sh
-cargo test                  # unit, behaviour, rendering, CLI and doc tests
-cargo clippy --all-targets -- -D warnings
-cargo fmt --all -- --check
+make test         # unit, behaviour, rendering, CLI and doc tests
+make test-unit    # the in-crate unit tests alone
+make lint         # clippy, warnings denied
+make fmt          # reformat the tree
+make ci           # everything CI enforces: fmt-check, lint, test
+make clean        # cargo clean, plus ./bin and ./dist
 ```
+
+Every target is one line of [`scripts/build.sh`](scripts/build.sh), which takes
+the same commands and needs no make:
+
+```sh
+./scripts/build.sh test
+./scripts/build.sh help
+```
+
+`make dist` builds a release tarball of exactly what `make install` would put on
+a machine, for the platforms the Debian package does not cover.
 
 The application logic lives in a library crate with the binary as a thin shell,
 so the whole program is testable headlessly:
@@ -436,6 +465,8 @@ so the whole program is testable headlessly:
   effect, against real spawned processes.
 - `tests/docs.rs` checks that this README, the man page and the shell
   completions still describe what the code does.
+- `tests/build_script.rs` checks that the `Makefile` and `scripts/build.sh`
+  still agree on what each command does.
 
 See [DESIGN.md](DESIGN.md).
 

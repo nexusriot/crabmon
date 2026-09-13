@@ -1,6 +1,11 @@
 # Build output
 /target
 
+# Where `make bin` and `make dist` put a release build and its tarball.
+# See scripts/build.sh.
+/bin/
+/dist/
+
 # Editor and OS cruft
 /.vscode/
 /.idea/
