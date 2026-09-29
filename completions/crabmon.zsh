@@ -3,7 +3,7 @@
 _crabmon() {
     _arguments -s \
         '(-r --refresh)'{-r,--refresh}'[refresh interval in ms]:milliseconds:' \
-        '(-s --sort)'{-s,--sort}'[sort column]:key:(pid name cpu mem virt disk time user state threads nice)' \
+        '(-s --sort)'{-s,--sort}'[sort column]:key:(pid name cpu mem virt disk time user state threads nice fds)' \
         '(-g --group)'{-g,--group}'[group processes]:by:(none service container user)' \
         '--record[append every sample to a JSONL recording]:file:_files' \
         '--replay[replay a recording instead of sampling]:file:_files' \

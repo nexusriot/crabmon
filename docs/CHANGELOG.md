@@ -3,6 +3,79 @@
 Notable changes to crabmon. Versions follow [semantic versioning](https://semver.org),
 with the usual 0.x caveat that minor releases may change behaviour.
 
+## 0.8.0 — unreleased
+
+Six things the existing machinery was one step short of: disks that say when
+they are saturated rather than only when they are full, alerts on the numbers
+crabmon already measured, a filter language that can name every column the
+table sorts on, recordings of incidents nobody predicted, per-process history,
+and the descriptor count that explains a daemon failing every `accept` while
+all its other figures look ordinary.
+
+### Added
+
+- **Disk saturation and latency.** `/proc/diskstats` fields 12–14 — in-flight
+  requests, `io_ticks` and service times — were parsed away and discarded;
+  they now drive a `% busy` and mean request latency on each disk gauge, in the
+  panel title for the busiest device, in `--once`/`--stream`/recordings, and as
+  `crabmon_disk_utilisation_ratio` and `crabmon_disk_request_seconds`. This is
+  the figure a throughput gauge cannot carry: an NVMe serving 4K random reads
+  is pinned at a few MB/s, and the rates draw that as very nearly idle. FreeBSD
+  gets the same numbers from `iostat -x`'s `%b` and `ms/t` columns.
+- **Five more alert kinds.** `psi` (targeting `cpu`, `mem` or `io`, optionally
+  `.full`), `io` for device saturation, `net` for aggregate throughput, `fd`
+  for descriptor exhaustion, and `proc`, which counts the processes matching a
+  filter query. Pressure-stall was the one crabmon called "the number that
+  explains a machine that feels frozen while the CPU graph looks idle" and then
+  offered no way to alert on.
+- **`below` on an alert rule**, firing when the measurement is strictly under
+  the threshold. With `kind = "proc"` this is process-*absence* alerting —
+  `query = "nginx"`, `threshold = 1`, `below = true` pages you when nginx dies
+  and clears when it comes back — which is the condition anyone actually wants
+  to be woken for, and which needed all three pieces to already exist.
+- **`OR` in the filter language.** A standalone `|` between terms, binding
+  looser than the implicit AND, so `nginx cpu>10 | apache` is
+  `(nginx AND cpu>10) OR apache`. Only a `|` with whitespace on both sides is
+  an operator, so `re:^chrom(e|ium)$` is still one regular expression.
+- **The columns the table sorts on can now all be filtered on**: `virt>`,
+  `thr>`, `nice<`, `time>` (in `s`/`m`/`h`/`d`) and `fd>`/`fd%>`. `--sort nice`
+  worked and `nice<0` did not, in a query language whose whole job is to narrow
+  the same table.
+- **A flight recorder.** `[record] flight` keeps that many trimmed frames in
+  memory and writes them out, plus `flight_after` more, whenever an alert
+  fires — so the recording of an incident exists because the incident happened
+  rather than because someone predicted it. The dump is an ordinary recording
+  that `--replay` and `--diff` read. A flapping rule extends the dump in
+  progress instead of leaving a file per refresh.
+- **Per-process history.** The 24-sample CPU buffer behind the TREND column is
+  now 120 samples of CPU, resident memory and disk IO, and `Enter` charts all
+  three with the peak each is scaled against. One sample cannot distinguish a
+  leak from a process that was always big, and leaving the program to find out
+  loses the process.
+- **File descriptors.** `[procs] fds` counts each process's open descriptors
+  and reads its `RLIMIT_NOFILE`, giving an FD column that switches to a
+  percentage once the process is close to its limit, a `fds` sort key, `fd>`
+  and `fd%>` filters, a `kind = "fd"` alert, `fds`/`fd_limit` CSV columns and
+  `crabmon_process_open_fds`/`crabmon_process_max_fds`. 4000 descriptors is
+  unremarkable against a limit of a million and fatal against the default 1024,
+  so the limit is what is actually reported against. Off by default: unlike
+  PORTS it is sampled for every process, because a filter that saw only the
+  rows on screen would be a filter over the wrong set.
+
+### Fixed
+
+- **Aggregate disk throughput counted a device once per mount.** The ordinary
+  btrfs subvolume layout has four or five mounts on one block device, all
+  reporting the same kernel counters, so the dashboard multiplied the machine's
+  whole disk throughput by however many subvolumes happened to be mounted.
+  Totals are now taken per device.
+- **Two alert rules sharing a name cleared each other's state.** Rule state was
+  keyed by `rule.name` and nothing made names unique, so a pair — the obvious
+  one being a rule over a threshold and one under it — shared a `fired` flag,
+  each clearing what the other had just set, and the hook command re-spawned on
+  every single refresh for as long as the condition held. State is keyed by
+  position now.
+
 ## 0.7.0 — unreleased
 
 Building, testing and installing crabmon is one command each, and the tooling

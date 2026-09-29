@@ -62,6 +62,11 @@ impl Default for Panels {
     }
 }
 
+/// Ceiling on the flight recorder's two frame budgets. At the default trim of
+/// 100 processes a frame is tens of kilobytes live, so this is a few hundred
+/// megabytes at the very top — deliberate, but bounded.
+pub const MAX_FLIGHT_FRAMES: usize = 5_000;
+
 /// A filter query bound to a number key.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SavedFilter {
@@ -108,11 +113,38 @@ pub struct RecordConfig {
     /// processes carry multi-kilobyte argv, which is most of a frame otherwise.
     /// 0 disables truncation.
     pub max_cmd_len: usize,
+    /// Frames of context the flight recorder keeps in memory, ready to be
+    /// written out when an alert fires. 0 — the default — switches it off; a
+    /// monitor that writes files unasked is not what anyone installed. At the
+    /// default 800 ms refresh, 750 frames is ten minutes and roughly 40 MB.
+    pub flight: usize,
+    /// Frames written after the alert, so a dump shows the recovery and not
+    /// only the run-up.
+    pub flight_after: usize,
+    /// Where dumps are written. Empty means the working directory.
+    pub flight_dir: String,
 }
 
 impl Default for RecordConfig {
     fn default() -> Self {
-        Self { top_n: 100, omit_paths: false, max_cmd_len: 200 }
+        Self {
+            top_n: 100,
+            omit_paths: false,
+            max_cmd_len: 200,
+            flight: 0,
+            flight_after: 30,
+            flight_dir: String::new(),
+        }
+    }
+}
+
+impl RecordConfig {
+    pub fn limits(&self) -> crate::record::Limits {
+        crate::record::Limits {
+            top_n: self.top_n,
+            omit_paths: self.omit_paths,
+            max_cmd_len: self.max_cmd_len,
+        }
     }
 }
 
@@ -140,6 +172,12 @@ pub struct ProcsConfig {
     /// Look up listening ports for the rows currently on screen. Off by
     /// default: it walks one fd table per visible row.
     pub ports: bool,
+    /// Count each process's open descriptors and read its limit, which adds
+    /// the FD column and makes `fd>` and `fd%>` filters and `kind = "fd"`
+    /// alerts work. Off by default: unlike PORTS it is sampled for every
+    /// process, not only the visible rows, because a filter that only saw the
+    /// rows already on screen would be a filter over the wrong set.
+    pub fds: bool,
     /// Rows to keep pinned across restarts is meaningless — PIDs are recycled —
     /// but the marker column can be switched off.
     pub pin_marker: bool,
@@ -147,7 +185,7 @@ pub struct ProcsConfig {
 
 impl Default for ProcsConfig {
     fn default() -> Self {
-        Self { columns: Vec::new(), ports: false, pin_marker: true }
+        Self { columns: Vec::new(), ports: false, fds: false, pin_marker: true }
     }
 }
 
@@ -307,6 +345,11 @@ impl Config {
         // An unknown column name would otherwise render as a blank strip with
         // no hint about the typo.
         self.procs.columns.retain(|c| crate::ui::procs::column_by_name(c).is_some());
+        // The flight recorder's ring is live memory, and it holds whole
+        // frames. A hand-edited `flight = 100000000` would be an OOM in the
+        // process that exists to make memory pressure visible.
+        self.record.flight = self.record.flight.min(MAX_FLIGHT_FRAMES);
+        self.record.flight_after = self.record.flight_after.min(MAX_FLIGHT_FRAMES);
         self
     }
 
@@ -373,6 +416,20 @@ mod tests {
         assert_eq!(fast.refresh_ms, crate::MIN_REFRESH_MS);
         let slow = Config { refresh_ms: 999_999, ..Default::default() }.sanitize();
         assert_eq!(slow.refresh_ms, crate::MAX_REFRESH_MS);
+    }
+
+    #[test]
+    fn the_flight_recorders_frame_budgets_are_clamped() {
+        // The ring holds whole frames in memory. A hand-edited
+        // `flight = 100000000` would be an out-of-memory kill in the process
+        // that exists to make memory pressure visible.
+        let cfg =
+            Config::parse("[record]\nflight = 100000000\nflight_after = 99999999\n").sanitize();
+        assert_eq!(cfg.record.flight, MAX_FLIGHT_FRAMES);
+        assert_eq!(cfg.record.flight_after, MAX_FLIGHT_FRAMES);
+
+        // ...and the default is off, so nothing writes files unasked.
+        assert_eq!(Config::default().record.flight, 0);
     }
 
     #[test]

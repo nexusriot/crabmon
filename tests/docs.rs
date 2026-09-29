@@ -85,7 +85,8 @@ fn the_packaged_deb_ships_the_files_that_exist() {
         "completions/crabmon.bash",
         "completions/crabmon.zsh",
         "completions/crabmon.fish",
-        "CHANGELOG.md",
+        "docs/CHANGELOG.md",
+        "docs/DESIGN.md",
     ] {
         assert!(manifest.contains(asset), "{asset} is not packaged");
         assert!(fs::metadata(asset).is_ok(), "{asset} is packaged but missing");
@@ -150,7 +151,7 @@ fn the_man_page_version_matches_the_crate() {
 
 #[test]
 fn the_docs_name_every_test_suite_that_exists() {
-    let design = read("DESIGN.md");
+    let design = read("docs/DESIGN.md");
     let mut suites: Vec<String> = fs::read_dir("tests")
         .unwrap()
         .filter_map(|e| e.ok())
@@ -159,11 +160,11 @@ fn the_docs_name_every_test_suite_that_exists() {
         .collect();
     suites.sort();
     for suite in &suites {
-        assert!(design.contains(suite), "DESIGN.md never mentions tests/{suite}");
+        assert!(design.contains(suite), "docs/DESIGN.md never mentions tests/{suite}");
     }
     assert!(
         design.contains(&format!("{} integration suites", number_word(suites.len()))),
-        "DESIGN.md does not say there are {} integration suites",
+        "docs/DESIGN.md does not say there are {} integration suites",
         suites.len()
     );
 }
@@ -393,13 +394,13 @@ fn the_deb_description_covers_the_current_feature_set() {
 fn the_test_count_quoted_in_design_is_not_wildly_stale() {
     // Not exact — that would be churn on every added test — but it must not
     // claim a number the suite has long since passed.
-    let design = read("DESIGN.md");
+    let design = read("docs/DESIGN.md");
     let quoted: usize = design
         .split("Over ")
         .nth(1)
         .and_then(|s| s.split(' ').next())
         .and_then(|n| n.parse().ok())
-        .expect("DESIGN.md should quote a test count as 'Over N tests'");
+        .expect("docs/DESIGN.md should quote a test count as 'Over N tests'");
     // The suites are counted at build time in CI; here just sanity-check the
     // claim is in the right order of magnitude and not above the real figure.
     assert!(quoted >= 200, "the quoted count {quoted} looks stale");
@@ -463,12 +464,12 @@ fn gitignore_does_not_swallow_the_projects_own_files() {
         "src/metrics/psi.rs",
         "tests/docs.rs",
         "README.md",
-        "DESIGN.md",
+        "docs/DESIGN.md",
         "Cargo.toml",
         "Cargo.lock",
         "docs/crabmon.1",
         "docs/crabmon.png",
-        "CHANGELOG.md",
+        "docs/CHANGELOG.md",
         "completions/crabmon.bash",
         ".github/workflows/ci.yml",
         "scripts/build-deb.sh",
@@ -512,11 +513,11 @@ fn every_gitignore_rule_says_what_it_is_for() {
 
 /// The version at the top of the changelog.
 fn changelog_latest_version() -> String {
-    let text = read("CHANGELOG.md");
+    let text = read("docs/CHANGELOG.md");
     text.lines()
         .find_map(|l| l.strip_prefix("## "))
         .map(|l| l.split_whitespace().next().unwrap_or("").to_string())
-        .expect("CHANGELOG.md should open with a '## <version>' heading")
+        .expect("docs/CHANGELOG.md should open with a '## <version>' heading")
 }
 
 #[test]
@@ -531,7 +532,7 @@ fn the_changelog_leads_with_the_current_version() {
 #[test]
 fn the_changelog_accounts_for_every_released_version() {
     // A version bump with no entry is how a changelog stops being useful.
-    let text = read("CHANGELOG.md");
+    let text = read("docs/CHANGELOG.md");
     let versions: Vec<&str> = text
         .lines()
         .filter_map(|l| l.strip_prefix("## "))
@@ -561,7 +562,7 @@ fn the_changelog_accounts_for_every_released_version() {
 /// which is what used to go stale at each version bump.
 #[test]
 fn the_changelog_accounts_for_every_flag_the_parser_accepts() {
-    let text = read("CHANGELOG.md");
+    let text = read("docs/CHANGELOG.md");
     for flag in long_flags() {
         // `--help` and `--version` are not features anyone announces.
         if matches!(flag, "--help" | "--version") {
@@ -573,7 +574,7 @@ fn the_changelog_accounts_for_every_flag_the_parser_accepts() {
 
 #[test]
 fn the_newest_changelog_entry_describes_this_version() {
-    let text = read("CHANGELOG.md");
+    let text = read("docs/CHANGELOG.md");
     // Element 0 is the file preamble; element 1 is the newest release section.
     let latest = text.split("\n## ").nth(1).expect("a release section");
     assert!(
@@ -584,4 +585,132 @@ fn the_newest_changelog_entry_describes_this_version() {
         latest.lines().filter(|l| l.trim_start().starts_with("- ")).count() >= 3,
         "a release with no entries is not a release note"
     );
+}
+
+/// A whitespace/punctuation-delimited token set, so a documented list is
+/// compared as a *list* rather than by substring. `contains("fd")` is
+/// satisfied by the word "fds" three lines further down, which is how the man
+/// page lost the `fd` column without any test noticing.
+fn tokens(text: &str) -> std::collections::HashSet<String> {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '%'))
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_ascii_lowercase())
+        .collect()
+}
+
+/// The words roff marks up with `\\fB...\\fR` or `\\fI...\\fR`, which in a
+/// man-page enumeration are exactly the list items and never the prose joining
+/// them — so "and" does not read as a documented value.
+fn roff_marked(text: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for (open, close) in [("\\fB", "\\fR"), ("\\fI", "\\fR")] {
+        for piece in text.split(open).skip(1) {
+            if let Some(word) = piece.split(close).next() {
+                out.extend(tokens(word));
+            }
+        }
+    }
+    out
+}
+
+/// The text between `start` and the next occurrence of `end`.
+fn between(text: &str, start: &str, end: &str) -> String {
+    let i = text.find(start).unwrap_or_else(|| panic!("{start} is missing"));
+    let rest = &text[i + start.len()..];
+    let j = rest.find(end).unwrap_or_else(|| panic!("{end} is missing after {start}"));
+    rest[..j].to_string()
+}
+
+/// The `[procs] columns` list is written out in three places — the code, the
+/// README's config block and the man page — and the man page silently lost
+/// `fd` when the column was added. Derived from `ALL_COLUMNS`, and compared as
+/// a token list so a mention elsewhere in the same paragraph cannot stand in
+/// for a missing entry.
+#[test]
+fn every_configurable_column_is_documented_where_the_option_is_described() {
+    let readme = read("README.md");
+    let man = read("docs/crabmon.1");
+
+    // Just the enumeration, in each document.
+    let readme_names = tokens(&between(&readme, "# for. Names:", "COMMAND is always"));
+    let man_names = roff_marked(&between(&man, "Names are", "COMMAND is always"));
+
+    let expected: std::collections::HashSet<String> =
+        crabmon::ui::procs::ALL_COLUMNS.iter().map(|c| c.id.to_string()).collect();
+
+    for id in &expected {
+        assert!(readme_names.contains(id), "the README's column list omits `{id}`");
+        assert!(man_names.contains(id), "the man page's column list omits `{id}`");
+    }
+    // ...and the mirror: a column removed from the code but left in the docs.
+    for listed in readme_names.union(&man_names) {
+        assert!(
+            expected.contains(listed),
+            "the docs list a column `{listed}` that no longer exists"
+        );
+    }
+}
+
+#[test]
+fn every_alert_kind_is_documented_where_the_rule_is_described() {
+    let readme = read("README.md");
+    let man = read("docs/crabmon.1");
+
+    // Scoped to the lines that spell out the vocabulary, so an incidental
+    // "cpu" or "io" elsewhere in either document cannot satisfy this.
+    let readme_row = readme
+        .lines()
+        .find(|l| l.trim_start().starts_with("kind = "))
+        .expect("the README config block should describe an alert kind")
+        .to_string();
+    let readme_kinds = tokens(&readme_row);
+    // The kinds are an `.IR` alternating list rather than inline `\\fB` markup,
+    // so the plain token set of that one sentence is the list.
+    let man_kinds = tokens(&between(&man, "is one of", "A rule fires"));
+
+    for kind in crabmon::alerts::ALL_ALERT_KINDS {
+        let k = kind.key_name();
+        assert!(readme_kinds.contains(k), "the README's `kind =` comment omits {k}");
+        assert!(man_kinds.contains(k), "the man page's [[alert]] entry omits {k}");
+    }
+}
+
+/// Filter fields, like sort keys, are written out in the README and the man
+/// page; both lists are hand-maintained and both went stale before. Scoped to
+/// the worked example in each, which is the list a reader actually consults.
+#[test]
+fn every_filter_field_is_documented_in_both_places() {
+    let readme = read("README.md");
+    let man = read("docs/crabmon.1");
+
+    let readme_block = between(&readme, "### Filter language", "```\n\nOnly a");
+    let man_block = between(&man, ".SH FILTER LANGUAGE", ".fi");
+
+    for term in [
+        "user:",
+        "pid:",
+        "ppid:",
+        "state:",
+        "cmd:",
+        "re:",
+        "service:",
+        "container:",
+        "cpu>",
+        "mem>",
+        "io>",
+        "virt>",
+        "thr>",
+        "nice<",
+        "time>",
+        "fd>",
+        "fd%>",
+    ] {
+        assert!(readme_block.contains(term), "the README's filter table omits {term}");
+        assert!(man_block.contains(term), "the man page's filter table omits {term}");
+    }
+    // `|` is an operator rather than a term, and is the easiest thing here to
+    // leave undocumented.
+    for (doc, name) in [(&readme_block, "README"), (&man_block, "man page")] {
+        assert!(doc.contains('|'), "the {name}'s filter table never shows the OR operator");
+    }
 }

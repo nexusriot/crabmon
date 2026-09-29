@@ -220,6 +220,8 @@ fn a_firing_alert_takes_over_the_status_line() {
         kind: crabmon::alerts::AlertKind::Disk,
         threshold: 90.0,
         for_secs: 0,
+        below: false,
+        query: String::new(),
         target: "/boot".into(),
         command: String::new(),
         command_clear: String::new(),
@@ -600,4 +602,107 @@ fn the_sampling_notice_never_buries_the_source_label() {
     let screen = screen(&mut app, 160, 20);
     assert!(screen.contains("UNREACHABLE"), "{screen}");
     assert!(screen.contains("sampling"), "{screen}");
+}
+
+#[test]
+fn the_fd_column_appears_only_when_descriptors_are_being_counted() {
+    // Without `[procs] fds` nothing has a count, so a column of dashes would
+    // be a column of nothing.
+    let mut a = app();
+    a.tick();
+    assert!(!screen(&mut a, 160, 48).contains("FD"), "unasked-for column");
+
+    let mut cfg = common::config();
+    cfg.procs.fds = true;
+    let mut snap = snapshot();
+    for (i, p) in snap.procs.iter_mut().enumerate() {
+        p.fds = Some(40 + i as u32 * 10);
+        p.fd_limit = Some(1024);
+    }
+    let mut a = crabmon::App::new(cfg, Box::new(FakeSource::single(snap)));
+    a.tick();
+    let s = screen(&mut a, 160, 48);
+    assert!(s.contains("FD"), "the column is missing:\n{s}");
+    assert!(s.contains(" 40"), "the count is missing:\n{s}");
+}
+
+#[test]
+fn a_process_near_its_descriptor_limit_reads_as_a_percentage_not_a_count() {
+    // 1000 descriptors means nothing on its own; 98% of the limit is the whole
+    // story, and only one of the two fits in the column.
+    let mut cfg = common::config();
+    cfg.procs.fds = true;
+    let mut snap = snapshot();
+    for p in snap.procs.iter_mut() {
+        p.fds = Some(1004);
+        p.fd_limit = Some(1024);
+    }
+    let mut a = crabmon::App::new(cfg, Box::new(FakeSource::single(snap)));
+    a.tick();
+    let s = screen(&mut a, 160, 48);
+    assert!(s.contains("98%"), "expected the share of the limit in:\n{s}");
+}
+
+#[test]
+fn the_detail_pane_charts_what_the_process_has_been_doing() {
+    // One sample cannot answer "is this leaking or is it just big", and
+    // leaving the program to find out loses the process.
+    let mut a = app();
+    for _ in 0..6 {
+        a.tick();
+    }
+    a.on_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_eq!(a.mode, Mode::Detail);
+    let s = screen(&mut a, 120, 44);
+    for needle in ["CPU trend", "RSS trend", "IO trend", "peak"] {
+        assert!(s.contains(needle), "{needle} missing from the detail pane:\n{s}");
+    }
+}
+
+#[test]
+fn a_process_with_no_history_yet_says_so_rather_than_drawing_a_flat_line() {
+    // A blank sparkline reads as a measured, idle process.
+    let mut a = app();
+    a.on_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    let s = screen(&mut a, 120, 44);
+    assert!(s.contains("no history yet"), "{s}");
+}
+
+#[test]
+fn the_detail_pane_reports_descriptors_against_the_limit_that_bounds_them() {
+    let mut cfg = common::config();
+    cfg.procs.fds = true;
+    let mut snap = snapshot();
+    for p in snap.procs.iter_mut() {
+        p.fds = Some(900);
+        p.fd_limit = Some(1024);
+    }
+    let mut a = crabmon::App::new(cfg, Box::new(FakeSource::single(snap)));
+    a.tick();
+    a.on_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    let s = screen(&mut a, 120, 44);
+    assert!(s.contains("900 / 1024 max"), "{s}");
+    assert!(s.contains("88%"), "{s}");
+}
+
+#[test]
+fn a_saturated_disk_is_labelled_busy_even_when_it_is_nearly_empty() {
+    // The failure a capacity gauge and a throughput figure both hide.
+    let mut snap = snapshot();
+    snap.disks[0].util = Some(0.97);
+    snap.disks[0].await_ms = Some(11.2);
+    snap.disks[0].read_bps = 4_000_000.0;
+    let mut a = crabmon::App::new(common::config(), Box::new(FakeSource::single(snap)));
+    a.tick();
+    let s = screen(&mut a, 160, 48);
+    assert!(s.contains("97% busy"), "expected the utilisation in:\n{s}");
 }

@@ -1,4 +1,4 @@
-.TH CRABMON 1 "2026-09-13" "crabmon 0.7.0" "User Commands"
+.TH CRABMON 1 "2026-09-29" "crabmon 0.8.0" "User Commands"
 .SH NAME
 crabmon \- terminal system monitor
 .SH SYNOPSIS
@@ -8,8 +8,11 @@ crabmon \- terminal system monitor
 .B crabmon
 is a keyboard-driven terminal system monitor. It shows per-core CPU history,
 memory and swap, a sortable and filterable process table with an optional tree
-view and per-process disk IO, network throughput, per-mount disk usage and IO,
-temperature sensors, GPU utilisation and cgroup limits.
+view and per-process disk IO, network throughput, per-mount disk usage,
+throughput and saturation, temperature sensors, GPU utilisation and cgroup
+limits. Given
+.B [procs] fds
+it also counts each process's open file descriptors against its own limit.
 .PP
 With
 .B \-\-once
@@ -24,7 +27,8 @@ percentages to mean anything.
 .TP
 .BR \-s ", " \-\-sort " " \fIKEY\fR
 Initial sort column: \fBpid\fR, \fBname\fR, \fBcpu\fR, \fBmem\fR, \fBvirt\fR,
-\fBdisk\fR, \fBtime\fR, \fBuser\fR, \fBstate\fR, \fBthreads\fR or \fBnice\fR.
+\fBdisk\fR, \fBtime\fR, \fBuser\fR, \fBstate\fR, \fBthreads\fR, \fBnice\fR or
+\fBfds\fR.
 .TP
 .BR \-a ", " \-\-ascending
 Sort ascending.
@@ -233,11 +237,15 @@ Show the alert rules and their state.
 Show all key bindings.
 .SH FILTER LANGUAGE
 Terms are separated by whitespace and combined with AND. A leading \fB!\fR
-negates a term.
+negates a term. A standalone \fB|\fR is OR, and binds looser than the implicit
+AND, so \fBa b | c\fR means \fB(a AND b) OR c\fR. Only a \fB|\fR surrounded
+by whitespace is an operator, so a regular expression containing one is left
+alone.
 .PP
 .nf
 firefox            name contains "firefox"
 !kworker           name does not contain "kworker"
+nginx | apache     either one
 user:vlad          user name contains "vlad"
 pid:1234           exact PID
 ppid:1             exact parent PID
@@ -248,8 +256,19 @@ cmd:\-\-headless     substring of the full command line
 re:^chrom(e|ium)$  regular expression over the process name
 cpu>5              CPU percentage comparison (> >= < <= =)
 mem>100M           resident memory comparison, with K/M/G/T suffixes
+virt>2G            virtual size, same suffixes
 io>1M              disk IO rate comparison
+thr>50             thread count
+nice<0             scheduling priority
+time>2h            run time, in s/m/h/d; a bare number is seconds
+fd>1000            open file descriptors (needs [procs] fds)
+fd%>90             ...as a percentage of the process's own limit
 .fi
+.PP
+A process that does not report a value never satisfies a comparison on it: a
+thread has no thread count, and another user's process reports no descriptors.
+Reading either as zero would sweep every one of them into \fBthr<2\fR and
+\fBfd<100\fR.
 .SH CONFIGURATION
 Settings live in
 .I $XDG_CONFIG_HOME/crabmon/config.toml
@@ -267,8 +286,8 @@ Refresh interval in milliseconds, clamped to 200\-10000. Default 800.
 .TP
 .B sort_by
 Sort column: \fBpid\fR, \fBname\fR, \fBcpu\fR, \fBmem\fR, \fBvirt\fR,
-\fBdisk\fR, \fBtime\fR, \fBuser\fR, \fBstate\fR, \fBthreads\fR, \fBnice\fR.
-Default \fBcpu\fR.
+\fBdisk\fR, \fBtime\fR, \fBuser\fR, \fBstate\fR, \fBthreads\fR, \fBnice\fR,
+\fBfds\fR. Default \fBcpu\fR.
 .TP
 .B sort_desc
 Sort descending. Default true.
@@ -349,13 +368,27 @@ over threads (default 100; 0 keeps everything, at roughly 1.5 MB a frame).
 truncates command lines (default 200) and
 .B omit_paths
 drops them, along with executable paths and working directories, entirely.
+.PP
+.B flight
+turns on the flight recorder: that many frames of context are held in memory at
+all times and written out, together with the next
+.B flight_after
+frames, whenever an alert fires \(em so the recording of an incident exists
+because the incident happened rather than because someone predicted it.
+Default 0, which switches it off.
+.B flight_dir
+is where dumps are written (empty means the working directory); each is named
+\fBcrabmon\-<rule>\-<unix>.jsonl\fR and replays like any other recording. At
+the default 800 ms refresh, \fBflight = 750\fR is ten minutes and roughly
+40 MB of live memory. A rule that flaps extends the dump in progress rather
+than opening a file per refresh.
 .SS [procs]
 .B columns
 fixes the column order instead of fitting the terminal width. Names are
 \fBmark\fR, \fBpid\fR, \fBuser\fR, \fBstate\fR, \fBcpu\fR, \fBtrend\fR,
-\fBmem\fR, \fBvirt\fR, \fBthr\fR, \fBni\fR, \fBdisk\fR, \fBtime\fR,
-\fBports\fR and \fBname\fR; COMMAND is always drawn last and unknown names are
-ignored. Empty (the default) fits as many as will go.
+\fBmem\fR, \fBvirt\fR, \fBthr\fR, \fBni\fR, \fBfd\fR, \fBdisk\fR,
+\fBtime\fR, \fBports\fR and \fBname\fR; COMMAND is always drawn last and
+unknown names are ignored. Empty (the default) fits as many as will go.
 .B ports
 looks up listening ports for the rows on screen — one fd table per visible row,
 so it is off by default.
@@ -392,16 +425,45 @@ Values may be colour names (\fBred\fR), hex (\fB#ff8800\fR) or 256-colour
 indexes (\fB33\fR). Unknown keys and unparseable values are ignored.
 .SS [[alert]]
 Each table defines one rule:
-.IR name ", " kind " (" cpu ", " mem ", " swap ", " load ", " disk ", " temp ", "
-.IR gpu "), " threshold ", " for_secs ", " target ", " command " and "
-.IR command_clear .
+.IR name ", " kind ", " threshold ", " for_secs ", " below ", " target ", "
+.IR query ", " command " and " command_clear .
+.I kind
+is one of
+.IR cpu ", " mem ", " swap ", " load ", " disk ", " temp ", " gpu ", " psi ", "
+.IR io ", " net ", " fd " or " proc .
 A rule fires only once its condition has held for \fIfor_secs\fR seconds, and
 its \fIcommand\fR runs once per activation. \fIcommand_clear\fR runs once when
 it recovers, and the alert popup (\fB!\fR) logs every transition,
 so an alert that fired at 03:12 and cleared at 03:14 says both.
+.PP
+.I threshold
+is a percentage for \fIcpu\fR, \fImem\fR, \fIswap\fR, \fIdisk\fR,
+\fIgpu\fR, \fIpsi\fR, \fIio\fR and \fIfd\fR, degrees for \fItemp\fR,
+bytes per second for \fInet\fR, a plain count for \fIproc\fR and an absolute
+figure for \fIload\fR.
+.I below
+fires when the measurement is strictly under the threshold instead of at or
+over it, which is the only way to say "fewer than one nginx". The comparison is
+strict where the default is inclusive, so \fBthreshold = 1\fR on a \fIproc\fR
+rule means "none running" rather than "one or fewer".
+.PP
 .I target
-restricts disk rules to a mount point, temperature rules to a sensor prefix and
-GPU rules to a device name.
+restricts disk and io rules to a mount point, temperature rules to a sensor
+prefix, GPU rules to a device name, net rules to an interface and fd rules to a
+process name. For \fIpsi\fR it names the resource \(em \fBcpu\fR,
+\fBmem\fR or \fBio\fR, optionally suffixed \fB.full\fR \(em and an empty
+target is the worst \fBsome\fR reading of the three.
+.I query
+is the filter query a \fIproc\fR rule counts matches of; a query that does not
+parse leaves the rule inert rather than counting zero.
+.PP
+.I io
+is device utilisation, not capacity: the figure that says a disk is the
+bottleneck when it is serving small random reads at a few MB/s and both its
+throughput and its free space look fine.
+.I fd
+measures each process against its own descriptor limit, which needs
+\fB[procs] fds\fR.
 .SH RECORDINGS
 .B \-\-record
 writes one JSON object per sample, so a recording is greppable with
@@ -415,22 +477,46 @@ about 240 MiB for an hour at the default interval.
 While replaying, sampling is paused: \fB[\fR and \fB]\fR step one frame,
 \fB{\fR and \fB}\fR step ten, and \fBz\fR plays on. Every panel renders
 from the recording exactly as it would from the live host.
+.SS Flight recorder
+.B \-\-record
+only helps if it was started before the incident, which is the one thing nobody
+does. With
+.B [record] flight
+set, crabmon holds that many recent frames in memory at all times and writes
+them out \(em plus
+.B flight_after
+further frames \(em whenever an alert fires. The result is an ordinary
+recording named \fBcrabmon\-<rule>\-<unix>.jsonl\fR, readable by
+.B \-\-replay
+and
+.BR \-\-diff .
+Frames are trimmed by the same \fB[record]\fR limits on the way into the ring,
+so the window costs what a recording of it would.
 .SH PLATFORM NOTES
 Sending signals and renice are Unix-only. CPU affinity, GPU statistics
-(\fI/sys/class/drm\fR), cgroup limits, process grouping, open-socket lookup and
-pressure stall information are Linux-only; those panels are simply absent
-elsewhere. Pressure needs Linux 4.20+ with \fBCONFIG_PSI=y\fR.
+(\fI/sys/class/drm\fR), cgroup limits, process grouping, open-socket lookup,
+the file-descriptor count (\fI/proc/<pid>/fd\fR and \fI/proc/<pid>/limits\fR)
+and pressure stall information are Linux-only; those panels and columns are
+simply absent elsewhere. Pressure needs Linux 4.20+ with \fBCONFIG_PSI=y\fR.
 .PP
-Per-disk IO comes from \fI/proc/diskstats\fR on Linux and from
+Per-disk IO, utilisation and request latency come from \fI/proc/diskstats\fR on
+Linux and from
 .BR iostat (8)
-on FreeBSD. The FreeBSD path is compile-checked and unit-tested against captured
-output but has not been exercised on real hardware.
+on FreeBSD, where they are since-boot averages rather than the interval rates
+the Linux path derives. The FreeBSD path is compile-checked and unit-tested
+against captured output but has not been exercised on real hardware.
 .PP
 Battery and mains state need no privileges. CPU package power comes from RAPL,
 whose counters are root-only on most kernels since CVE-2020-8694; the figure is
 omitted rather than guessed when they cannot be read. Per-process disk IO
 requires permission to read \fI/proc/<pid>/io\fR, so figures for other users'
-processes read as zero unless crabmon runs as root.
+processes read as zero unless crabmon runs as root; their fd tables are
+unreadable for the same reason, and report as unknown rather than zero.
+.PP
+Alerts \(em and so the flight recorder \(em are evaluated only by the
+interactive interface.
+.BR \-\-once ", " \-\-serve ", " \-\-stream " and " \-\-watch
+do not evaluate rules and never write a dump.
 .SH EXIT STATUS
 .TP
 .B 0

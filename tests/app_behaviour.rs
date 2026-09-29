@@ -369,6 +369,8 @@ fn alerts_fire_once_their_hold_time_elapses() {
         kind: crabmon::alerts::AlertKind::Disk,
         threshold: 90.0,
         for_secs: 0,
+        below: false,
+        query: String::new(),
         target: "/boot".into(),
         command: String::new(),
         command_clear: String::new(),
@@ -977,4 +979,96 @@ fn pausing_clears_a_stale_sampler_notice() {
     a.on_key(key('z'));
     assert!(a.paused);
     assert!(!a.is_stale());
+}
+
+#[test]
+fn per_process_history_covers_memory_and_io_as_well_as_cpu() {
+    // One sample cannot distinguish a leak from a process that is simply big,
+    // and the answer has to be there the moment the detail pane opens rather
+    // than start accumulating then.
+    // `App::new` takes the first frame for itself, so the four ticks below
+    // read frames 1..=4.
+    let mut frames = Vec::new();
+    for i in 0..5u64 {
+        let mut snap = snapshot();
+        for p in snap.procs.iter_mut() {
+            p.mem = 100_000_000 * (i + 1);
+            p.read_bps = 1024.0 * i as f64;
+        }
+        frames.push(snap);
+    }
+    let mut a = crabmon::App::new(common::config(), Box::new(FakeSource::new(frames)));
+    for _ in 0..4 {
+        a.tick();
+    }
+
+    let pid = a.rows()[0].pid;
+    let series = a.proc_series(pid).expect("the selected process has a series");
+    assert_eq!(series.len(), 4);
+    assert_eq!(series.mem, vec![200_000_000, 300_000_000, 400_000_000, 500_000_000]);
+    assert_eq!(series.io, vec![1024.0, 2048.0, 3072.0, 4096.0]);
+    // ...and the TREND column still reads the same buffer.
+    assert_eq!(a.cpu_spark(pid).len(), 4);
+}
+
+#[test]
+fn every_per_process_series_is_bounded_not_just_the_cpu_one() {
+    let mut a = app();
+    for _ in 0..(crabmon::app::PROC_HIST_LEN + 40) {
+        a.tick();
+    }
+    let pid = a.rows()[0].pid;
+    let series = a.proc_series(pid).unwrap();
+    assert_eq!(series.cpu.len(), crabmon::app::PROC_HIST_LEN);
+    assert_eq!(series.mem.len(), crabmon::app::PROC_HIST_LEN);
+    assert_eq!(series.io.len(), crabmon::app::PROC_HIST_LEN);
+}
+
+#[test]
+fn a_dead_process_takes_all_of_its_series_with_it() {
+    let mut gone = snapshot();
+    gone.procs.clear();
+    let mut a = crabmon::App::new(
+        common::config(),
+        Box::new(FakeSource::new(vec![snapshot(), snapshot(), gone])),
+    );
+    a.tick();
+    let pid = a.rows()[0].pid;
+    assert!(a.proc_series(pid).is_some());
+    a.tick();
+    assert!(a.proc_series(pid).is_none(), "the whole entry goes, not just the CPU vector");
+}
+
+#[test]
+fn descriptors_can_be_filtered_on_like_any_other_column() {
+    // The asymmetry this closes: the table could sort on a column the filter
+    // language could not name.
+    let mut snap = snapshot();
+    for (i, p) in snap.procs.iter_mut().enumerate() {
+        p.fds = Some(if i == 0 { 5_000 } else { 12 });
+        p.fd_limit = Some(1_024);
+    }
+    let busiest = snap.procs[0].pid;
+    let mut a = crabmon::App::new(common::config(), Box::new(FakeSource::single(snap)));
+    a.tick();
+
+    let retype = |a: &mut crabmon::App, query: &str| {
+        a.on_key(code(KeyCode::Esc));
+        a.on_key(key('/'));
+        for c in query.chars() {
+            a.on_key(key(c));
+        }
+        a.on_key(code(KeyCode::Enter));
+    };
+
+    retype(&mut a, "fd>1000");
+    assert!(a.filter_error.is_none());
+    assert_eq!(a.rows().len(), 1);
+    assert_eq!(a.rows()[0].pid, busiest);
+
+    retype(&mut a, "fd%>90");
+    assert_eq!(a.rows().len(), 1, "well past its own limit");
+
+    retype(&mut a, "fd>1000 | thr>0");
+    assert!(a.rows().len() > 1, "`|` widens rather than narrows");
 }

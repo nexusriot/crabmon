@@ -21,9 +21,11 @@ pub enum SortBy {
     State,
     Threads,
     Nice,
+    /// Open file descriptors. Always `-` unless `[procs] fds` is on.
+    Fds,
 }
 
-pub const ALL_SORTS: [SortBy; 11] = [
+pub const ALL_SORTS: [SortBy; 12] = [
     SortBy::Pid,
     SortBy::Name,
     SortBy::Cpu,
@@ -35,6 +37,7 @@ pub const ALL_SORTS: [SortBy; 11] = [
     SortBy::State,
     SortBy::Threads,
     SortBy::Nice,
+    SortBy::Fds,
 ];
 
 impl SortBy {
@@ -51,6 +54,7 @@ impl SortBy {
             SortBy::State => "S",
             SortBy::Threads => "THR",
             SortBy::Nice => "NI",
+            SortBy::Fds => "FD",
         }
     }
 
@@ -75,6 +79,7 @@ impl SortBy {
             SortBy::State => "state",
             SortBy::Threads => "threads",
             SortBy::Nice => "nice",
+            SortBy::Fds => "fds",
         }
     }
 
@@ -106,6 +111,7 @@ pub fn compare(a: &ProcRow, b: &ProcRow, key: SortBy, desc: bool) -> Ordering {
         SortBy::State => a.state.cmp(&b.state),
         SortBy::Threads => a.threads.cmp(&b.threads),
         SortBy::Nice => a.nice.cmp(&b.nice),
+        SortBy::Fds => a.fds.cmp(&b.fds),
     };
     let primary = if desc { primary.reverse() } else { primary };
     primary.then_with(|| a.pid.cmp(&b.pid))

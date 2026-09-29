@@ -23,9 +23,17 @@ use crate::theme::Theme;
 use crate::tree::{self, TreeRow};
 use crate::ui::Layout;
 
-/// Samples kept per process for the sparkline column. Short on purpose: one
-/// vector per process on a 2000-task machine adds up.
-pub const PROC_SPARK_LEN: usize = 24;
+/// Samples kept per process. The TREND column reads the tail of this and the
+/// detail pane charts all of it, which is why it is no longer the eight
+/// samples one column needed.
+///
+/// One vector per process on a 2000-task machine does add up: at three series
+/// of this length that is a few megabytes, which buys "is this leaking or is
+/// it just big" without having to leave the program and come back later.
+pub const PROC_HIST_LEN: usize = 120;
+
+/// Kept for callers that only want the sparkline column's window.
+pub const PROC_SPARK_LEN: usize = PROC_HIST_LEN;
 
 /// Signals offered in the signal menu, in the order they are listed.
 pub const SIGNAL_NAMES: [&str; 9] = [
@@ -167,8 +175,8 @@ pub struct App {
     /// The frame the last tick saw, for sources that sample asynchronously.
     last_frame_id: Option<u64>,
     stale: bool,
-    /// Per-PID CPU history for the sparkline column.
-    cpu_spark: HashMap<u32, Vec<f32>>,
+    /// Per-PID time series: the TREND column and the detail pane's charts.
+    proc_hist: HashMap<u32, ProcSeries>,
     /// Sockets of the process whose detail pane is open, fetched on demand.
     pub detail_sockets: Vec<sockets::Socket>,
     /// Where actions are logged. `None` disables the audit log.
@@ -234,7 +242,7 @@ impl App {
             popup_height: 1,
             last_frame_id: None,
             stale: false,
-            cpu_spark: HashMap::new(),
+            proc_hist: HashMap::new(),
             detail_sockets: Vec::new(),
             audit_path: None,
             audit_entries: Vec::new(),
@@ -311,27 +319,29 @@ impl App {
         self.record_process_history();
     }
 
-    /// A short CPU history per process, for the sparkline column. Bounded by
-    /// evicting processes that are no longer in the snapshot.
+    /// CPU, resident memory and disk IO per process, for the TREND column and
+    /// the detail pane. Bounded by evicting processes that are no longer in
+    /// the snapshot.
     fn record_process_history(&mut self) {
         let live: HashSet<u32> = self.snap.procs.iter().map(|p| p.pid).collect();
-        self.cpu_spark.retain(|pid, _| live.contains(pid));
+        self.proc_hist.retain(|pid, _| live.contains(pid));
         // Tags and pins outlive their processes otherwise: the "[N tagged]"
         // counter kept counting the dead, and a pinned PID could be recycled
         // onto an unrelated process and quietly hoisted to the top.
         self.tagged.retain(|pid| live.contains(pid));
         self.pinned.retain(|pid| live.contains(pid));
         for p in &self.snap.procs {
-            let series = self.cpu_spark.entry(p.pid).or_default();
-            if series.len() >= PROC_SPARK_LEN {
-                series.remove(0);
-            }
-            series.push(p.cpu);
+            self.proc_hist.entry(p.pid).or_default().push(p);
         }
     }
 
     pub fn cpu_spark(&self, pid: u32) -> &[f32] {
-        self.cpu_spark.get(&pid).map(|v| v.as_slice()).unwrap_or(&[])
+        self.proc_hist.get(&pid).map(|s| s.cpu.as_slice()).unwrap_or(&[])
+    }
+
+    /// Everything recorded about one process over time, for the detail pane.
+    pub fn proc_series(&self, pid: u32) -> Option<&ProcSeries> {
+        self.proc_hist.get(&pid)
     }
 
     /// Recompute the filtered, sorted (or tree-ordered) process view and keep
@@ -1269,6 +1279,42 @@ fn threads_are_distinguishable(procs: &[ProcRow]) -> bool {
 }
 
 /// One row of the grouped process view.
+/// What one process did over the last `PROC_HIST_LEN` samples.
+///
+/// Three parallel vectors rather than a vector of triples: every reader wants
+/// one series at a time, and the sparkline helpers take a slice.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProcSeries {
+    pub cpu: Vec<f32>,
+    /// Resident memory, in bytes.
+    pub mem: Vec<u64>,
+    /// Read plus write, in bytes per second.
+    pub io: Vec<f32>,
+}
+
+impl ProcSeries {
+    fn push(&mut self, p: &ProcRow) {
+        push_bounded(&mut self.cpu, p.cpu);
+        push_bounded(&mut self.mem, p.mem);
+        push_bounded(&mut self.io, p.io_bps() as f32);
+    }
+
+    pub fn len(&self) -> usize {
+        self.cpu.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cpu.is_empty()
+    }
+}
+
+fn push_bounded<T>(buf: &mut Vec<T>, v: T) {
+    if buf.len() >= PROC_HIST_LEN {
+        buf.remove(0);
+    }
+    buf.push(v);
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct GroupRow {
     pub name: String,

@@ -12,7 +12,7 @@ _crabmon() {
 
     case "$prev" in
         -s|--sort)
-            COMPREPLY=($(compgen -W "pid name cpu mem virt disk time user state threads nice" -- "$cur"))
+            COMPREPLY=($(compgen -W "pid name cpu mem virt disk time user state threads nice fds" -- "$cur"))
             return 0 ;;
         -g|--group)
             COMPREPLY=($(compgen -W "none service container user" -- "$cur"))

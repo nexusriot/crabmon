@@ -1,6 +1,6 @@
 [package]
 name = "crabmon"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "A fast, keyboard-driven terminal system monitor"
 repository = "https://github.com/nexusriot/crabmon"
@@ -55,7 +55,8 @@ assets = [
   ["completions/crabmon.zsh", "/usr/share/zsh/vendor-completions/_crabmon", "644"],
   ["completions/crabmon.fish", "/usr/share/fish/vendor_completions.d/crabmon.fish", "644"],
   ["README.md", "/usr/share/doc/crabmon/README.md", "644"],
-  ["CHANGELOG.md", "/usr/share/doc/crabmon/changelog", "644"]
+  ["docs/CHANGELOG.md", "/usr/share/doc/crabmon/changelog", "644"],
+  ["docs/DESIGN.md", "/usr/share/doc/crabmon/DESIGN.md", "644"]
 ]
 section = "utils"
 priority = "optional"

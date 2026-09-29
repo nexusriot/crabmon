@@ -381,6 +381,39 @@ pub fn render(snap: &Snapshot, top_procs: usize) -> String {
         }
     }
 
+    // Utilisation is the disk figure a byte counter cannot carry, and the one
+    // an alert is usually written against.
+    let utilised: Vec<(String, f64)> = snap
+        .disks
+        .iter()
+        .filter_map(|d| d.util.map(|u| (format!("mount=\"{}\"", escape_label(&d.mount)), u)))
+        .collect();
+    if !utilised.is_empty() {
+        metric(
+            &mut out,
+            "disk_utilisation_ratio",
+            "Fraction of the interval this device had IO in flight.",
+            "gauge",
+            &utilised,
+        );
+    }
+    let latency: Vec<(String, f64)> = snap
+        .disks
+        .iter()
+        .filter_map(|d| {
+            d.await_ms.map(|ms| (format!("mount=\"{}\"", escape_label(&d.mount)), ms / 1000.0))
+        })
+        .collect();
+    if !latency.is_empty() {
+        metric(
+            &mut out,
+            "disk_request_seconds",
+            "Mean time from queueing to completion, per request.",
+            "gauge",
+            &latency,
+        );
+    }
+
     if top_procs > 0 {
         let proc_label = |p: &crate::metrics::ProcRow| {
             format!("pid=\"{}\",name=\"{}\"", p.pid, escape_label(&p.name))
@@ -412,6 +445,29 @@ pub fn render(snap: &Snapshot, top_procs: usize) -> String {
             "gauge",
             &top.iter().map(|p| (proc_label(p), p.mem as f64)).collect::<Vec<_>>(),
         );
+        // Only ever populated when `[procs] fds` is on, and a process whose fd
+        // table belongs to another user reports nothing rather than zero — so
+        // the series are emitted only for the rows that actually have a count.
+        let fds: Vec<(String, f64)> =
+            top.iter().filter_map(|p| p.fds.map(|n| (proc_label(p), n as f64))).collect();
+        if !fds.is_empty() {
+            metric(
+                &mut out,
+                "process_open_fds",
+                "Per-process open file descriptors.",
+                "gauge",
+                &fds,
+            );
+            let limits: Vec<(String, f64)> =
+                top.iter().filter_map(|p| p.fd_limit.map(|n| (proc_label(p), n as f64))).collect();
+            metric(
+                &mut out,
+                "process_max_fds",
+                "Per-process soft limit on open file descriptors.",
+                "gauge",
+                &limits,
+            );
+        }
     }
 
     out

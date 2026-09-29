@@ -96,7 +96,7 @@ USAGE:
 
 OPTIONS:
     -r, --refresh <MS>       Refresh interval, {min}-{max} ms
-    -s, --sort <KEY>         pid|name|cpu|mem|virt|disk|time|user|state|threads|nice
+    -s, --sort <KEY>         pid|name|cpu|mem|virt|disk|time|user|state|threads|nice|fds
     -a, --ascending          Sort ascending
     -d, --descending         Sort descending (the default)
     -f, --filter <QUERY>     Initial process filter, e.g. 'user:root cpu>5'

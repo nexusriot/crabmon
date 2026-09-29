@@ -5,6 +5,7 @@
 //! as the live source would — which is what makes "send me a recording of the
 //! slowdown" a workable bug report.
 
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -52,7 +53,14 @@ impl Recorder {
     /// Write one frame. Flushed immediately so a recording survives a kill.
     pub fn write(&mut self, snap: &Snapshot) -> std::io::Result<()> {
         let trimmed = trim_frame(snap, self.top_n, self.omit_paths, self.max_cmd_len);
-        let line = serde_json::to_string(&trimmed)?;
+        self.write_trimmed(&trimmed)
+    }
+
+    /// Write a frame that has already been trimmed, for the flight recorder,
+    /// which trims once on the way into its ring rather than once per frame
+    /// per dump.
+    pub fn write_trimmed(&mut self, snap: &Snapshot) -> std::io::Result<()> {
+        let line = serde_json::to_string(snap)?;
         self.writer.write_all(line.as_bytes())?;
         self.writer.write_all(b"\n")?;
         self.writer.flush()?;
@@ -67,6 +75,135 @@ impl Recorder {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// How a frame budget is spelled everywhere a recording is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    pub top_n: usize,
+    pub omit_paths: bool,
+    pub max_cmd_len: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self { top_n: 100, omit_paths: false, max_cmd_len: 200 }
+    }
+}
+
+/// A rolling window of recent frames, written out when something goes wrong.
+///
+/// `--record` only helps if you started it before the incident, which is the
+/// one thing nobody does. The flight recorder keeps the last `pre` frames in
+/// memory at all times and, when an alert fires, writes them plus the next
+/// `post` frames to a file — so the recording of the slowdown exists because
+/// the slowdown happened, not because someone predicted it.
+///
+/// Frames are trimmed on the way *into* the ring, not on the way out: a
+/// ten-minute window of untrimmed frames is well over a gigabyte of live
+/// memory in a process whose job is to make memory pressure visible.
+pub struct FlightRecorder {
+    ring: VecDeque<Snapshot>,
+    pre: usize,
+    post: usize,
+    dir: PathBuf,
+    limits: Limits,
+    active: Option<Dump>,
+}
+
+struct Dump {
+    recorder: Recorder,
+    /// Frames still to be written after the trigger.
+    remaining: usize,
+}
+
+impl FlightRecorder {
+    /// `pre == 0` disables the recorder entirely, which is the default: a
+    /// monitor that writes files to disk unasked is not what anyone installed.
+    pub fn new(dir: &Path, pre: usize, post: usize, limits: Limits) -> Option<FlightRecorder> {
+        (pre > 0).then(|| FlightRecorder {
+            ring: VecDeque::with_capacity(pre.min(1024)),
+            pre,
+            post,
+            dir: dir.to_path_buf(),
+            limits,
+            active: None,
+        })
+    }
+
+    /// Offer a frame. Returns the path of a dump that this frame completed.
+    pub fn push(&mut self, snap: &Snapshot) -> Option<PathBuf> {
+        let trimmed =
+            trim_frame(snap, self.limits.top_n, self.limits.omit_paths, self.limits.max_cmd_len);
+
+        let mut finished = None;
+        if let Some(dump) = &mut self.active {
+            // Already trimmed, so this writes the frame as it stands rather
+            // than trimming it a second time.
+            let _ = dump.recorder.write_trimmed(&trimmed);
+            dump.remaining = dump.remaining.saturating_sub(1);
+            if dump.remaining == 0 {
+                finished = self.active.take().map(|d| d.recorder.path().to_path_buf());
+            }
+        }
+
+        while self.ring.len() >= self.pre {
+            self.ring.pop_front();
+        }
+        self.ring.push_back(trimmed);
+        finished
+    }
+
+    /// Start a dump: the whole ring, then the next `post` frames.
+    ///
+    /// A trigger while a dump is already running extends that one instead of
+    /// opening a second file. A flapping rule would otherwise leave a file per
+    /// refresh, each one mostly the same frames.
+    pub fn trigger(&mut self, reason: &str, at_unix: u64) -> std::io::Result<Option<PathBuf>> {
+        if let Some(dump) = &mut self.active {
+            dump.remaining = dump.remaining.max(self.post);
+            return Ok(None);
+        }
+        let path = self.dir.join(dump_name(reason, at_unix));
+        let mut recorder = Recorder::create(&path)?.with_limits(
+            self.limits.top_n,
+            self.limits.omit_paths,
+            self.limits.max_cmd_len,
+        );
+        for frame in &self.ring {
+            recorder.write_trimmed(frame)?;
+        }
+        // `post == 0` still leaves a usable file: the context up to and
+        // including the frame that tripped the rule.
+        if self.post == 0 {
+            return Ok(Some(path));
+        }
+        self.active = Some(Dump { recorder, remaining: self.post });
+        Ok(Some(path))
+    }
+
+    pub fn is_dumping(&self) -> bool {
+        self.active.is_some()
+    }
+
+    pub fn buffered(&self) -> usize {
+        self.ring.len()
+    }
+}
+
+/// `crabmon-<rule>-<unix>.jsonl`, with the rule name reduced to something a
+/// filesystem will take — an alert may legitimately be called `disk / full`.
+pub fn dump_name(reason: &str, at_unix: u64) -> String {
+    let safe: String = reason
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let safe = safe.trim_matches('-');
+    let safe = if safe.is_empty() { "alert" } else { safe };
+    format!(
+        "crabmon-{}-{at_unix}.jsonl",
+        crate::format::truncate_fit(safe, 40).replace('\u{2026}', "")
+    )
 }
 
 /// Replays a recording as a `MetricSource`.
@@ -239,6 +376,142 @@ mod tests {
 
     fn tmpfile(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("crabmon-rec-{tag}-{}.jsonl", std::process::id()))
+    }
+
+    fn flight_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("crabmon-flight-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn dumps_in(dir: &Path) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> =
+            std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn a_dump_contains_the_frames_from_before_the_alert() {
+        // The whole point: `--record` only helps if you started it before the
+        // incident, and nobody does.
+        let dir = flight_dir("before");
+        let mut fr = FlightRecorder::new(&dir, 4, 2, Limits::default()).unwrap();
+        for n in 0..10 {
+            assert_eq!(fr.push(&frame(n)), None, "nothing finished yet");
+        }
+        assert_eq!(fr.buffered(), 4, "the ring holds the last four");
+
+        let path = fr.trigger("cpu-saturated", 1_700_000_042).unwrap().unwrap();
+        let written = parse_jsonl(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written.len(), 4, "the ring is written out immediately");
+        let pids: Vec<u32> = written.iter().map(|f| f.procs[0].pid).collect();
+        assert_eq!(pids, vec![6, 7, 8, 9], "the four frames leading up to the trigger");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_dump_runs_on_past_the_alert_and_then_closes() {
+        let dir = flight_dir("after");
+        let mut fr = FlightRecorder::new(&dir, 2, 3, Limits::default()).unwrap();
+        fr.push(&frame(1));
+        fr.push(&frame(2));
+        let path = fr.trigger("disk", 1_700_000_000).unwrap().unwrap();
+        assert!(fr.is_dumping());
+
+        assert_eq!(fr.push(&frame(3)), None);
+        assert_eq!(fr.push(&frame(4)), None);
+        // The frame that completes the budget is the one that reports the path.
+        assert_eq!(fr.push(&frame(5)), Some(path.clone()));
+        assert!(!fr.is_dumping());
+
+        // ...and later frames do not reopen it.
+        assert_eq!(fr.push(&frame(6)), None);
+
+        let written = parse_jsonl(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let pids: Vec<u32> = written.iter().map(|f| f.procs[0].pid).collect();
+        assert_eq!(pids, vec![1, 2, 3, 4, 5], "two of context, then three of aftermath");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_flapping_rule_extends_one_dump_rather_than_opening_a_file_per_frame() {
+        let dir = flight_dir("flap");
+        let mut fr = FlightRecorder::new(&dir, 2, 2, Limits::default()).unwrap();
+        fr.push(&frame(1));
+        assert!(fr.trigger("flappy", 1).unwrap().is_some(), "the first one opens a file");
+        for n in 2..8 {
+            fr.push(&frame(n));
+            // A second trigger extends the window and announces nothing.
+            assert_eq!(fr.trigger("flappy", n as u64).unwrap(), None);
+        }
+        assert_eq!(dumps_in(&dir).len(), 1, "one incident, one file");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_dump_with_no_aftermath_budget_still_leaves_a_usable_file() {
+        let dir = flight_dir("nopost");
+        let mut fr = FlightRecorder::new(&dir, 3, 0, Limits::default()).unwrap();
+        for n in 0..5 {
+            fr.push(&frame(n));
+        }
+        let path = fr.trigger("now", 7).unwrap().unwrap();
+        assert!(!fr.is_dumping(), "nothing left to wait for");
+        assert_eq!(parse_jsonl(&std::fs::read_to_string(&path).unwrap()).unwrap().len(), 3);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_ring_holds_its_frames_trimmed_so_ten_minutes_is_not_a_gigabyte() {
+        // Untrimmed, a busy machine's frame is ~1.5 MB; a window of them is
+        // well over a gigabyte of live memory in the process whose job is to
+        // make memory pressure visible.
+        let dir = flight_dir("trim");
+        let mut fr =
+            FlightRecorder::new(&dir, 2, 0, Limits { top_n: 3, omit_paths: false, max_cmd_len: 8 })
+                .unwrap();
+        let mut big = frame(1);
+        big.procs = (0..50)
+            .map(|i| ProcRow {
+                pid: i,
+                cpu: i as f32,
+                threads: Some(1),
+                cmd: "/usr/bin/something --with --many --flags".into(),
+                ..Default::default()
+            })
+            .collect();
+        fr.push(&big);
+        let path = fr.trigger("big", 1).unwrap().unwrap();
+        let written = parse_jsonl(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written[0].procs.len(), 3, "trimmed on the way in, not on the way out");
+        assert!(written[0].procs[0].cmd.chars().count() <= 8);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_zero_frame_window_switches_the_recorder_off_entirely() {
+        // The default: a monitor that writes files to disk unasked is not what
+        // anyone installed.
+        assert!(FlightRecorder::new(Path::new("."), 0, 30, Limits::default()).is_none());
+    }
+
+    #[test]
+    fn a_rule_name_that_is_not_a_filename_still_produces_one() {
+        // Alert names are free text: `disk / full` and `cpu>90%` are both
+        // legal, and neither is a path component.
+        assert_eq!(dump_name("cpu-saturated", 1700), "crabmon-cpu-saturated-1700.jsonl");
+        assert_eq!(dump_name("disk / full", 1700), "crabmon-disk---full-1700.jsonl");
+        assert!(!dump_name("../../etc/passwd", 1).contains('/'));
+        assert!(!dump_name("", 1).is_empty());
+        assert!(dump_name("", 1).starts_with("crabmon-alert-"));
+        assert!(dump_name(&"x".repeat(200), 1).len() < 80, "a name is not a filesystem limit");
     }
 
     #[test]
@@ -439,6 +712,18 @@ mod tests {
         let frames = parse_jsonl(minimal).unwrap();
         assert_eq!(frames[0].taken_at_unix, 123);
         assert!(frames[0].procs.is_empty());
+
+        // A recording made before disk saturation and descriptor counts
+        // existed still replays; the new fields read as "not measured" rather
+        // than as an idle disk and a process holding no files.
+        let pre_0_7 = r#"{"taken_at_unix":1,"disks":[{"mount":"/","total":10,"used":5,"read_bps":2048.0}],"procs":[{"pid":1,"name":"init","threads":1}]}"#;
+        let frames = parse_jsonl(pre_0_7).unwrap();
+        let disk = &frames[0].disks[0];
+        assert_eq!(disk.read_bps, 2048.0);
+        assert_eq!(disk.util, None);
+        assert_eq!(disk.await_ms, None);
+        assert_eq!(frames[0].procs[0].fds, None);
+        assert_eq!(frames[0].procs[0].fd_ratio(), None);
     }
 
     #[test]

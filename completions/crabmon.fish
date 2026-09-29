@@ -3,7 +3,7 @@ complete -c crabmon -f
 
 complete -c crabmon -s r -l refresh -r -d 'Refresh interval in ms (200-10000)'
 complete -c crabmon -s s -l sort -r -d 'Sort column' \
-    -a 'pid name cpu mem virt disk time user state threads nice'
+    -a 'pid name cpu mem virt disk time user state threads nice fds'
 complete -c crabmon -s a -l ascending -d 'Sort ascending'
 complete -c crabmon -s d -l descending -d 'Sort descending (the default)'
 complete -c crabmon -s f -l filter -r -d 'Initial process filter'

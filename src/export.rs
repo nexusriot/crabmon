@@ -63,7 +63,7 @@ fn csv_field(s: &str) -> String {
 /// Column order of the CSV export. Every `ProcRow` field the JSON carries is
 /// here too: a CSV that silently drops the cgroup, nice and path columns sends
 /// people back to the JSON for exactly the questions CSV is good at.
-pub const CSV_COLUMNS: [&str; 20] = [
+pub const CSV_COLUMNS: [&str; 22] = [
     "pid",
     "ppid",
     "name",
@@ -77,6 +77,8 @@ pub const CSV_COLUMNS: [&str; 20] = [
     "run_time_secs",
     "start_time_unix",
     "threads",
+    "fds",
+    "fd_limit",
     "read_bps",
     "write_bps",
     "service",
@@ -92,7 +94,7 @@ pub fn procs_to_csv(procs: &[ProcRow]) -> String {
     for p in procs {
         let opt = |v: &Option<String>| csv_field(v.as_deref().unwrap_or(""));
         out.push_str(&format!(
-            "{},{},{},{:.1},{},{},{},{},{},{},{},{},{},{:.0},{:.0},{},{},{},{},{}\n",
+            "{},{},{},{:.1},{},{},{},{},{},{},{},{},{},{},{},{:.0},{:.0},{},{},{},{},{}\n",
             p.pid,
             p.ppid.map(|v| v.to_string()).unwrap_or_default(),
             csv_field(&p.name),
@@ -106,6 +108,8 @@ pub fn procs_to_csv(procs: &[ProcRow]) -> String {
             p.run_time,
             p.start_time_unix,
             p.threads.map(|t| t.to_string()).unwrap_or_default(),
+            p.fds.map(|v| v.to_string()).unwrap_or_default(),
+            p.fd_limit.map(|v| v.to_string()).unwrap_or_default(),
             p.read_bps,
             p.write_bps,
             opt(&p.service),

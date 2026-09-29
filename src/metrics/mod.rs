@@ -3,6 +3,7 @@
 
 pub mod cgroup;
 pub mod diskstats;
+pub mod fds;
 pub mod gpu;
 pub mod meminfo;
 pub mod netclass;
@@ -106,6 +107,15 @@ pub struct ProcRow {
     /// Scheduling priority, where the platform exposes it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nice: Option<i32>,
+    /// Open file descriptors. `None` when the walk is switched off (`[procs]
+    /// fds`) or the process belongs to another user, which is not the same as
+    /// a process holding none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fds: Option<u32>,
+    /// The process's own `RLIMIT_NOFILE` soft limit, which is what `fds` runs
+    /// out against — the system-wide total is nowhere near it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fd_limit: Option<u64>,
     /// systemd unit owning the process, e.g. `docker.service`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service: Option<String>,
@@ -123,6 +133,19 @@ pub struct ProcRow {
 impl ProcRow {
     pub fn io_bps(&self) -> f64 {
         self.read_bps + self.write_bps
+    }
+
+    /// How close the process is to its own descriptor limit, 0..=1.
+    ///
+    /// The count alone says nothing: 4000 fds is unremarkable for a proxy with
+    /// a limit of a million and fatal for a daemon left on the default 1024.
+    /// `None` when either half is unknown, so an unreadable limit reads as no
+    /// data rather than as headroom.
+    pub fn fd_ratio(&self) -> Option<f64> {
+        match (self.fds, self.fd_limit) {
+            (Some(n), Some(limit)) if limit > 0 => Some(ratio(n as u64, limit)),
+            _ => None,
+        }
     }
 }
 
@@ -156,6 +179,17 @@ pub struct DiskRow {
     pub used: u64,
     pub read_bps: f64,
     pub write_bps: f64,
+    /// Fraction of the interval the device had IO in flight, 0..=1. This is
+    /// what says a device is *saturated*; throughput does not. `None` where
+    /// the platform does not publish it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub util: Option<f64>,
+    /// Mean request service time in milliseconds, `None` when nothing
+    /// completed in the interval.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub await_ms: Option<f64>,
+    /// Requests the device had outstanding at the moment of the reading.
+    pub in_flight: u64,
     /// Inodes can run out long before bytes do.
     pub inodes_total: u64,
     pub inodes_used: u64,
@@ -174,6 +208,27 @@ impl DiskRow {
     pub fn inodes_are_the_problem(&self) -> bool {
         self.inodes_total > 0 && self.inode_ratio() > self.ratio() + 0.1
     }
+}
+
+/// Aggregate over distinct *devices*, not mounts.
+///
+/// A device carrying several mounts — the ordinary btrfs subvolume layout, and
+/// every bind mount — publishes one set of counters that every one of its
+/// mounts reports, so summing per mount multiplied the machine's disk
+/// throughput by however many subvolumes happened to be mounted.
+fn per_device<'a, T: 'a>(disks: &'a [DiskRow], pick: impl Fn(&'a DiskRow) -> Option<T>) -> Vec<T> {
+    let mut seen = std::collections::HashSet::new();
+    disks
+        .iter()
+        .filter(|d| {
+            // An unresolved device has no counters to double-count, but it also
+            // has no key to deduplicate on; fall back to the mount so two of
+            // them are not collapsed into one.
+            let key = if d.kernel_name.is_empty() { &d.mount } else { &d.kernel_name };
+            seen.insert(key.as_str())
+        })
+        .filter_map(pick)
+        .collect()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -265,7 +320,17 @@ impl Snapshot {
     }
 
     pub fn disk_io_totals(&self) -> (f64, f64) {
-        self.disks.iter().fold((0.0, 0.0), |(r, w), d| (r + d.read_bps, w + d.write_bps))
+        per_device(&self.disks, |d| Some((d.read_bps, d.write_bps)))
+            .into_iter()
+            .fold((0.0, 0.0), |(r, w), (dr, dw)| (r + dr, w + dw))
+    }
+
+    /// The busiest device's utilisation, which is the figure an aggregate
+    /// cannot carry: two disks at 100% and 0% are not a machine at 50%.
+    pub fn disk_util_max(&self) -> Option<f64> {
+        per_device(&self.disks, |d| d.util)
+            .into_iter()
+            .fold(None, |acc: Option<f64>, u| Some(acc.map_or(u, |a| a.max(u))))
     }
 }
 
@@ -431,16 +496,92 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_disk_io_adds_every_mount() {
+    fn aggregate_disk_io_adds_every_device() {
         let snap = Snapshot {
             disks: vec![
-                DiskRow { read_bps: 2048.0, write_bps: 1_048_576.0, ..Default::default() },
-                DiskRow { read_bps: 1024.0, write_bps: 0.0, ..Default::default() },
+                DiskRow {
+                    mount: "/".into(),
+                    kernel_name: "dm-0".into(),
+                    read_bps: 2048.0,
+                    write_bps: 1_048_576.0,
+                    ..Default::default()
+                },
+                DiskRow {
+                    mount: "/boot".into(),
+                    kernel_name: "nvme0n1p1".into(),
+                    read_bps: 1024.0,
+                    write_bps: 0.0,
+                    ..Default::default()
+                },
             ],
             ..Default::default()
         };
         assert_eq!(snap.disk_io_totals(), (3072.0, 1_048_576.0));
         assert_eq!(Snapshot::default().disk_io_totals(), (0.0, 0.0));
+    }
+
+    #[test]
+    fn one_device_carrying_several_mounts_is_counted_once() {
+        // The ordinary btrfs subvolume layout, and every bind mount: one set
+        // of kernel counters, reported by each mount that sits on it. Summing
+        // per mount multiplied the machine's whole disk throughput by however
+        // many subvolumes happened to be mounted.
+        let subvol = |mount: &str| DiskRow {
+            mount: mount.into(),
+            kernel_name: "nvme0n1p2".into(),
+            read_bps: 10_000.0,
+            write_bps: 4_000.0,
+            util: Some(0.5),
+            ..Default::default()
+        };
+        let snap = Snapshot {
+            disks: vec![subvol("/"), subvol("/home"), subvol("/var/log"), subvol("/.snapshots")],
+            ..Default::default()
+        };
+        assert_eq!(snap.disk_io_totals(), (10_000.0, 4_000.0), "one device, read once");
+        assert_eq!(snap.disk_util_max(), Some(0.5));
+    }
+
+    #[test]
+    fn devices_with_no_resolved_kernel_name_are_still_counted_separately() {
+        // Network filesystems and tmpfs have no block device to deduplicate
+        // on. Collapsing them all onto the empty key would report one of them.
+        let unresolved = |mount: &str, r: f64| DiskRow {
+            mount: mount.into(),
+            read_bps: r,
+            ..Default::default()
+        };
+        let snap = Snapshot {
+            disks: vec![unresolved("/mnt/nfs", 100.0), unresolved("/run", 25.0)],
+            ..Default::default()
+        };
+        assert_eq!(snap.disk_io_totals().0, 125.0);
+    }
+
+    #[test]
+    fn the_busiest_device_is_reported_rather_than_an_average_of_all_of_them() {
+        // Two disks, one pinned and one idle, is not a machine at 50%: the
+        // pinned one is still the bottleneck for whatever is waiting on it.
+        let snap = Snapshot {
+            disks: vec![
+                DiskRow {
+                    mount: "/".into(),
+                    kernel_name: "sda".into(),
+                    util: Some(1.0),
+                    ..Default::default()
+                },
+                DiskRow {
+                    mount: "/data".into(),
+                    kernel_name: "sdb".into(),
+                    util: Some(0.0),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(snap.disk_util_max(), Some(1.0));
+        // A platform that publishes no utilisation says so, rather than 0%.
+        assert_eq!(Snapshot::default().disk_util_max(), None);
     }
 
     #[test]

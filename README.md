@@ -35,7 +35,9 @@ and it can print all of it as JSON or CSV for scripts.
   by default so the same bytes are not counted twice.
 - **Disks** — one usage gauge per mount with live read/write throughput,
   including LVM and LUKS volumes, and a warning when a filesystem is running
-  out of inodes rather than bytes.
+  out of inodes rather than bytes. Busy devices are labelled with their
+  utilisation and mean request latency: an NVMe serving small random reads is
+  pinned at a few MB/s, and a throughput figure draws that as very nearly idle.
 - **Sensors** — temperatures grouped by driver, so a 22-core `coretemp` flood
   does not push the NVMe and chassis sensors off the panel.
 - **GPU** — utilisation, VRAM and temperature from `/sys/class/drm`, with
@@ -52,19 +54,33 @@ and it can print all of it as JSON or CSV for scripts.
   totalling CPU, memory and disk IO per group, and `Enter` to open a group into
   the processes behind it.
 - **Alerts** — configurable thresholds with a hold time, command hooks for both
-  firing and recovering, and a log of every transition.
+  firing and recovering, and a log of every transition. Rules can watch CPU,
+  memory, swap, load, disk capacity or saturation, temperature, GPU, pressure
+  stall, network throughput, file descriptors — or the number of processes
+  matching a filter query, which with `below` is how you get paged when
+  something *stops*.
+- **File descriptors** — an optional FD column with each process's count
+  against its own `RLIMIT_NOFILE`, plus `fd>` and `fd%>` filters and an alert
+  kind. Descriptor exhaustion is to a process what inode exhaustion is to a
+  filesystem: the resource that runs out while every other gauge looks fine.
 - **Export** — write a snapshot as JSON or CSV from the TUI, or run
   `crabmon --once` headless.
 - **Record & replay** — `--record` writes every sample to a JSONL file (trimmed
   to keep it a sane size) and `--replay` drives the whole UI from one, so "send
   me a recording of the slowdown" is a workable bug report.
+- **Flight recorder** — `[record] flight` keeps the last N frames in memory and
+  writes them out, with the aftermath, whenever an alert fires. The recording
+  of an incident then exists because the incident happened, rather than because
+  someone thought to start recording first.
 - **Diff** — `--diff before.json after.json` reduces two snapshots to what
   actually changed: what started, what exited, what grew.
 - **Watch** — `--watch 'state:D'` blocks until something matches and exits
   non-zero, so a shell script can wait on a condition.
 - **Prometheus** — `--serve :9100` runs headless and exposes CPU, memory, swap,
   load, disks, interfaces, sensors, pressure, power and GPU, plus the busiest
-  processes (capped, and configurable). The cgroup panel has no series yet.
+  processes (capped, and configurable), including per-device utilisation and
+  request latency and, where `[procs] fds` is on, per-process descriptor counts
+  against their limits.
 - **Remote** — `--remote host` monitors another machine over SSH, with no
   daemon and no open port, over one long-lived session rather than a process
   per sample.
@@ -140,7 +156,7 @@ run of stuck workers.
 | Option | Meaning |
 | --- | --- |
 | `-r`, `--refresh <MS>` | Refresh interval, 200–10000 ms |
-| `-s`, `--sort <KEY>` | `pid`, `name`, `cpu`, `mem`, `virt`, `disk`, `time`, `user`, `state`, `threads`, `nice` |
+| `-s`, `--sort <KEY>` | `pid`, `name`, `cpu`, `mem`, `virt`, `disk`, `time`, `user`, `state`, `threads`, `nice`, `fds` |
 | `-a`, `--ascending` | Sort ascending |
 | `-d`, `--descending` | Sort descending (the default) |
 | `-f`, `--filter <QUERY>` | Initial process filter |
@@ -226,11 +242,14 @@ five: `busy` (`cpu>5`), `hungry` (`mem>500M`), `mine` (`user:$USER`), `io`
 
 ### Filter language
 
-Terms are separated by whitespace and combined with AND; `!` negates a term.
+Terms are separated by whitespace and combined with AND; `!` negates a term. A
+standalone `|` is OR and binds looser than the implicit AND, so `a b | c` means
+`(a AND b) OR c`.
 
 ```
 firefox            name contains "firefox"
 !kworker           name does not contain "kworker"
+nginx | apache     either one
 user:vlad          user name contains "vlad"
 pid:1234           exact PID          ppid:1  exact parent PID
 state:R            process state letter
@@ -240,8 +259,23 @@ cmd:--headless     substring of the full command line
 re:^chrom(e|ium)$  regular expression over the process name
 cpu>5              CPU comparison, with > >= < <= =
 mem>100M           resident memory, with K/M/G/T suffixes
+virt>2G            virtual size, same suffixes
 io>1M              disk IO rate
+thr>50             thread count
+nice<0             scheduling priority
+time>2h            run time, in s/m/h/d; a bare number is seconds
+fd>1000            open file descriptors (needs `[procs] fds`)
+fd%>90             ...as a percentage of the process's own limit
 ```
+
+Only a `|` with whitespace on both sides is an operator, so
+`re:^chrom(e|ium)$` is still one regular expression rather than two broken
+queries.
+
+A process that does not report a value never satisfies a comparison on it: a
+thread has no thread count, and another user's process reports no descriptors.
+Reading either as zero would sweep every one of them into `thr<2` and `fd<100`,
+so `!thr>2` is how you find them instead.
 
 ## Recordings
 
@@ -255,6 +289,26 @@ limits.
 by default while scrubbing: `[` and `]` step a frame, `{` and `}` step ten, and
 `z` plays on. The whole recording is parsed into memory up front, so an
 hours-long capture wants a machine with room for it.
+
+## The flight recorder
+
+`--record` only helps if you started it before the thing went wrong, which is
+the one thing nobody does. Set `[record] flight` and crabmon keeps that many
+recent frames in memory at all times; when an alert fires it writes them out,
+plus the next `flight_after` frames, as an ordinary recording:
+
+```toml
+[record]
+flight = 750        # ten minutes at the default 800 ms refresh, ~40 MB
+flight_after = 150  # ...and two minutes of aftermath
+flight_dir = "/var/log/crabmon"
+```
+
+The result is `crabmon-<rule>-<unix>.jsonl`, which `--replay` and `--diff` read
+like any other recording. Frames are trimmed by the same `[record]` limits on
+the way *into* the ring, so the window costs what a recording of it would, not
+what an untrimmed one would. A rule that flaps extends the dump in progress
+instead of leaving a file per refresh.
 
 ## Comparing snapshots
 
@@ -309,7 +363,7 @@ are clamped rather than rejected.
 
 ```toml
 refresh_ms = 800            # clamped to 200..=10000
-sort_by = "cpu"             # pid|name|cpu|mem|virt|disk|time|user|state|threads|nice
+sort_by = "cpu"             # pid|name|cpu|mem|virt|disk|time|user|state|threads|nice|fds
 sort_desc = true
 filter = ""                 # initial filter query
 tree = false
@@ -346,11 +400,17 @@ power = true
 
 [procs]
 # Fixed column order; empty means fit as many as the terminal is wide enough
-# for. Names: mark pid user state cpu trend mem virt thr ni disk time ports name
-# COMMAND is always drawn last, and unknown names are ignored.
+# for. Names: mark pid user state cpu trend mem virt thr ni fd disk time ports
+# name. COMMAND is always drawn last, and unknown names are ignored.
 columns = []
 ports = false               # add the PORTS column and look up ports for the
                             # rows on screen (one fd-table walk per visible row)
+fds = false                 # count every process's open descriptors and read
+                            # its limit: adds the FD column and makes fd>,
+                            # fd%> and kind = "fd" alerts work. Sampled for
+                            # every process, not just the rows on screen, so
+                            # on a 2800-process machine it roughly doubles
+                            # crabmon's own CPU use (~10% → ~20% of a core).
 pin_marker = true           # show the ▸ pinned / • tagged marker column
 
 [remote]
@@ -371,6 +431,11 @@ top_n = 0                   # 0 keeps every process
 top_n = 100                 # processes kept per frame; 0 keeps all (~1.5 MB/frame)
 omit_paths = false          # drop command lines, exe and cwd entirely
 max_cmd_len = 200           # truncate argv; Chromium's runs to kilobytes
+flight = 0                  # flight recorder: frames of context held in memory
+                            # and written out when an alert fires. 0 is off.
+                            # At 800 ms, 750 frames is 10 minutes / ~40 MB.
+flight_after = 30           # ...and frames written after the alert
+flight_dir = ""             # empty means the working directory
 
 [serve]
 top_procs = 20              # per-process series exported by --serve, busiest
@@ -397,12 +462,34 @@ crit = "#ff5555"
 
 [[alert]]
 name = "cpu-saturated"
-kind = "cpu"                # cpu|mem|swap|load|disk|temp|gpu
-threshold = 90.0
+kind = "cpu"                # cpu|mem|swap|load|disk|temp|gpu|psi|io|net|fd|proc
+threshold = 90.0            # % for most kinds; °C for temp, B/s for net,
+                            # a count for proc, absolute for load
 for_secs = 30               # must hold this long before firing
-target = ""                 # mount point, sensor prefix or GPU name
+below = false               # fire when strictly *under* the threshold instead
+target = ""                 # mount point, sensor prefix, GPU or interface
+                            # name, psi resource (cpu|mem|io[.full]), or a
+                            # process name for fd rules
+query = ""                  # the filter query a proc rule counts matches of
 command = ""                # run once when the alert activates
 command_clear = ""          # ...and once when it recovers
+```
+
+`kind = "io"` is device *utilisation*, not capacity — the figure that says a
+disk is the bottleneck while it serves small random reads at a few MB/s and
+both its throughput and its free space look fine. `kind = "proc"` with `below`
+is how you say "page me when this stops":
+
+```toml
+[[alert]]
+name = "nginx-down"
+kind = "proc"
+query = "nginx"
+threshold = 1               # strictly below 1, i.e. none left
+below = true
+for_secs = 10               # ...and it stayed gone, rather than restarting
+command = "notify-send 'nginx is gone'"
+command_clear = "notify-send 'nginx is back'"
 ```
 
 `!` lists the rules, which are firing, and a log of every transition — an alert
@@ -411,17 +498,22 @@ that fires at 03:12 and clears at 03:14 says both.
 ## Platform notes
 
 - Sending signals and renice are **Unix-only**.
-- CPU affinity, per-disk IO rates (`/proc/diskstats`), GPU statistics
-  (`/sys/class/drm`) and cgroup limits are **Linux-only**. Those panels are
-  simply absent elsewhere.
+- CPU affinity, per-disk IO rates and saturation (`/proc/diskstats`), GPU
+  statistics (`/sys/class/drm`), cgroup limits and the file-descriptor count
+  (`/proc/<pid>/fd`, `/proc/<pid>/limits`) are **Linux-only**. Those panels and
+  columns are simply absent elsewhere, and `fd>` filters and `kind = "fd"`
+  alerts have nothing to measure.
 - Per-process disk IO needs permission to read `/proc/<pid>/io`, so other
-  users' processes read as zero unless crabmon runs as root.
+  users' processes read as zero unless crabmon runs as root. Their fd tables
+  are unreadable for the same reason, and report as *unknown* rather than zero.
 - PSI needs Linux 4.20+ with `CONFIG_PSI=y`; the panel is hidden otherwise.
 - CPU package power needs readable RAPL counters, which are root-only on most
   kernels since CVE-2020-8694. Battery figures need no privileges.
-- Per-disk IO on FreeBSD is read from `iostat -x`. That path is compile-checked
-  in CI and unit-tested against captured output, but has not been run on real
-  FreeBSD hardware.
+- Per-disk IO on FreeBSD is read from `iostat -x`, including its `%b` and
+  `ms/t` columns for utilisation and latency; those are since-boot averages
+  rather than the interval rates the Linux path derives. That path is
+  compile-checked in CI and unit-tested against captured output, but has not
+  been run on real FreeBSD hardware.
 - `--remote` needs crabmon installed on the far end and non-interactive SSH
   (`BatchMode=yes`). It holds one session open and reads a stream of frames,
   falling back to a process per sample if the far end predates `--stream`; a
@@ -430,6 +522,8 @@ that fires at 03:12 and clears at 03:14 says both.
   the host they run on and refuse to be combined with `--remote` or `--replay`.
 - Temperature sensors depend on the OS exposing them; if none are available the
   panel says so.
+- Alerts, and so the flight recorder, run only in the TUI. `--once`, `--serve`,
+  `--stream` and `--watch` do not evaluate rules and never write a dump.
 
 ## Development
 
@@ -450,8 +544,11 @@ the same commands and needs no make:
 ./scripts/build.sh help
 ```
 
-`make dist` builds a release tarball of exactly what `make install` would put on
-a machine, for the platforms the Debian package does not cover.
+`make dist` builds a release tarball — the binary, the man page, the
+completions and the prose (`README.md`, `docs/CHANGELOG.md`, `docs/DESIGN.md`,
+`LICENSE`) — for the platforms the Debian package does not cover. `make
+install` places the first three under `PREFIX`; the documentation has no agreed
+home there, so it is left in the tarball.
 
 The application logic lives in a library crate with the binary as a thin shell,
 so the whole program is testable headlessly:
@@ -468,11 +565,11 @@ so the whole program is testable headlessly:
 - `tests/build_script.rs` checks that the `Makefile` and `scripts/build.sh`
   still agree on what each command does.
 
-See [DESIGN.md](DESIGN.md).
+See [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md).
+See [docs/CHANGELOG.md](docs/CHANGELOG.md).
 
 ## License
 

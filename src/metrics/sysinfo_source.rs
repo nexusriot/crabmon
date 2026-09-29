@@ -8,10 +8,11 @@ use sysinfo::{
     ProcessStatus, RefreshKind, System, UpdateKind, Users,
 };
 
-use super::diskstats::{self, DiskStats};
+use super::diskstats::{self, DeviceRates, DiskCounters, DiskStats};
+use super::fds::LimitCache;
 use super::procgroup::CgroupPaths;
 use super::{
-    cgroup, gpu, meminfo, netclass, power, procgroup, psi, rate, CpuSample, DiskRow, GpuInfo,
+    cgroup, fds, gpu, meminfo, netclass, power, procgroup, psi, rate, CpuSample, DiskRow, GpuInfo,
     HostInfo, MemSample, MetricSource, NetIface, ProcRow, Sensor, Snapshot,
 };
 
@@ -44,10 +45,16 @@ pub struct SysinfoSource {
     /// couple of percent of a core on a busy machine for a value that almost
     /// never changes, so it is refreshed on the relist cadence instead.
     nice_cache: HashMap<u32, (u64, Option<i32>)>,
+    /// pid → RLIMIT_NOFILE, on the same "read once per process" terms as the
+    /// cgroup path: a limit is set at exec and almost never changed after.
+    fd_limits: LimitCache,
     prev_rapl_uj: Option<u64>,
 
     virtual_prefixes: Vec<String>,
     use_nvidia_smi: bool,
+    /// Count each process's open descriptors. Off by default: it is a
+    /// `getdents` sweep per process per sample.
+    count_fds: bool,
     host: HostInfo,
 }
 
@@ -155,11 +162,20 @@ impl SysinfoSource {
             dev_key_cache: HashMap::new(),
             cgroup_paths: CgroupPaths::default(),
             nice_cache: HashMap::new(),
+            fd_limits: LimitCache::default(),
             prev_rapl_uj: None,
             virtual_prefixes,
             use_nvidia_smi,
+            count_fds: false,
             host,
         }
+    }
+
+    /// Ask for the FD column's data. A builder rather than a constructor
+    /// argument so every existing caller keeps the cheap behaviour.
+    pub fn with_fds(mut self, count_fds: bool) -> SysinfoSource {
+        self.count_fds = count_fds;
+        self
     }
 
     pub fn host(&self) -> &HostInfo {
@@ -212,6 +228,13 @@ impl SysinfoSource {
                 .map(|u| u.name().to_string());
 
             let start_time = p.start_time();
+            // Both are `None` when the sweep is off, which the UI renders as
+            // "not asked for" rather than as a process holding nothing.
+            let (fd_count, fd_limit) = if self.count_fds {
+                (fds::count(pid_u), self.fd_limits.get(pid_u, start_time))
+            } else {
+                (None, None)
+            };
             let cgroup_path = self.cgroup_paths.get(pid_u, start_time).map(str::to_string);
             let service = cgroup_path.as_deref().and_then(procgroup::service_of);
             let container = cgroup_path.as_deref().and_then(procgroup::container_of);
@@ -232,6 +255,8 @@ impl SysinfoSource {
                 read_bps,
                 write_bps,
                 nice: nice_of(&mut self.nice_cache, pid_u, start_time),
+                fds: fd_count,
+                fd_limit,
                 service,
                 container,
                 cmd: p.cmd().join(" "),
@@ -245,6 +270,7 @@ impl SysinfoSource {
         self.prev_proc_io.retain(|pid, _| seen.contains(pid));
         self.cgroup_paths.retain_live(&|pid| seen.contains(&pid));
         self.nice_cache.retain(|pid, _| seen.contains(pid));
+        self.fd_limits.retain_live(&|pid| seen.contains(&pid));
         rows
     }
 
@@ -282,10 +308,10 @@ impl SysinfoSource {
 
     fn collect_disks(&mut self, secs: f64) -> Vec<DiskRow> {
         let stats = diskstats::read_diskstats();
-        let mut io: BTreeMap<String, (f64, f64)> = BTreeMap::new();
-        for (dev, &(r, w)) in stats.iter() {
-            if let Some(&(pr, pw)) = self.prev_diskstats.get(dev) {
-                io.insert(dev.clone(), (rate(pr, r, secs), rate(pw, w, secs)));
+        let mut io: BTreeMap<String, DeviceRates> = BTreeMap::new();
+        for (dev, cur) in stats.iter() {
+            if let Some(prev) = self.prev_diskstats.get(dev) {
+                io.insert(dev.clone(), DiskCounters::rates(prev, cur, secs));
             }
         }
         // FreeBSD has no /proc/diskstats; iostat already reports rates, so they
@@ -318,7 +344,7 @@ impl SysinfoSource {
                 continue;
             }
             let kernel_name = self.device_key(&device, &stats).unwrap_or_default();
-            let (read_bps, write_bps) = io.get(&kernel_name).copied().unwrap_or((0.0, 0.0));
+            let rates = io.get(&kernel_name).copied().unwrap_or_default();
             let (inodes_total, inodes_used) = inode_usage(&mount);
             out.push(DiskRow {
                 mount,
@@ -329,8 +355,11 @@ impl SysinfoSource {
                 removable,
                 total,
                 used: total.saturating_sub(avail),
-                read_bps,
-                write_bps,
+                read_bps: rates.read_bps,
+                write_bps: rates.write_bps,
+                util: rates.util,
+                await_ms: rates.await_ms,
+                in_flight: rates.in_flight,
                 inodes_total,
                 inodes_used,
             });

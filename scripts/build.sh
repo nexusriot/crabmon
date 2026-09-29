@@ -130,7 +130,8 @@ cmd_dist() {
   cp "$RELEASE_BIN" "$stage/"
   cp "docs/$NAME.1" "$stage/"
   cp completions/* "$stage/completions/"
-  cp README.md CHANGELOG.md LICENSE "$stage/"
+  cp README.md LICENSE "$stage/"
+  cp docs/CHANGELOG.md docs/DESIGN.md "$stage/"
 
   tar -czf "$DIST_DIR/$tarball" -C "$DIST_DIR" "$NAME-$v-$arch"
   rm -rf "$stage"

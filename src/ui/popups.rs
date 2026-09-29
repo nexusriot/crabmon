@@ -146,7 +146,33 @@ pub fn affinity(f: &mut Frame<'_>, area: Rect, app: &App) {
 
 /// Fixed rows the detail pane draws before the socket list. `App` needs the
 /// count to know how far the pane can scroll.
-pub const DETAIL_FIELDS: usize = 16;
+pub const DETAIL_FIELDS: usize = 20;
+
+/// One history row: a sparkline and the peak it is scaled against, together
+/// fitting exactly `width` columns.
+///
+/// The peak is not decoration. A sparkline normalises to its own maximum, so
+/// without it a process idling between 0.1% and 0.3% draws exactly the same
+/// shape as one swinging between 10% and 90%. It is also what sizes the bar:
+/// "453.8 MiB peak" is five characters longer than "88.1% peak", and a fixed
+/// bar width would push one of them off the edge of the popup.
+fn trend_text(samples: &[f32], width: usize, peak_label: impl Fn(f32) -> String) -> String {
+    if samples.is_empty() {
+        return "no history yet".into();
+    }
+    let peak = samples.iter().copied().fold(0.0f32, f32::max);
+    let label = peak_label(peak);
+    let bar = width.saturating_sub(label.chars().count() + 1).min(MAX_TREND_WIDTH);
+    if bar == 0 {
+        // Too narrow for a shape; the number is the half worth keeping.
+        return label;
+    }
+    format!("{} {label}", crate::ui::procs::sparkline(samples, bar))
+}
+
+/// Longer than this and the bar is more decoration than information; the
+/// series itself is only `PROC_HIST_LEN` samples anyway.
+const MAX_TREND_WIDTH: usize = 96;
 
 pub fn detail(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     let Some(p) = app.selected_row().cloned() else { return };
@@ -193,6 +219,7 @@ pub fn detail(f: &mut Frame<'_>, area: Rect, app: &mut App) {
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "-".into()),
         ),
+        field("FDs", fd_field(p)),
         field("Service", p.service.clone().unwrap_or_else(|| "-".into())),
         field("Container", p.container.clone().unwrap_or_else(|| "-".into())),
         field("Exe", if p.exe.is_empty() { "-".into() } else { p.exe.clone() }),
@@ -200,6 +227,24 @@ pub fn detail(f: &mut Frame<'_>, area: Rect, app: &mut App) {
         field("Listening", if listening.is_empty() { "-".into() } else { listening.join(", ") }),
         field("Sockets", app.detail_sockets.len().to_string()),
     ];
+
+    // What the process has been doing, not just what it is doing. "Is this
+    // leaking or is it just big" is not answerable from one sample, and
+    // leaving the program to find out loses the process.
+    // The key column is 10 wide with one of ratatui's column gaps after it.
+    let width = inner.width.saturating_sub(11) as usize;
+    let series = app.proc_series(p.pid).cloned().unwrap_or_default();
+    rows.push(field("CPU trend", trend_text(&series.cpu, width, |v| format!("{v:.1}% peak"))));
+    rows.push(field(
+        "RSS trend",
+        trend_text(&series.mem.iter().map(|m| *m as f32).collect::<Vec<_>>(), width, |v| {
+            format!("{} peak", human_bytes(v as u64))
+        }),
+    ));
+    rows.push(field(
+        "IO trend",
+        trend_text(&series.io, width, |v| format!("{} peak", human_bps(v as f64))),
+    ));
     debug_assert_eq!(rows.len(), DETAIL_FIELDS, "DETAIL_FIELDS must match what is drawn");
 
     // Open sockets follow the fields, and scroll with them.
@@ -235,6 +280,20 @@ pub fn detail(f: &mut Frame<'_>, area: Rect, app: &mut App) {
             .wrap(Wrap { trim: true }),
             cmd_area,
         );
+    }
+}
+
+/// `1024 / 1024 max (100%)`, or just the count when the limit is unreadable.
+fn fd_field(p: &crate::metrics::ProcRow) -> String {
+    match (p.fds, p.fd_limit) {
+        (Some(n), Some(limit)) => {
+            let pct = p.fd_ratio().map(|r| format!(" ({:.0}%)", r * 100.0)).unwrap_or_default();
+            format!("{n} / {limit} max{pct}")
+        }
+        // The limit is what says whether the count matters, so a count without
+        // one is reported as exactly that rather than dressed up as a ratio.
+        (Some(n), None) => format!("{n} (no readable limit)"),
+        _ => "-".into(),
     }
 }
 

@@ -17,7 +17,7 @@ use crabmon::cli::{self, Args, Parsed};
 use crabmon::config::{self, Config};
 use crabmon::export;
 use crabmon::metrics::{MetricSource, SysinfoSource};
-use crabmon::record::{trim_frame, Recorder, ReplaySource};
+use crabmon::record::{trim_frame, FlightRecorder, Recorder, ReplaySource};
 use crabmon::remote::RemoteSource;
 use crabmon::sampler::ThreadedSource;
 
@@ -66,6 +66,7 @@ fn main() -> Result<()> {
 
 fn live_source(cfg: &Config) -> SysinfoSource {
     SysinfoSource::new(cfg.virtual_iface_prefixes.clone(), cfg.gpu.enabled && cfg.gpu.nvidia_smi)
+        .with_fds(cfg.procs.fds)
 }
 
 /// Where snapshots come from: a recording, another host, or this one.
@@ -292,7 +293,19 @@ fn run_tui(
         },
         None => None,
     };
-    let res = event_loop(&mut terminal, &mut app, &stop, recorder.as_mut());
+    // The flight recorder writes into the working directory by default, the
+    // same place `P` exports to, so a dump lands somewhere the user can find.
+    let flight_dir = match app.cfg.record.flight_dir.is_empty() {
+        true => std::path::PathBuf::from("."),
+        false => std::path::PathBuf::from(&app.cfg.record.flight_dir),
+    };
+    let mut flight = FlightRecorder::new(
+        &flight_dir,
+        app.cfg.record.flight,
+        app.cfg.record.flight_after,
+        app.cfg.record.limits(),
+    );
+    let res = event_loop(&mut terminal, &mut app, &stop, recorder.as_mut(), flight.as_mut());
 
     // Always restore the terminal, even if the loop failed.
     restore(mouse);
@@ -331,6 +344,7 @@ fn event_loop(
     app: &mut App,
     stop: &StopFlag,
     mut recorder: Option<&mut Recorder>,
+    mut flight: Option<&mut FlightRecorder>,
 ) -> Result<()> {
     let mut last_tick = Instant::now();
     loop {
@@ -381,10 +395,38 @@ fn event_loop(
                     app.set_status(format!("recording failed: {e}"));
                 }
             }
+            if let Some(f) = flight.as_deref_mut() {
+                run_flight_recorder(app, f);
+            }
             run_alert_commands(app);
         }
     }
     Ok(())
+}
+
+/// Offer the frame to the flight recorder, then start a dump for any alert
+/// that has just fired.
+///
+/// The order matters: the ring has to contain the frame that tripped the rule
+/// before the dump is opened, or every recording would stop one frame short of
+/// the evidence.
+fn run_flight_recorder(app: &mut App, flight: &mut FlightRecorder) {
+    if let Some(path) = flight.push(&app.snap) {
+        app.set_status(format!("flight recording written to {}", path.display()));
+    }
+    for name in app.alerts.take_fired() {
+        match flight.trigger(&name, app.snap.taken_at_unix) {
+            // `None` means a dump was already running and has been extended,
+            // which needs no second announcement.
+            Ok(Some(path)) => app.set_status(format!(
+                "{name}: recording {} frames to {}",
+                flight.buffered(),
+                path.display()
+            )),
+            Ok(None) => {}
+            Err(e) => app.set_status(format!("flight recording failed: {e}")),
+        }
+    }
 }
 
 /// Alert hooks are user-configured shell commands, spawned detached.

@@ -100,9 +100,50 @@ pub fn parse_size(s: &str) -> Option<u64> {
     num.trim().parse::<f64>().ok().map(|v| (v * mult as f64) as u64)
 }
 
+/// Parse `90`, `30s`, `5m`, `2h`, `3d` into seconds. Used by the filter
+/// language's `time>` term, where a bare number means seconds because that is
+/// the unit `run_time` is already in.
+pub fn parse_duration(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (num, mult) = match s.chars().last().unwrap().to_ascii_lowercase() {
+        's' => (&s[..s.len() - 1], 1u64),
+        'm' => (&s[..s.len() - 1], 60),
+        'h' => (&s[..s.len() - 1], 3_600),
+        'd' => (&s[..s.len() - 1], 86_400),
+        _ => (s, 1),
+    };
+    let v: f64 = num.trim().parse().ok()?;
+    // A negative age is not a typo worth guessing at, and `time>-1` matching
+    // everything would be a silently useless filter.
+    (v >= 0.0).then_some((v * mult as f64) as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durations_accept_the_units_a_process_age_is_read_in() {
+        assert_eq!(parse_duration("90"), Some(90), "a bare number is seconds");
+        assert_eq!(parse_duration("30s"), Some(30));
+        assert_eq!(parse_duration("5m"), Some(300));
+        assert_eq!(parse_duration("2h"), Some(7_200));
+        assert_eq!(parse_duration("3d"), Some(259_200));
+        assert_eq!(parse_duration("1.5h"), Some(5_400), "fractions, like parse_size");
+        assert_eq!(parse_duration(" 2H "), Some(7_200), "case and padding");
+    }
+
+    #[test]
+    fn a_duration_that_is_not_one_is_rejected_rather_than_read_as_zero() {
+        // `time>yesterday` must flag the query, not quietly match everything.
+        assert_eq!(parse_duration(""), None);
+        assert_eq!(parse_duration("yesterday"), None);
+        assert_eq!(parse_duration("m"), None);
+        assert_eq!(parse_duration("-5m"), None);
+    }
 
     #[test]
     fn bytes_scale_and_label() {

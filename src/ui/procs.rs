@@ -40,6 +40,9 @@ const MEM: Col = col("mem", SortBy::Mem, "MEM", 7);
 const VIRT: Col = col("virt", SortBy::Virt, "VIRT", 7);
 const THR: Col = col("thr", SortBy::Threads, "THR", 4);
 const NI: Col = col("ni", SortBy::Nice, "NI", 3);
+/// Descriptors against the process's own limit. Like PORTS it is off the
+/// automatic list, because without `[procs] fds` every row would read `-`.
+const FD: Col = col("fd", SortBy::Fds, "FD", 6);
 /// Not sortable in its own right; it visualises the CPU column.
 const SPARK: Col = col("trend", SortBy::Cpu, "TREND", 8);
 const DISK: Col = col("disk", SortBy::Disk, "DISK", 9);
@@ -51,8 +54,8 @@ const PORTS: Col =
 const NAME: Col = col("name", SortBy::Name, "COMMAND", 0);
 
 /// Every column `[procs] columns` can name.
-pub const ALL_COLUMNS: [Col; 14] =
-    [MARK, PID, USER, STATE, CPU, SPARK, MEM, VIRT, THR, NI, DISK, TIME, PORTS, NAME];
+pub const ALL_COLUMNS: [Col; 15] =
+    [MARK, PID, USER, STATE, CPU, SPARK, MEM, VIRT, THR, NI, FD, DISK, TIME, PORTS, NAME];
 
 pub fn column_by_name(name: &str) -> Option<Col> {
     let name = name.trim().to_ascii_lowercase();
@@ -62,13 +65,18 @@ pub fn column_by_name(name: &str) -> Option<Col> {
 /// Columns in display order, widest-first priority for what gets dropped.
 const OPTIONAL: [Col; 8] = [STATE, USER, DISK, TIME, NI, SPARK, VIRT, THR];
 /// Canonical left-to-right order, whichever subset is chosen.
-const ORDER: [Col; 13] =
-    [MARK, PID, USER, STATE, CPU, SPARK, MEM, VIRT, THR, NI, DISK, TIME, PORTS];
+const ORDER: [Col; 14] =
+    [MARK, PID, USER, STATE, CPU, SPARK, MEM, VIRT, THR, NI, FD, DISK, TIME, PORTS];
 const MIN_NAME: u16 = 10;
 
 /// Choose the columns that fit in `width`, always keeping the marker, PID,
 /// CPU%, MEM and COMMAND.
 pub fn plan_columns(width: u16, with_ports: bool) -> Vec<Col> {
+    plan(width, with_ports, false)
+}
+
+/// As `plan_columns`, but also told whether descriptors are being counted.
+pub fn plan(width: u16, with_ports: bool, with_fds: bool) -> Vec<Col> {
     let mut chosen = vec![MARK, PID, CPU, MEM];
     let cost = |cols: &[Col]| -> u16 {
         // One space of ratatui column spacing between every pair, plus the
@@ -79,8 +87,19 @@ pub fn plan_columns(width: u16, with_ports: bool) -> Vec<Col> {
     // it never joins the automatic set on its own. `[procs] ports` is how you
     // ask for it, and having asked, it outranks the other optional columns for
     // the width that is going.
-    let optional: Vec<Col> =
-        if with_ports { [PORTS].into_iter().chain(OPTIONAL).collect() } else { OPTIONAL.to_vec() };
+    // PORTS and FD are both paid for elsewhere — an fd-table walk per visible
+    // row, and a directory sweep per process — so neither joins the automatic
+    // set unasked. Having been asked for, they outrank the columns that are
+    // free, because a column that costs syscalls nobody looks at is worse than
+    // one missing thread count.
+    let mut optional: Vec<Col> = Vec::new();
+    if with_ports {
+        optional.push(PORTS);
+    }
+    if with_fds {
+        optional.push(FD);
+    }
+    optional.extend(OPTIONAL);
     for col in optional {
         let mut trial = chosen.clone();
         trial.push(col);
@@ -99,9 +118,9 @@ pub fn plan_columns(width: u16, with_ports: bool) -> Vec<Col> {
 /// An explicit list is honoured as written — someone who asked for a column has
 /// a reason — except that COMMAND is always appended if it was left out, since
 /// a table of numbers with no process names is not a process table.
-pub fn columns_for(width: u16, configured: &[String], ports: bool) -> Vec<Col> {
+pub fn columns_for(width: u16, configured: &[String], ports: bool, fds: bool) -> Vec<Col> {
     if configured.is_empty() {
-        return plan_columns(width, ports);
+        return plan(width, ports, fds);
     }
     let mut out: Vec<Col> = Vec::new();
     for name in configured {
@@ -112,7 +131,7 @@ pub fn columns_for(width: u16, configured: &[String], ports: bool) -> Vec<Col> {
         }
     }
     if out.is_empty() {
-        return plan_columns(width, ports);
+        return plan(width, ports, fds);
     }
     // COMMAND flexes, so it has to be last wherever it was asked for.
     out.retain(|c| c.id != NAME.id);
@@ -197,7 +216,22 @@ fn field_text(key: SortBy, p: &ProcRow, name: &str, name_width: usize) -> String
         }
         SortBy::Time => human_duration(p.run_time),
         SortBy::Nice => p.nice.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+        SortBy::Fds => fd_text(p),
         SortBy::Name => truncate_fit(name, name_width),
+    }
+}
+
+/// The descriptor count, or the percentage of the limit once the process is
+/// close enough for that to be the more useful number.
+///
+/// Both figures do not fit in six columns, and the count alone cannot say
+/// whether it matters: 4000 is nothing against a limit of a million and fatal
+/// against the default 1024.
+pub fn fd_text(p: &ProcRow) -> String {
+    let Some(n) = p.fds else { return "     -".into() };
+    match p.fd_ratio() {
+        Some(r) if r >= 0.8 => format!("{:>5.0}%", r * 100.0),
+        _ => format!("{n:>6}"),
     }
 }
 
@@ -268,7 +302,8 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
 
-    let cols = columns_for(inner.width, &app.cfg.procs.columns, app.cfg.procs.ports);
+    let cols =
+        columns_for(inner.width, &app.cfg.procs.columns, app.cfg.procs.ports, app.cfg.procs.fds);
     app.proc_area = area;
     app.header_cols = column_ranges(inner, &cols);
 
@@ -355,6 +390,15 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
                     "state" if p.state == 'Z' || p.state == 'D' => {
                         Style::default().fg(app.theme.warn)
                     }
+                    // Descriptors are only worth colouring against the limit,
+                    // which is the one thing that says a big number is a
+                    // problem rather than a busy proxy doing its job.
+                    "fd" => Style::default().fg(match p.fd_ratio() {
+                        Some(r) => {
+                            app.theme.usage(r, app.cfg.thresholds.warn, app.cfg.thresholds.crit)
+                        }
+                        None => app.theme.text,
+                    }),
                     "pid" => Style::default().fg(app.theme.dim),
                     _ => Style::default().fg(app.theme.text),
                 };
@@ -548,18 +592,22 @@ mod tests {
 
     #[test]
     fn an_explicit_column_list_is_honoured_and_typos_are_dropped() {
-        let cols = columns_for(200, &["pid".into(), "ports".into(), "nonsense".into()], false);
+        let cols =
+            columns_for(200, &["pid".into(), "ports".into(), "nonsense".into()], false, false);
         let ids: Vec<&str> = cols.iter().map(|c| c.id).collect();
         assert_eq!(ids, vec!["pid", "ports", "name"], "COMMAND is appended, typos are not");
 
         // Asking for COMMAND in the middle still puts it last: it is the column
         // that flexes, so anything after it would have no width left.
-        let cols = columns_for(200, &["name".into(), "cpu".into()], false);
+        let cols = columns_for(200, &["name".into(), "cpu".into()], false, false);
         assert_eq!(cols.iter().map(|c| c.id).collect::<Vec<_>>(), vec!["cpu", "name"]);
 
         // An all-typo list falls back rather than drawing an empty table.
-        assert_eq!(columns_for(200, &["nope".into()], false).len(), plan_columns(200, false).len());
-        assert_eq!(columns_for(200, &[], false).len(), plan_columns(200, false).len());
+        assert_eq!(
+            columns_for(200, &["nope".into()], false, false).len(),
+            plan_columns(200, false).len()
+        );
+        assert_eq!(columns_for(200, &[], false, false).len(), plan_columns(200, false).len());
     }
 
     #[test]
@@ -576,7 +624,7 @@ mod tests {
         // Clicking PORTS has no ordering to apply; the old code would have
         // silently re-sorted by whatever key the column borrowed.
         let inner = Rect { x: 0, y: 0, width: 120, height: 20 };
-        let cols = columns_for(120, &["pid".into(), "ports".into(), "cpu".into()], false);
+        let cols = columns_for(120, &["pid".into(), "ports".into(), "cpu".into()], false, false);
         let ranges = column_ranges(inner, &cols);
         assert_eq!(ranges.len(), 3, "mark and ports contribute no clickable range");
     }
@@ -617,7 +665,7 @@ mod tests {
         assert!(on.iter().any(|c| c.id == PORTS.id), "[procs] ports did not add the column");
 
         // An explicit column list still wins over the switch either way.
-        let explicit = columns_for(200, &["pid".into(), "name".into()], true);
+        let explicit = columns_for(200, &["pid".into(), "name".into()], true, false);
         assert!(!explicit.iter().any(|c| c.id == PORTS.id), "an explicit list was overridden");
     }
 

@@ -12,6 +12,26 @@ How crabmon is put together, and why.
   features cleanly feature-gated.
 - Every non-trivial decision testable without a terminal or a live host.
 
+## Repository layout
+
+```
+README.md            what crabmon does and how to drive it
+Makefile             a front end to scripts/build.sh, one line per target
+docs/
+  crabmon.1          the man page
+  DESIGN.md          this document
+  CHANGELOG.md       the release history
+  crabmon.png        the screenshot the README embeds
+completions/         bash, zsh and fish
+scripts/build.sh     the build driver; build-deb.sh is an alias CI still uses
+src/                 the library, plus a thin binary
+tests/               six integration suites
+```
+
+The prose lives under `docs/` with the man page it duplicates, so the three
+documents that have to agree with each other sit in one directory; `tests/docs.rs`
+is what enforces that they do.
+
 ## Crate layout
 
 The application is a **library** with a thin binary on top. That split exists
@@ -43,7 +63,7 @@ src/
   metrics/
     mod.rs           the data model and the `MetricSource` trait
     sysinfo_source.rs the live host implementation
-    diskstats.rs     /proc/diskstats and device-name resolution
+    diskstats.rs     /proc/diskstats: bytes, saturation and service times
     netclass.rs      virtual-interface classification
     gpu.rs           /sys/class/drm and nvidia-smi
     cgroup.rs        cgroup v1/v2 limits
@@ -52,6 +72,7 @@ src/
     meminfo.rs       the buffers/cache breakdown
     procgroup.rs     per-process cgroup paths, and what they mean
     sockets.rs       /proc/net joined against a process's fd table
+    fds.rs           open descriptors and the limit they run out against
   ui/
     mod.rs           layout selection and the draw entry point
     header.rs        host banner and status line
@@ -177,6 +198,23 @@ counters produces a gap rather than an absurd spike.
   canonicalises the symlink (`→ /dev/dm-0`) and takes the basename, which is why
   IO rates work on LVM and LUKS roots. Sectors are 512 bytes regardless of the
   device's logical block size.
+- **Disk saturation** — bytes alone cannot say a device is *busy*: an NVMe
+  serving 4K random reads is pinned at a few MB/s, and a throughput gauge draws
+  that as idle. `io_ticks` (field 13) is milliseconds with a non-empty queue,
+  so `Δio_ticks / Δwall` is a utilisation fraction; the service-time fields
+  divided by completed requests give mean latency. Both arrive on the line the
+  parser was already reading and discarding. Utilisation is clamped, because
+  the kernel samples the queue on its own timer and a busy device routinely
+  reports a few milliseconds more than the interval held. `await` is `None`
+  rather than 0 when nothing completed: there is no average of nothing, and
+  zero would draw an instant disk.
+- **Disk aggregates** — summed per *device*, not per mount. A device carrying
+  several mounts — the ordinary btrfs subvolume layout, and every bind mount —
+  publishes one set of counters that each of its mounts reports, so the old
+  per-mount sum multiplied the machine's disk throughput by however many
+  subvolumes happened to be mounted. Utilisation aggregates as a maximum rather
+  than a sum: two disks at 100% and 0% are not a machine at 50%, and the pinned
+  one is still what everything is waiting on.
 - **Network aggregate** — loopback, bridges, veth pairs and VPN tunnels are
   classified as virtual and excluded by default. Counting them meant VPN traffic
   was reported roughly twice, once on the tunnel and once on the physical NIC.
@@ -208,6 +246,18 @@ counters produces a gap rather than an absurd spike.
 - **Sockets** — `/proc/net/{tcp,tcp6,udp,udp6}` keyed by inode, joined against
   the `socket:[inode]` symlinks in a process's fd table. Only ever done for the
   one process whose detail pane is open.
+- **File descriptors** — a `getdents` sweep of `/proc/<pid>/fd`, counted rather
+  than collected so a process holding 200k sockets does not materialise 200k
+  `PathBuf`s, and capped at `MAX_FDS_COUNTED`. The *limit* comes from
+  `/proc/<pid>/limits` and is cached per PID and start time, like the cgroup
+  path: it is set at exec and almost never changes. The count alone says
+  nothing — 4000 descriptors is unremarkable against a limit of a million and
+  fatal against the default 1024 — so the ratio is what the column, the filter
+  and the alert are all written against. Unlike the `ports` column this is
+  sampled for every process rather than the visible rows, because a filter over
+  only what is already on screen is a filter over the wrong set. An unreadable
+  fd table reads as `None`, not zero: another user's process is not a process
+  holding no files, and zero would sweep every one of them into `fd<100`.
 - **Per-process IO** — differences of `Process::disk_usage()` totals. Reading
   `/proc/<pid>/io` for another user's process is not permitted, so those rates
   legitimately read as zero.
@@ -217,6 +267,30 @@ counters produces a gap rather than an absurd spike.
   because it costs tens of milliseconds per refresh.
 - **cgroups** — the panel appears only when the process is actually confined,
   since a limitless root cgroup is noise.
+
+## Alert rules
+
+A rule is a measurement, a threshold and a direction. `below` inverts the
+comparison, and is *strict* where the default is inclusive: the obvious
+`threshold = 1` on a `proc` rule has to mean "none running" rather than firing
+while the one process is still up.
+
+Rule state is keyed by **position, not name**. Nothing makes names unique, and
+two rules sharing one — the pair `below` makes obvious, one over a threshold
+and one under — shared a `fired` flag, each clearing what the other had just
+set, so the hook command re-spawned on every refresh for as long as the
+condition held.
+
+`proc` rules count the processes matching a filter query, parsed once at
+construction. A query that fails to parse leaves the rule inert rather than
+counting zero, because counting zero would make every `below` rule fire for
+ever on a typo, hook and all.
+
+A rule with nothing to measure is skipped rather than read as zero. That is
+what makes `kind = "fd"` safe to leave in a config on a machine where
+`[procs] fds` is off, and `cpu.full` report nothing on the kernels that
+publish no `full` line for CPU rather than silently falling back to `some`,
+which measures something else entirely.
 
 ## Recording and replay
 
@@ -235,6 +309,26 @@ hides threads by default the replay would then look almost empty.
 
 Every snapshot type carries `#[serde(default)]`, so a recording made by an older
 crabmon still loads when fields are added.
+
+### The flight recorder
+
+`--record` only helps if it was started before the incident, which is the one
+thing nobody does. `FlightRecorder` holds the last `pre` frames in memory at
+all times and, when a rule goes active, writes them plus the next `post` frames
+as an ordinary recording.
+
+Three details:
+
+- **Frames are trimmed on the way *into* the ring, not on the way out.** A
+  ten-minute window of untrimmed frames is well over a gigabyte of live memory,
+  in the process whose job is to make memory pressure visible.
+- **The ring is written before the frame budget starts.** `run_flight_recorder`
+  pushes the frame *then* handles triggers, so the ring already contains the
+  frame that tripped the rule; the other order would stop every recording one
+  frame short of the evidence.
+- **A trigger while a dump is running extends it** rather than opening a second
+  file. A flapping rule would otherwise leave a file per refresh, each one
+  mostly the same frames.
 
 ## Sampling off the draw thread
 
@@ -321,23 +415,30 @@ terminal or a runaway process:
 
 ## Testing
 
-Over 450 tests: the in-crate unit tests plus six integration suites. All
+Over 500 tests: the in-crate unit tests plus six integration suites. All
 are offline and deterministic except `proc_control`, which deliberately touches
 the kernel:
 
 - **unit tests** (`src/**`) — formatting, filter parsing, sorting, tree
-  flattening, diskstats/cgroup/PSI/meminfo/`iostat`/`nvidia-smi` parsing, GPU and
-  battery sysfs against fabricated trees, socket-table decoding, alert state,
-  column planning, base64, the Prometheus exposition format, recording
-  round-trips and config round-trips.
+  flattening, diskstats/cgroup/PSI/meminfo/`iostat`/`nvidia-smi`/`limits`
+  parsing, GPU and battery sysfs against fabricated trees, socket-table
+  decoding, alert state, column planning, base64, the Prometheus exposition
+  format, recording round-trips and config round-trips. Also the arithmetic
+  that is easy to get quietly wrong: disk utilisation against a counter reset,
+  an idle interval having no average service time, per-device rather than
+  per-mount aggregation, and every alert kind against a snapshot built to make
+  it fire.
 - **`tests/app_behaviour.rs`** — the interaction model against a fixture source:
   key handling in every mode, selection stability across re-sorts, PID-reuse
   refusal for all three process actions, tagging and bulk actions, pinning,
   saved filters, grouping and group drill-down, popup scrolling, replay
-  scrubbing, audit logging, mouse handling, history bounds, and that a repeated
-  frame from an asynchronous source never reaches the charts.
+  scrubbing, audit logging, mouse handling, history bounds, per-process series
+  accumulating and being evicted with the process, and that a repeated frame
+  from an asynchronous source never reaches the charts.
 - **`tests/render.rs`** — the real panels drawn onto a `TestBackend`, asserting
-  on screen content, at sizes from 10×3 up to 300×100 and in every theme.
+  on screen content, at sizes from 10×3 up to 300×100 and in every theme,
+  including the FD column only appearing once descriptors are counted and the
+  detail pane's trend rows.
 - **`tests/cli.rs`** — the built binary: `--help`, `--version`, exit codes,
   `--once` JSON/CSV output, `--diff` in both formats, `--stream` read back
   through the recording parser, `--watch`'s exit codes, and the refusal to
@@ -365,6 +466,11 @@ the kernel:
   They are also scoped to the relevant section of each document, so an
   incidental mention of a word elsewhere cannot satisfy them.
 
+  The lists that are enumerated in prose — `[procs] columns`, the alert kinds,
+  the filter fields — are compared as *parsed lists* rather than by substring.
+  `contains("fd")` is satisfied by the word "fds" three lines further down,
+  which is how the man page lost the `fd` column with the suite green.
+
 ## Configuration & persistence
 
 `Config` has a default for every field, `#[serde(default)]` on the struct, and a
@@ -386,9 +492,13 @@ A pair of tests in `tests/docs.rs` assert that the two lists agree and that the
 script's own help covers every command it accepts.
 
 `make deb` (still reachable as `scripts/build-deb.sh`, the name CI uses) builds
-a release binary and runs `cargo-deb`, which installs the binary, the man page
-and bash/zsh/fish completions. `make dist` produces the same file set as a
-tarball for the platforms the deb does not cover. CI runs the test-suite on
+a release binary and runs `cargo-deb`, which installs the binary, the man page,
+bash/zsh/fish completions and the prose under `/usr/share/doc/crabmon` — the
+README, this document and the changelog, the last of which Debian expects at
+that exact path. `make dist` produces the same file set as a tarball for the
+platforms the deb does not cover; `make install` is the binary, the man page
+and the completions only, since the prose has nowhere agreed to go under an
+arbitrary `PREFIX`. CI runs the test-suite on
 Linux, macOS and Windows, checks formatting and clippy, and cross-checks the
 cfg-gated code paths against aarch64 Linux and FreeBSD.
 
@@ -435,9 +545,11 @@ one that publishes them.
 - `nvidia-smi` polling is opt-in and synchronous; it will stall a refresh on a
   machine where the driver is slow to answer.
 - The FreeBSD disk-IO path shells out to `iostat -x` per tick and reports
-  since-boot averages rather than instantaneous rates. It is compile-checked in
-  CI and unit-tested against captured output, but has never run on real FreeBSD
-  hardware.
+  since-boot averages rather than instantaneous rates — which now applies to
+  the utilisation and latency figures it reads out of `%b` and `ms/t` as well,
+  so a FreeBSD host's "% busy" is its average since boot and not what the disk
+  is doing now. It is compile-checked in CI and unit-tested against captured
+  output, but has never run on real FreeBSD hardware.
 - `--remote` streams by default (`[remote] stream`, on): one SSH session and
   one `crabmon --stream` for the whole session. The one-shot fallback, taken
   when the far end is too old to understand the flag, does re-run
@@ -449,12 +561,28 @@ one that publishes them.
   monitors but is the obvious next thing to optimise.
 - A replay is parsed in full into memory before the first frame is drawn, so a
   long capture costs roughly its JSON size several times over. Nothing indexes
-  the file by line offset.
+  the file by line offset. The flight recorder makes long captures routine, so
+  this is more pressing than it was.
+- The flight recorder's ring is bounded in *frames*, not bytes. A machine with
+  an unusually long process list and a large `[record] top_n` costs
+  proportionally more per frame than the figures quoted in the docs.
+- `[procs] fds` adds a `getdents` sweep per process per sample. Measured on a
+  2800-process machine at the default 800 ms refresh it roughly doubles
+  crabmon's sampling cost, from about 10% of one core to about 20%. That is why
+  it is off by default, and it is the second thing — after the process-list
+  rebuild above — that a busy host pays for.
+- Per-process history is kept for every process in the snapshot, not only the
+  ones being looked at, so that the detail pane has something to draw the
+  moment it opens. At `PROC_HIST_LEN` samples of three series that is a few
+  megabytes on a 2000-process machine.
 - The `ports` column walks one fd table per visible row, which is why it is off
   by default — `[procs] ports`, or naming it in `[procs] columns`, is what asks
   for it — and resolved only for rows actually on screen. A process holding tens
   of thousands of descriptors is cut off at `MAX_FDS_SCANNED`, which bounds the
   walk itself rather than the list it returns.
+- Alerts are evaluated in `App::tick`, so they and the flight recorder run only
+  in the TUI. `--serve`, `--stream`, `--once` and `--watch` never fire a rule,
+  and a headless collector therefore cannot produce a dump.
 - Pins do not reorder the tree view. The ordering there is structural, and
   hoisting a child out of its parent would draw a tree that is not one.
 - `--diff` holds both snapshots in memory, so diffing two ends of a large
@@ -481,14 +609,9 @@ Open defects, found by review and not yet fixed:
 - An explicit `[procs] columns` list is never width-checked, so on a narrow
   terminal `name_width` can reach zero and every process name renders blank.
   The automatic planner reserves `MIN_NAME`; the configured path does not.
-- Alert rule state is keyed by `rule.name` and nothing enforces that names are
-  unique. Two rules sharing one — one over threshold, one under — clear each
-  other's `fired` flag, so the hook command re-spawns every refresh.
 - The detail popup reads the *local* host for the nice value and socket list
   rather than the snapshot, so under `--replay` they are missing and under
   `--remote` they belong to whatever local process holds that PID. The same
   applies to the `ports` column.
-- Aggregate disk throughput is summed per mount, so a device carrying several
-  mounts — the normal btrfs subvolume layout — is counted once per mount.
 - `MATCHED = 1` is also the exit code a failed run returns, so a `--watch`
   caller cannot distinguish a match from a typo in the query.
