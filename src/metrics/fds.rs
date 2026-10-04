@@ -38,6 +38,67 @@ pub fn count(pid: u32) -> Option<u32> {
     }
 }
 
+/// Entries listed in the detail pane's open-files section.
+///
+/// Bounded because the pane can only show so many, and a proxy holding 200k
+/// descriptors should not cost 200k `readlink`s to open a popup with twenty
+/// visible rows.
+pub const MAX_FILES_LISTED: usize = 256;
+
+/// One open descriptor and what it points at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenFile {
+    pub fd: u32,
+    /// The resolved link target: a path, or a `pipe:[…]`/`anon_inode:…` label
+    /// for the descriptors that are not files.
+    pub target: String,
+}
+
+impl OpenFile {
+    /// Whether this is a real path rather than one of the kernel's synthetic
+    /// targets. Those are worth showing — a process wedged on an eventfd is
+    /// still holding it — but they are not what "open files" means to anyone
+    /// looking for the log that filled a disk.
+    pub fn is_path(&self) -> bool {
+        self.target.starts_with('/')
+    }
+}
+
+/// The process's open descriptors, in numeric order.
+///
+/// Sockets are left out: the detail pane already lists them with their
+/// addresses and states, and `socket:[4026531992]` next to that is noise.
+/// Everything else is kept, including the pipes and anonymous inodes, because
+/// "what is this process actually holding" is the question being asked.
+///
+/// `None` when the fd table cannot be read — another user's process, or one
+/// that exited while the pane was opening — which the pane renders as "not
+/// readable" rather than as a process holding nothing.
+pub fn open_files(pid: u32) -> Option<Vec<OpenFile>> {
+    #[cfg(target_os = "linux")]
+    {
+        let dir = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+        let mut out: Vec<OpenFile> = dir
+            .flatten()
+            .take(MAX_FILES_LISTED)
+            .filter_map(|e| {
+                let fd: u32 = e.file_name().to_string_lossy().parse().ok()?;
+                let target = std::fs::read_link(e.path()).ok()?.to_string_lossy().to_string();
+                // A descriptor can be closed between the readdir and the
+                // readlink; that is a process doing its job, not an error.
+                (!target.starts_with("socket:")).then_some(OpenFile { fd, target })
+            })
+            .collect();
+        out.sort_by_key(|f| f.fd);
+        Some(out)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// The soft `RLIMIT_NOFILE` from `/proc/<pid>/limits`.
 pub fn soft_limit(pid: u32) -> Option<u64> {
     #[cfg(target_os = "linux")]
@@ -113,6 +174,54 @@ Max open files            1024                 1048576              files
 Max locked memory         8388608              8388608              bytes
 Max pending signals       62841                62841                signals
 ";
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_can_list_its_own_open_files() {
+        // Hold a file open so there is something unambiguous to find.
+        let path = std::env::temp_dir().join(format!("crabmon-fd-{}.tmp", std::process::id()));
+        let file = std::fs::File::create(&path).expect("create");
+
+        let files = open_files(std::process::id()).expect("our own fd table is readable");
+        assert!(files.iter().any(|f| f.target == path.to_string_lossy()), "{files:?}");
+        // stdin/stdout/stderr are always there, so the list is never empty.
+        assert!(files.len() >= 3, "{files:?}");
+        // In numeric order, so the list reads like `ls /proc/<pid>/fd`.
+        let fds: Vec<u32> = files.iter().map(|f| f.fd).collect();
+        let mut sorted = fds.clone();
+        sorted.sort_unstable();
+        assert_eq!(fds, sorted);
+
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sockets_are_left_out_because_the_pane_already_lists_them_properly() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let files = open_files(std::process::id()).expect("readable");
+        assert!(
+            !files.iter().any(|f| f.target.starts_with("socket:")),
+            "a bare socket inode is noise next to the socket table: {files:?}"
+        );
+        drop(listener);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_that_is_gone_reports_nothing_rather_than_an_empty_list() {
+        // An empty list would read as "this process holds no files", which is
+        // never true of a live process — the same distinction `count` makes.
+        assert_eq!(open_files(u32::MAX), None);
+    }
+
+    #[test]
+    fn a_path_is_told_apart_from_the_kernel_synthetic_targets() {
+        assert!(OpenFile { fd: 3, target: "/var/log/app.log".into() }.is_path());
+        assert!(!OpenFile { fd: 4, target: "pipe:[12345]".into() }.is_path());
+        assert!(!OpenFile { fd: 5, target: "anon_inode:[eventfd]".into() }.is_path());
+    }
 
     #[test]
     fn the_soft_limit_is_read_and_not_the_hard_one() {

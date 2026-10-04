@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+#
+# A one-route HTTP client, so the e2e image needs nothing installed into it.
+#
+# The exporter is scraped from *inside* the container, because `--serve` is
+# tested with an empty network namespace and there is no port to publish. That
+# used to mean `apt-get install curl` in the image build: a package fetched
+# from whatever the Debian mirrors held that day, which is a large uncontrolled
+# input to a test whose whole claim is that it is hermetic. Bash's `/dev/tcp`
+# is already in the base image and is the entire feature needed here — one
+# request, no redirects, no TLS, no keep-alive.
+#
+#   httpc GET /metrics        print the body, exit non-zero unless 200
+#   httpc GET /healthz code   print the status code
+#
+# PORT overrides the port; the host is always loopback, which is the only
+# place anything in this container is listening.
+set -u
+
+method=${1:?usage: httpc METHOD PATH [code|body]}
+path=${2:?usage: httpc METHOD PATH [code|body]}
+mode=${3:-body}
+host=127.0.0.1
+port=${PORT:-9100}
+
+# Exit 7 like curl's "failed to connect", so a retry loop can tell "not up
+# yet" from "answered with something unexpected".
+exec 3<>"/dev/tcp/$host/$port" || exit 7
+
+printf '%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n' \
+    "$method" "$path" "$host" >&3
+
+status=
+while IFS= read -r line <&3; do
+    line=${line%$'\r'}
+    if [ -z "$status" ]; then
+        # `HTTP/1.1 404 Not Found` → `404`
+        rest=${line#* }
+        status=${rest%% *}
+    fi
+    [ -n "$line" ] || break
+done
+
+if [ "$mode" = code ]; then
+    printf '%s\n' "${status:-000}"
+    exit 0
+fi
+
+cat <&3
+[ "$status" = 200 ]

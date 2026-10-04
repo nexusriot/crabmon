@@ -21,7 +21,9 @@ and it can print all of it as JSON or CSV for scripts.
 - **Processes** — PID, user, state, CPU%, a CPU sparkline, RSS, virtual size,
   thread count, nice, disk IO, run time, listening ports and command, sortable on
   every column (keyboard or by clicking the header), with a tree view, a query
-  language, and a detail pane on `Enter` showing the process's open sockets.
+  language, and a detail pane on `Enter` showing the process's open sockets and
+  the files it is holding open — "which log is filling the disk" without
+  leaving crabmon for `lsof` and losing the process you were looking at.
   Threads are hidden by default (`H` shows them), so the list reflects processes
   rather than every kernel task. Tag several with `Space` to signal, renice or
   pin them at once, and `f` keeps one process at the top of the table however the
@@ -33,6 +35,12 @@ and it can print all of it as JSON or CSV for scripts.
 - **Network** — per-interface rates and totals with an RX/TX history chart.
   Loopback, bridges, veth pairs and VPN tunnels are excluded from the aggregate
   by default so the same bytes are not counted twice.
+- **Per-container network** — the kernel accounts bytes to a network
+  namespace rather than to a PID, and every process in a container shares one,
+  so the grouped view carries each container's throughput and `--serve`
+  exports it. Per-*process* bytes would need eBPF or packet capture, and so
+  privileges crabmon does not ask for; this is the honest figure underneath
+  the question people are usually asking.
 - **Disks** — one usage gauge per mount with live read/write throughput,
   including LVM and LUKS volumes, and a warning when a filesystem is running
   out of inodes rather than bytes. Busy devices are labelled with their
@@ -58,7 +66,10 @@ and it can print all of it as JSON or CSV for scripts.
   memory, swap, load, disk capacity or saturation, temperature, GPU, pressure
   stall, network throughput, file descriptors — or the number of processes
   matching a filter query, which with `below` is how you get paged when
-  something *stops*.
+  something *stops*. `--serve --alerts` and `--stream --alerts` run the same
+  rules with no terminal at all, exporting each one firing or not — which is
+  what puts pressure stall, device saturation and descriptor exhaustion within
+  reach of a pager.
 - **File descriptors** — an optional FD column with each process's count
   against its own `RLIMIT_NOFILE`, plus `fd>` and `fd%>` filters and an alert
   kind. Descriptor exhaustion is to a process what inode exhaustion is to a
@@ -74,8 +85,11 @@ and it can print all of it as JSON or CSV for scripts.
   someone thought to start recording first.
 - **Diff** — `--diff before.json after.json` reduces two snapshots to what
   actually changed: what started, what exited, what grew.
-- **Watch** — `--watch 'state:D'` blocks until something matches and exits
-  non-zero, so a shell script can wait on a condition.
+- **Watch** — `--watch 'state:D'` blocks until processes match and exits
+  non-zero, so a shell script can wait on a condition; `--watch-rule 'cpu>=90'`
+  waits on any measurement an alert can, including `proc:nginx<1` for "it has
+  stopped". Both are alert rules underneath, so a condition means the same
+  thing in a script, in the config file and in the exporter.
 - **Prometheus** — `--serve :9100` runs headless and exposes CPU, memory, swap,
   load, disks, interfaces, sensors, pressure, power and GPU, plus the busiest
   processes (capped, and configurable), including per-device utilisation and
@@ -83,13 +97,15 @@ and it can print all of it as JSON or CSV for scripts.
   against their limits.
 - **Remote** — `--remote host` monitors another machine over SSH, with no
   daemon and no open port, over one long-lived session rather than a process
-  per sample.
+  per sample. `--remote web-1,web-2,db-1` opens a fleet table instead: one row
+  per host, sampled concurrently, so the machine in trouble is visible before
+  you have picked one and an unreachable host costs the others nothing.
 - **Never blocks** — sampling runs on its own thread, so a slow `nvidia-smi`, a
   wedged NFS mount or a stalled SSH link leaves the interface responsive instead
   of freezing it.
 - **Action log** — every signal, renice and affinity change is recorded to a
   local file, viewable in the TUI with `L`.
-- **Themes and layouts** — five colour themes, four layouts, and a config file
+- **Themes and layouts** — five colour themes, five layouts, and a config file
   that covers every panel, threshold and colour.
 
 ## Install
@@ -161,7 +177,7 @@ run of stuck workers.
 | `-d`, `--descending` | Sort descending (the default) |
 | `-f`, `--filter <QUERY>` | Initial process filter |
 | `-t`, `--tree` | Start in process-tree view |
-| `-l`, `--layout <NAME>` | `dashboard`, `processes`, `cpu`, `io` |
+| `-l`, `--layout <NAME>` | `dashboard`, `processes`, `cpu`, `io`, `fleet` |
 | `--theme <NAME>` | `default`, `mono`, `nord`, `solarized`, `gruvbox` |
 | `--no-color` | Disable colour (same as `--theme mono`) |
 | `--no-mouse` | Do not capture mouse events |
@@ -170,14 +186,17 @@ run of stuck workers.
 | `-n`, `--top <N>` | Limit `--once` and `P` snapshot output to the top N processes |
 | `-c`, `--config <PATH>` | Use an alternate config file |
 | `-g`, `--group <BY>` | Group processes: `none`, `service`, `container`, `user` |
+| `--columns <LIST>` | Process-table columns, e.g. `pid,user,cpu,mem,name` |
 | `--record <PATH>` | Record every sample to a JSONL file, replacing it if it exists |
 | `--replay <PATH>` | Replay a recording instead of sampling this host |
-| `--remote <TARGET>` | Monitor TARGET over SSH (needs crabmon installed there) |
+| `--remote <TARGET>` | Monitor TARGET over SSH; comma-separated for a fleet |
 | `--remote-command <C>` | Command to run on the remote host |
 | `--serve <ADDR>` | Serve Prometheus metrics on ADDR, headless (this host only) |
 | `--stream` | Print one JSON snapshot per line forever (this host only) |
+| `--alerts` | With `--serve`/`--stream`: evaluate alert rules headlessly |
 | `--diff <A> [B]` | Compare two snapshots, or one recording end to end |
 | `--watch <QUERY>` | Block until processes match QUERY, then exit 1 |
+| `--watch-rule <EXPR>` | ...or until a measurement does: `cpu>=90`, `proc:nginx<1` |
 | `--watch-for <SECS>` | ...only once the match has held this long |
 | `--watch-timeout <SECS>` | ...giving up after this long; 0 waits forever |
 | `-h`, `--help` / `-V`, `--version` | Help / version |
@@ -200,6 +219,7 @@ run of stuck workers.
 | `T` | Toggle the process tree |
 | `H` | Show or hide individual threads |
 | `G` | Group by service, container or user |
+| `W` | Show the fleet table (several `--remote` hosts) |
 | `Space` | Tag a process for a bulk action |
 | `U` | Untag everything |
 | `f` | Pin a process to the top of the table |
@@ -341,6 +361,67 @@ first. A match is the *non-zero* exit, so it is `||` that runs on a match and
 nothing went wrong. `--watch-for` requires the match to hold that many
 *consecutive* seconds, so a condition that flickers once a minute does not
 count.
+
+`--watch-rule` waits for a measurement instead of a process list, using the
+same vocabulary as an `[[alert]]`:
+
+```sh
+crabmon --watch-rule 'psi:io>20' --watch-for 60 --watch-timeout 900 || page-oncall
+crabmon --watch-rule 'proc:nginx<1' --watch-timeout 0 && echo 'nginx came back'
+```
+
+`EXPR` is `kind[:target]op value`, where `kind` is any alert kind — `cpu`,
+`mem`, `swap`, `load`, `disk`, `temp`, `gpu`, `psi`, `io`, `net`, `fd`, `proc`.
+`>` and `>=` both mean at-or-over and `<` means strictly under, matching the
+way an `[[alert]]` compares; `<=` is refused rather than quietly read as `<`.
+The operator is taken from the right, so a `proc` query may contain one of its
+own: `proc:cpu>5<1` is "fewer than one process over 5% CPU".
+
+Both forms *are* alert rules — `--watch nginx` is `proc:nginx>=1` — so a
+condition behaves identically here, in the config file, and under
+`--serve --alerts`.
+
+## Watching several machines
+
+```sh
+crabmon --remote web-1,web-2,db-1
+```
+
+More than one `--remote` target opens the **fleet** table: one row per host
+with CPU, memory, swap, load, disk utilisation, network and process count, so
+the machine in trouble is visible before you have picked one. `Enter` points
+the rest of the interface at the host under the cursor and `W` goes back.
+
+Hosts are sampled concurrently, each on its own worker, so one unreachable
+machine costs the others nothing — it becomes one row saying why, next to the
+last numbers it reported, rather than a blank dashboard. A single target
+behaves exactly as it always has: no fleet table, and no extra stop in the
+`Tab` cycle.
+
+## Alerts without a terminal
+
+```sh
+crabmon --serve :9100 --alerts
+```
+
+The `[[alert]]` rules, their hooks and the flight recorder used to run only in
+the full-screen interface — which made the flight recorder, whose whole point
+is to have a recording of an incident nobody predicted, depend on someone
+watching at the moment it happened. `--alerts` runs them under `--serve` and
+`--stream` instead.
+
+Under `--serve` each rule is also exported, firing or not:
+
+```text
+crabmon_alert_active{rule="cpu-saturated",kind="cpu"} 1
+crabmon_alert_value{rule="cpu-saturated",kind="cpu"} 97.5
+crabmon_alert_threshold{rule="cpu-saturated",kind="cpu"} 90
+```
+
+That is what makes crabmon's own measurements — pressure stall, the busiest
+device's utilisation, how close a process is to *its own* descriptor limit —
+reachable from a pager. A rule that is not firing still gets a series, because
+a gauge that only appears once something is wrong cannot be alerted on.
 
 ## Streaming
 
@@ -530,6 +611,8 @@ that fires at 03:12 and clears at 03:14 says both.
 ```sh
 make test         # unit, behaviour, rendering, CLI and doc tests
 make test-unit    # the in-crate unit tests alone
+make e2e          # the end-to-end suite, toolchain and all, in containers
+make e2e-local    # the same tests, using the toolchain on this machine
 make lint         # clippy, warnings denied
 make fmt          # reformat the tree
 make ci           # everything CI enforces: fmt-check, lint, test
@@ -564,6 +647,31 @@ so the whole program is testable headlessly:
   completions still describe what the code does.
 - `tests/build_script.rs` checks that the `Makefile` and `scripts/build.sh`
   still agree on what each command does.
+- `tests/e2e_docker.rs` builds the binary into a container and runs it there,
+  so that "pid 1 is reported", "a process that starts between two samples
+  shows up as started" and "a process that `exec`s is reported as what it
+  became" are assertions about a known machine rather than about whatever the
+  developer's own `/proc` happens to hold. Each container gets an empty network
+  namespace, a read-only image and a tmpfs for scratch, and the base images are
+  pinned by digest — so a run cannot reach the network, see the host, or find
+  anything an earlier test left behind. Two of the tests assert that sandbox
+  rather than assuming it. It is opt-in, because it costs minutes on a cold
+  cache: `make e2e`, or `CRABMON_E2E=1 cargo test --test e2e_docker`. Without
+  that it skips itself and passes, so `cargo test` on a machine with no Docker
+  stays green.
+
+  `make e2e` needs **Docker and nothing else, not even Rust**. The harness is
+  itself a `cargo test` suite, so a toolchain has to exist somewhere; this one
+  comes from a container as well, with the checkout mounted read-only and
+  cargo's output on named volumes, so a run leaves nothing behind in your tree.
+  It does hand that container the host's Docker socket, which is
+  root-equivalent access to the machine — the usual arrangement for a build
+  agent, and the reason the other target exists.
+
+  `make e2e-local` runs the same tests with the toolchain already on this
+  machine: no runner container, nothing handed the socket, and the output in
+  the ordinary `target/`. It is the faster one to iterate in. Both need a
+  Docker daemon, because containers are what they test against.
 
 See [docs/DESIGN.md](docs/DESIGN.md).
 

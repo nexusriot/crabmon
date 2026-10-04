@@ -146,7 +146,25 @@ pub fn affinity(f: &mut Frame<'_>, area: Rect, app: &App) {
 
 /// Fixed rows the detail pane draws before the socket list. `App` needs the
 /// count to know how far the pane can scroll.
-pub const DETAIL_FIELDS: usize = 20;
+pub const DETAIL_FIELDS: usize = 21;
+
+/// The "Open files" summary line: how many descriptors, and how many of them
+/// are real paths rather than pipes and anonymous inodes.
+///
+/// `None` is not zero. A process whose fd table belongs to another user is not
+/// a process holding nothing, and saying "0" there would be a lie the rest of
+/// the pane does not tell.
+fn open_files_summary(files: Option<&[crate::metrics::fds::OpenFile]>) -> String {
+    match files {
+        None => "not readable".into(),
+        Some([]) => "-".into(),
+        Some(f) => {
+            let paths = f.iter().filter(|x| x.is_path()).count();
+            let capped = if f.len() >= crate::metrics::fds::MAX_FILES_LISTED { "+" } else { "" };
+            format!("{}{capped} ({paths} files, sockets listed below)", f.len())
+        }
+    }
+}
 
 /// One history row: a sparkline and the peak it is scaled against, together
 /// fitting exactly `width` columns.
@@ -177,7 +195,8 @@ const MAX_TREND_WIDTH: usize = 96;
 pub fn detail(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     let Some(p) = app.selected_row().cloned() else { return };
     let p = &p;
-    let total = DETAIL_FIELDS + app.detail_sockets.len();
+    let files = app.detail_files.clone();
+    let total = DETAIL_FIELDS + app.detail_sockets.len() + files.as_ref().map_or(0, Vec::len);
     let title = format!(" {} (pid {}) ", truncate_fit(&p.name, 32), p.pid);
     let inner = scroll_frame(f, area, app, &title, total, (72, 70));
 
@@ -226,6 +245,7 @@ pub fn detail(f: &mut Frame<'_>, area: Rect, app: &mut App) {
         field("Cwd", if p.cwd.is_empty() { "-".into() } else { p.cwd.clone() }),
         field("Listening", if listening.is_empty() { "-".into() } else { listening.join(", ") }),
         field("Sockets", app.detail_sockets.len().to_string()),
+        field("Open files", open_files_summary(files.as_deref())),
     ];
 
     // What the process has been doing, not just what it is doing. "Is this
@@ -246,6 +266,16 @@ pub fn detail(f: &mut Frame<'_>, area: Rect, app: &mut App) {
         trend_text(&series.io, width, |v| format!("{} peak", human_bps(v as f64))),
     ));
     debug_assert_eq!(rows.len(), DETAIL_FIELDS, "DETAIL_FIELDS must match what is drawn");
+
+    // The descriptors the process is holding, after the sockets, which are
+    // listed with their addresses just below. Both scroll with the fields.
+    //
+    // "Which log is filling the disk" and "what is this wedged process still
+    // holding open" are the questions a monitor is open for, and until now
+    // the answer meant leaving it for `lsof`, which loses the process.
+    for file in files.as_deref().unwrap_or(&[]) {
+        rows.push(field(&format!("fd {}", file.fd), file.target.clone()));
+    }
 
     // Open sockets follow the fields, and scroll with them.
     for sock in &app.detail_sockets {
@@ -298,12 +328,12 @@ fn fd_field(p: &crate::metrics::ProcRow) -> String {
 }
 
 /// Every binding, in one place, so the help and the README cannot drift.
-pub const KEYS: [(&str, &str); 38] = [
+pub const KEYS: [(&str, &str); 39] = [
     ("q / Ctrl-C", "quit"),
     ("↑ ↓ / k j", "move selection"),
     ("PgUp PgDn", "move a page"),
     ("Home / End", "first / last process"),
-    ("Enter", "process detail, or open the selected group"),
+    ("Enter", "process detail, or open the selected group or host"),
     ("/", "filter (user: pid: cpu> mem> re: !neg)"),
     ("Esc", "clear the filter"),
     ("c m p n d", "sort by cpu / mem / pid / name / disk"),
@@ -313,6 +343,7 @@ pub const KEYS: [(&str, &str); 38] = [
     ("T", "toggle process tree"),
     ("H", "show or hide individual threads"),
     ("G", "group by service, container or user"),
+    ("W", "fleet table, with several --remote hosts"),
     ("Space", "tag a process for a bulk action"),
     ("U", "untag everything"),
     ("f", "pin a process to the top of the table"),

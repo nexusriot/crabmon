@@ -36,6 +36,29 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
 
+  # The end-to-end suite builds the binary into a container and drives it
+  # there. It is opt-in locally because it costs minutes on a cold cache; in CI
+  # it is the only place the shipped binary is exercised on a machine whose
+  # process list the test controls.
+  # The default path: containers all the way down, so this job installs no
+  # toolchain on purpose. If it breaks, it breaks here rather than for
+  # somebody who has Docker and no Rust and cannot run the suite at all.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make e2e
+
+  # And the same tests driven by a local toolchain, which is what anyone
+  # iterating on them actually runs.
+  e2e-local:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: make e2e-local
+
   # The Unix- and Linux-only paths (signals, renice, affinity, /proc/diskstats)
   # are cfg-gated; make sure the gates actually hold on other targets.
   cross-check:
@@ -52,7 +75,7 @@ jobs:
       - run: cargo check --target ${{ matrix.target }}
 
   deb:
-    needs: [test, lint]
+    needs: [test, lint, e2e, e2e-local]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:

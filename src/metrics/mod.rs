@@ -5,8 +5,10 @@ pub mod cgroup;
 pub mod diskstats;
 pub mod fds;
 pub mod gpu;
+pub mod identity;
 pub mod meminfo;
 pub mod netclass;
+pub mod netns;
 pub mod power;
 pub mod procgroup;
 pub mod psi;
@@ -15,9 +17,11 @@ pub mod sysinfo_source;
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::fleet::FleetHost;
 pub use cgroup::CgroupInfo;
 pub use gpu::GpuInfo;
 pub use meminfo::MemDetail;
+pub use netns::NetNamespace;
 pub use power::PowerSample;
 pub use procgroup::GroupBy;
 pub use psi::PsiSample;
@@ -122,6 +126,11 @@ pub struct ProcRow {
     /// Short container id, when the process lives in one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container: Option<String>,
+    /// The network namespace this process is in. Bytes are accounted to a
+    /// namespace rather than to a process, so this is what joins a process to
+    /// the traffic its container moved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub netns: Option<u64>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub cmd: String,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -307,6 +316,9 @@ pub struct Snapshot {
     pub gpus: Vec<GpuInfo>,
     pub psi: PsiSample,
     pub power: PowerSample,
+    /// Per-network-namespace throughput: one row per container, plus the
+    /// host's own namespace, flagged.
+    pub netns: Vec<NetNamespace>,
     pub taken_at_unix: u64,
 }
 
@@ -323,6 +335,19 @@ impl Snapshot {
         per_device(&self.disks, |d| Some((d.read_bps, d.write_bps)))
             .into_iter()
             .fold((0.0, 0.0), |(r, w), (dr, dw)| (r + dr, w + dw))
+    }
+
+    /// Traffic for a set of namespaces, counted once each.
+    ///
+    /// Every process in a container reports its namespace's counters, so a
+    /// caller holding a group's processes has the same namespace several
+    /// times over; summing as given would multiply the container's traffic by
+    /// however many processes it happens to run.
+    pub fn netns_totals(&self, ids: &std::collections::HashSet<u64>) -> (f64, f64) {
+        self.netns
+            .iter()
+            .filter(|n| ids.contains(&n.id))
+            .fold((0.0, 0.0), |(rx, tx), n| (rx + n.rx_bps, tx + n.tx_bps))
     }
 
     /// The busiest device's utilisation, which is the figure an aggregate
@@ -359,6 +384,34 @@ pub trait MetricSource {
     /// A one-line description for the status bar, e.g. the recording's path.
     fn label(&self) -> Option<String> {
         None
+    }
+
+    /// A short description of why this source cannot currently sample, or
+    /// `None` when it can.
+    ///
+    /// `label` already says this for the status line, but as prose with the
+    /// problem embedded in it. The fleet view needs the question answered
+    /// rather than parsed: a row has to know whether to draw numbers or an
+    /// explanation, and matching on the word "UNREACHABLE" inside a sentence
+    /// is not a way to find out.
+    fn error(&self) -> Option<String> {
+        None
+    }
+
+    /// The hosts this source covers, for the fleet view. A source that
+    /// monitors one machine returns an empty list, which is what keeps the
+    /// fleet layout out of everyone else's way.
+    fn fleet(&self) -> Vec<FleetHost> {
+        Vec::new()
+    }
+
+    /// Make `index` the host that `snapshot` returns. A no-op for a source
+    /// covering one machine.
+    fn select_host(&mut self, _index: usize) {}
+
+    /// Which host `snapshot` is currently returning.
+    fn selected_host(&self) -> usize {
+        0
     }
 
     /// Identifies the frame `snapshot` last returned, for sources that sample

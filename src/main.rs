@@ -19,7 +19,8 @@ use crabmon::export;
 use crabmon::metrics::{MetricSource, SysinfoSource};
 use crabmon::record::{trim_frame, FlightRecorder, Recorder, ReplaySource};
 use crabmon::remote::RemoteSource;
-use crabmon::sampler::ThreadedSource;
+use crabmon::sampler::{Pacer, ThreadedSource};
+use crabmon::supervisor;
 
 fn main() -> Result<()> {
     let args = match cli::parse(std::env::args().skip(1)) {
@@ -47,13 +48,18 @@ fn main() -> Result<()> {
         return print_diff(a, b.as_deref(), &args);
     }
     if let Some(addr) = &args.serve {
-        return serve_metrics(addr, &cfg);
+        return serve_metrics(addr, &cfg, args.alerts);
     }
     if args.stream {
-        return stream_frames(&cfg);
+        return stream_frames(&cfg, args.alerts);
     }
+    let hold = args.watch_for.unwrap_or(0);
     if let Some(query) = &args.watch {
-        return watch_for(query, &cfg, &args);
+        return watch_for(crabmon::watch::process_rule(query, hold), &cfg, &args);
+    }
+    if let Some(expr) = &args.watch_rule {
+        let rule = crabmon::watch::parse_rule(expr, hold).map_err(|e| anyhow::anyhow!("{e}"))?;
+        return watch_for(rule, &cfg, &args);
     }
     if args.once {
         let mut source = live_source(&cfg);
@@ -81,13 +87,27 @@ fn build_source(cfg: &Config, args: &Args) -> Result<Box<dyn MetricSource>> {
         eprintln!("crabmon: replaying {} frames from {path}", source.len());
         return Ok(Box::new(source));
     }
-    if let Some(target) = &args.remote {
-        let remote = match (&args.remote_command, cfg.remote.stream) {
-            (Some(_), _) => RemoteSource::new(target, args.remote_command.clone(), Vec::new()),
-            (None, true) => RemoteSource::streaming(target, cfg.refresh_ms, Vec::new()),
-            (None, false) => RemoteSource::new(target, None, Vec::new()),
+    if let Some(spec) = &args.remote {
+        let targets = crabmon::fleet::parse_targets(spec);
+        let one = |target: &str| -> Box<dyn MetricSource> {
+            let remote = match (&args.remote_command, cfg.remote.stream) {
+                (Some(_), _) => RemoteSource::new(target, args.remote_command.clone(), Vec::new()),
+                (None, true) => RemoteSource::streaming(target, cfg.refresh_ms, Vec::new()),
+                (None, false) => RemoteSource::new(target, None, Vec::new()),
+            };
+            Box::new(ThreadedSource::new(Box::new(remote)))
         };
-        return Ok(Box::new(ThreadedSource::new(Box::new(remote))));
+        return match targets.len() {
+            0 => Err(anyhow::anyhow!("--remote names no hosts")),
+            // One host behaves exactly as it always has: no fleet table, no
+            // extra layout in the Tab cycle, no wrapper in the way.
+            1 => Ok(one(&targets[0])),
+            _ => {
+                eprintln!("crabmon: watching {} hosts: {}", targets.len(), targets.join(", "));
+                let sources = targets.iter().map(|t| (t.clone(), one(t))).collect();
+                Ok(Box::new(crabmon::fleet::FleetSource::new(sources)))
+            }
+        };
     }
     Ok(Box::new(ThreadedSource::new(Box::new(live_source(cfg)))))
 }
@@ -95,14 +115,25 @@ fn build_source(cfg: &Config, args: &Args) -> Result<Box<dyn MetricSource>> {
 /// `--stream`: one JSON snapshot per line, forever. This is what a streaming
 /// `--remote` runs on the far end, so frames are trimmed the same way a
 /// recording is — a full process list every second over SSH is unusable.
-fn stream_frames(cfg: &Config) -> Result<()> {
+///
+/// With `--alerts` the same rules the TUI evaluates run here too, so a host
+/// streaming to a collector also pages and writes flight recordings. Hook
+/// output and recording notices go to stderr, which keeps stdout a clean
+/// stream of frames for whatever is reading it.
+fn stream_frames(cfg: &Config, alerts: bool) -> Result<()> {
     let mut source = live_source(cfg);
-    let interval = Duration::from_millis(cfg.refresh_ms);
     source.snapshot(Duration::ZERO);
+    // The interval the rates are divided by has to be the one that actually
+    // passed, not the one that was asked for — see `Pacer`.
+    let mut pacer = Pacer::new(Duration::from_millis(cfg.refresh_ms));
+    let mut sup = alerts.then(|| supervisor::Supervisor::new(cfg));
     let mut out = io::stdout().lock();
     loop {
-        std::thread::sleep(interval);
-        let snap = source.snapshot(interval);
+        let dt = pacer.wait();
+        let snap = source.snapshot(dt);
+        if let Some(sup) = sup.as_mut() {
+            report(sup.observe(&snap));
+        }
         let frame =
             trim_frame(&snap, cfg.record.top_n, cfg.record.omit_paths, cfg.record.max_cmd_len);
         let line = serde_json::to_string(&frame)?;
@@ -139,27 +170,49 @@ fn print_diff(a: &str, b: Option<&str>, args: &Args) -> Result<()> {
     Ok(())
 }
 
-/// `--watch`: block until processes match, then print them and exit non-zero.
-fn watch_for(query: &str, cfg: &Config, args: &Args) -> Result<()> {
-    let filter = crabmon::filter::parse(query).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let hold = args.watch_for.unwrap_or(0);
+/// `--watch`: block until a condition holds, then say so and exit non-zero.
+///
+/// Both forms are alert rules — `--watch <query>` is "at least one process
+/// matches", `--watch-rule` is every other kind — so a condition behaves the
+/// same here, in `[[alert]]` and in `--serve --alerts`. The exit code is what
+/// a shell is waiting on: 1 when it happened, 0 when it did not.
+fn watch_for(rule: crabmon::alerts::AlertRule, cfg: &Config, args: &Args) -> Result<()> {
+    // The rows to print on a match. A `proc` rule has a query to show them
+    // from; the other kinds are about the machine as a whole and print no
+    // process list at all.
+    //
+    // Not `filter::parse(&rule.query)` unconditionally: an empty query parses
+    // into the empty filter, which matches *everything*, so `--watch-rule
+    // 'cpu>=90'` printed the entire process table instead of nothing.
+    let rows_of = match rule.query.is_empty() {
+        true => None,
+        false => crabmon::filter::parse(&rule.query).ok(),
+    };
     let timeout = args.watch_timeout.unwrap_or(0);
-    let interval = Duration::from_millis(cfg.refresh_ms.max(crabmon::MIN_REFRESH_MS));
+    let interval = crabmon::watch::interval(cfg.refresh_ms);
 
     let mut source = live_source(cfg);
     source.snapshot(Duration::ZERO);
     let started = Instant::now();
-    let mut holding = crabmon::watch::Holding::default();
+    let mut pacer = Pacer::new(interval);
+    let mut engine = crabmon::alerts::AlertEngine::new(vec![rule]);
 
-    let outcome = loop {
-        std::thread::sleep(interval);
-        let snap = source.snapshot(interval);
+    let (outcome, fired) = loop {
+        let dt = pacer.wait();
+        let snap = source.snapshot(dt);
         let now = Instant::now();
-        if let Some(rows) = holding.observe(&snap, &filter, hold, now) {
-            break crabmon::watch::Outcome::Matched(rows);
+        // The engine's hold time is in seconds since the watch started, which
+        // is the same clock `--watch-for` is quoted in.
+        let active = engine.evaluate(&snap, now.duration_since(started).as_secs());
+        if let Some(alert) = active.into_iter().next() {
+            let rows = match &rows_of {
+                Some(f) => snap.procs.iter().filter(|p| f.matches(p)).cloned().collect(),
+                None => Vec::new(),
+            };
+            break (crabmon::watch::Outcome::Matched(rows), Some(alert));
         }
         if crabmon::watch::timed_out(started, timeout, now) {
-            break crabmon::watch::Outcome::TimedOut;
+            break (crabmon::watch::Outcome::TimedOut, None);
         }
     };
 
@@ -168,26 +221,90 @@ fn watch_for(query: &str, cfg: &Config, args: &Args) -> Result<()> {
             .format
             .or_else(|| export::ExportFormat::parse(&cfg.export.format))
             .unwrap_or(export::ExportFormat::Json);
-        let snap = crabmon::Snapshot { procs: rows.clone(), ..Default::default() };
         let mut out = io::stdout().lock();
-        out.write_all(export::render(&snap, format).as_bytes())?;
+        // Processes when there are processes to show, which is what makes
+        // `--watch nginx | jq` work. A rule about the machine — or a `below`
+        // rule, which fires precisely because nothing matches — has no rows,
+        // and an empty snapshot full of zeroes would be a worse answer than
+        // the condition that actually fired.
+        let text = match (rows.is_empty(), &fired) {
+            (false, _) => {
+                let snap = crabmon::Snapshot { procs: rows.clone(), ..Default::default() };
+                export::render(&snap, format)
+            }
+            (true, Some(alert)) => match format {
+                export::ExportFormat::Json => {
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "rule": alert.name,
+                        "message": alert.message,
+                        "value": alert.value,
+                        "threshold": alert.threshold,
+                    }))? + "\n"
+                }
+                export::ExportFormat::Csv => {
+                    format!(
+                        "rule,value,threshold\n{},{},{}\n",
+                        alert.name, alert.value, alert.threshold
+                    )
+                }
+            },
+            (true, None) => String::new(),
+        };
+        out.write_all(text.as_bytes())?;
         out.flush()?;
     }
     std::process::exit(outcome.exit_code());
 }
 
 /// Headless Prometheus exporter.
-fn serve_metrics(addr: &str, cfg: &Config) -> Result<()> {
+///
+/// With `--alerts` the rules are evaluated on every scrape and exported
+/// alongside the metrics, and their hooks and flight recordings run from here.
+/// Evaluating on the scrape rather than on a timer of its own is deliberate:
+/// it is the only moment a fresh sample exists, and a second sampler would
+/// double this process's cost to measure the same machine twice.
+fn serve_metrics(addr: &str, cfg: &Config, alerts: bool) -> Result<()> {
     let mut source = live_source(cfg);
     let interval = Duration::from_millis(cfg.refresh_ms);
     // Prime the counters so the first scrape carries real rates.
     source.snapshot(Duration::ZERO);
     std::thread::sleep(interval);
     let top = cfg.serve.top_procs;
+    let mut sup = alerts.then(|| supervisor::Supervisor::new(cfg));
+    if alerts {
+        eprintln!("crabmon: evaluating {} alert rules on every scrape", cfg.alerts.len());
+    }
     // `serve` measures the gap between scrapes and hands it over; the rates are
     // deltas over that interval, not over the configured refresh.
-    crabmon::serve::serve(addr, top, move |elapsed| source.snapshot(elapsed))?;
+    crabmon::serve::serve_rendered(addr, move |elapsed| {
+        let snap = source.snapshot(elapsed);
+        let states = match sup.as_mut() {
+            None => Vec::new(),
+            Some(sup) => {
+                report(sup.observe(&snap));
+                sup.alerts.states(&snap)
+            }
+        };
+        crabmon::serve::render_with_alerts(&snap, top, &states)
+    })?;
     Ok(())
+}
+
+/// Print what a headless alert pass produced, and run its hooks.
+///
+/// stderr, not stdout: `--stream`'s stdout is a frame per line that something
+/// else is parsing, and a recording notice in the middle of it would break the
+/// reader on the far end of an SSH pipe.
+fn report(obs: crabmon::supervisor::Observation) {
+    for note in obs.notes {
+        eprintln!("crabmon: {note}");
+    }
+    for name in obs.active.iter().map(|a| &a.message) {
+        eprintln!("crabmon: {name}");
+    }
+    for err in supervisor::spawn_hooks(&obs.commands) {
+        eprintln!("crabmon: {err}");
+    }
 }
 
 fn config_path(args: &Args) -> std::path::PathBuf {
@@ -214,6 +331,9 @@ fn apply_args(mut cfg: Config, args: &Args) -> Config {
     if let Some(t) = &args.theme {
         cfg.theme = t.clone();
     }
+    if let Some(c) = &args.columns {
+        cfg.procs.columns = c.clone();
+    }
     if let Some(l) = args.layout {
         cfg.layout = l;
     }
@@ -233,8 +353,11 @@ fn apply_args(mut cfg: Config, args: &Args) -> Config {
 fn print_once(cfg: &Config, args: &Args, source: &mut SysinfoSource) -> Result<()> {
     let interval = Duration::from_millis(cfg.refresh_ms.max(crabmon::MIN_REFRESH_MS));
     source.snapshot(Duration::from_secs(0));
-    std::thread::sleep(interval);
-    let mut snap = source.snapshot(interval);
+    // Not `interval`: the priming sample costs real time, and the rates in the
+    // printed snapshot are counter deltas over the gap between the two reads.
+    let mut pacer = Pacer::new(interval);
+    let dt = pacer.wait();
+    let mut snap = source.snapshot(dt);
 
     // A filter from the config file reaches here unvalidated; silently
     // degrading to "match everything" is the failure a script cannot see.
@@ -276,6 +399,12 @@ fn run_tui(
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
     let mut app = App::new(cfg, source);
+    // A fleet opens on the fleet table: the first question is which machine,
+    // and the dashboard of whichever host happened to be listed first is not
+    // an answer to it.
+    if !app.fleet().is_empty() && args.layout.is_none() {
+        app.cfg.layout = crabmon::ui::Layout::Fleet;
+    }
     app.config_path = Some(config_path);
     app.audit_path = audit_path(&app.cfg);
 
@@ -395,54 +524,16 @@ fn event_loop(
                     app.set_status(format!("recording failed: {e}"));
                 }
             }
-            if let Some(f) = flight.as_deref_mut() {
-                run_flight_recorder(app, f);
+            // Hooks and flight recordings. `App::tick` has already evaluated
+            // the rules; this drains what that produced, through the same
+            // code `--serve --alerts` runs, so an incident is handled
+            // identically whether or not anyone is watching.
+            for note in app.drain_alert_side_effects(flight.as_deref_mut()) {
+                app.set_status(note);
             }
-            run_alert_commands(app);
         }
     }
     Ok(())
-}
-
-/// Offer the frame to the flight recorder, then start a dump for any alert
-/// that has just fired.
-///
-/// The order matters: the ring has to contain the frame that tripped the rule
-/// before the dump is opened, or every recording would stop one frame short of
-/// the evidence.
-fn run_flight_recorder(app: &mut App, flight: &mut FlightRecorder) {
-    if let Some(path) = flight.push(&app.snap) {
-        app.set_status(format!("flight recording written to {}", path.display()));
-    }
-    for name in app.alerts.take_fired() {
-        match flight.trigger(&name, app.snap.taken_at_unix) {
-            // `None` means a dump was already running and has been extended,
-            // which needs no second announcement.
-            Ok(Some(path)) => app.set_status(format!(
-                "{name}: recording {} frames to {}",
-                flight.buffered(),
-                path.display()
-            )),
-            Ok(None) => {}
-            Err(e) => app.set_status(format!("flight recording failed: {e}")),
-        }
-    }
-}
-
-/// Alert hooks are user-configured shell commands, spawned detached.
-fn run_alert_commands(app: &mut App) {
-    for cmd in app.alerts.take_commands() {
-        let spawned = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&cmd)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-        if let Err(e) = spawned {
-            app.set_status(format!("alert command failed: {e}"));
-        }
-    }
 }
 
 fn restore(mouse: bool) {

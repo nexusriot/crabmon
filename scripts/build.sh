@@ -11,6 +11,9 @@
 #   DESTDIR   staging root prepended to PREFIX    (default: empty)
 #   BIN_DIR   where `bin` drops the binary        (default: ./bin)
 #   DIST_DIR  where `dist` writes the tarball     (default: ./dist)
+#
+#   DOCKER_SOCK  the daemon socket `e2e` hands its runner container
+#                                                (default: /var/run/docker.sock)
 
 set -euo pipefail
 
@@ -24,6 +27,13 @@ DIST_DIR=${DIST_DIR:-dist}
 
 NAME=crabmon
 RELEASE_BIN=target/release/$NAME
+
+# The e2e harness image, and the volumes that keep its cargo cache off the
+# mounted checkout. Named rather than anonymous so a second run reuses the
+# compiled dependencies instead of rebuilding them from scratch.
+E2E_RUNNER_IMAGE=${E2E_RUNNER_IMAGE:-crabmon-e2e-runner:local}
+E2E_CARGO_VOLUME=${E2E_CARGO_VOLUME:-crabmon-e2e-cargo}
+E2E_TARGET_VOLUME=${E2E_TARGET_VOLUME:-crabmon-e2e-target}
 
 # The version lives in Cargo.toml and nowhere else; every other mention of it
 # is derived, so a bump cannot half-happen.
@@ -70,6 +80,63 @@ cmd_test() {
   # --all-targets is what CI runs: the in-crate unit tests plus every
   # integration suite, rather than the lib tests alone.
   $CARGO test --all-targets "$@"
+}
+
+# The end-to-end suite builds a container and runs the binary inside it, which
+# costs minutes on a cold cache — so `test` leaves it switched off and this is
+# how you ask for it. `cargo test` is still the thing being run: the suite
+# skips itself unless CRABMON_E2E says otherwise.
+#
+# The toolchain is containerised too, so this works on a machine that has
+# Docker and nothing else — which is the point of an end-to-end suite that
+# anyone can run. `e2e-local` is the same tests driven by the toolchain you
+# already have, which is faster to iterate on; both need a Docker daemon,
+# because containers are what they test against.
+cmd_e2e() {
+  require_docker
+  local sock=${DOCKER_SOCK:-/var/run/docker.sock}
+  if [ ! -S "$sock" ]; then
+    echo "no Docker socket at $sock; set DOCKER_SOCK to point at one" >&2
+    exit 1
+  fi
+  say "running the end-to-end suite in Docker, toolchain included"
+  # The checkout is mounted read-only and cargo's output goes to named
+  # volumes, so a run cannot leave a root-owned `target/` — or anything else —
+  # in the tree it was pointed at.
+  #
+  # The daemon is the host's, reached through its socket, so the containers
+  # the tests create are siblings of this one rather than nested: no
+  # privileged mode, no daemon inside a daemon. Handing over that socket is
+  # root-equivalent access to the host, which is the usual arrangement for a
+  # build agent and the reason `e2e-local` exists for anyone who would rather
+  # not.
+  docker build -q -f tests/e2e/Dockerfile.runner -t "$E2E_RUNNER_IMAGE" . >/dev/null
+  docker run --rm \
+    -v "$PWD:/src:ro" \
+    -v "$sock:/var/run/docker.sock" \
+    -v "$E2E_CARGO_VOLUME:/cargo" \
+    -v "$E2E_TARGET_VOLUME:/target" \
+    "$E2E_RUNNER_IMAGE" test --test e2e_docker "$@"
+}
+
+# The same tests, driven by the toolchain already on this machine. No runner
+# container, nothing handed the Docker socket, and the output lands in the
+# ordinary `target/` — which is what makes it the one to iterate in.
+cmd_e2e_local() {
+  require_docker
+  if ! command -v "$CARGO" >/dev/null 2>&1; then
+    echo "$CARGO is not installed; use \`make e2e\`, which brings its own" >&2
+    exit 1
+  fi
+  say "running the end-to-end suite with the local toolchain"
+  CRABMON_E2E=1 $CARGO test --test e2e_docker "$@"
+}
+
+require_docker() {
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "docker is not installed; the e2e suite needs it" >&2
+    exit 1
+  fi
 }
 
 cmd_test_unit() {
@@ -185,6 +252,9 @@ Usage: ./scripts/build.sh <command>       (or: make <command>)
 
   test         the whole suite: unit tests and every integration suite
   test-unit    the in-crate unit tests only
+  e2e          the end-to-end suite, toolchain and all, in containers —
+               needs Docker and nothing else, not even Rust
+  e2e-local    the same tests, driven by the toolchain on this machine
   check        type-check without producing a binary
   fmt          reformat the tree
   fmt-check    fail if the tree is not formatted

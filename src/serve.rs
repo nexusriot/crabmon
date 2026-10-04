@@ -5,7 +5,7 @@
 //! because the whole contract is one route, one method and a text body — a
 //! framework would be more dependency than feature.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -23,18 +23,43 @@ pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 /// to serve everybody.
 pub const MAX_CONNECTIONS: usize = 16;
 
+/// Longest request line the exporter will read before giving up on it. A URL
+/// Prometheus actually sends is well under 200 bytes; this is only here so a
+/// client that never sends a newline cannot make the exporter buffer without
+/// bound.
+pub const MAX_REQUEST_LINE: u64 = 8 * 1024;
+
 /// Escape a Prometheus label value.
 pub fn escape_label(value: &str) -> String {
     value.replace('\\', r"\\").replace('"', "\\\"").replace('\n', r"\n")
 }
 
+/// Emit one metric family: a HELP/TYPE pair and its samples.
+///
+/// Samples that repeat a label set are dropped, keeping the first. Prometheus
+/// treats two samples with identical labels in one family as a duplicate
+/// series and rejects the **whole scrape** — the same all-or-nothing failure
+/// that repeating a HELP line used to cause here, and from the same cause: a
+/// label built from something that is not actually unique. Two identical GPUs
+/// are the obvious case, since a card's name is `"<vendor> <driver>"` from
+/// sysfs or whatever `nvidia-smi` calls the model, and a box with a matched
+/// pair reports the same string twice. Two NVMe drives presenting the same
+/// sensor label do it too.
+///
+/// Losing the second of a duplicated pair is a real loss, but it is strictly
+/// better than losing every series in the scrape, which is what happened
+/// before: a dual-GPU host exported nothing at all.
 fn metric(out: &mut String, name: &str, help: &str, kind: &str, samples: &[(String, f64)]) {
     if samples.is_empty() {
         return;
     }
     out.push_str(&format!("# HELP crabmon_{name} {help}\n"));
     out.push_str(&format!("# TYPE crabmon_{name} {kind}\n"));
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (labels, value) in samples {
+        if !seen.insert(labels.as_str()) {
+            continue;
+        }
         if labels.is_empty() {
             out.push_str(&format!("crabmon_{name} {value}\n"));
         } else {
@@ -52,7 +77,54 @@ fn plain(value: f64) -> Vec<(String, f64)> {
 /// `top_procs` limits the per-process series, because one series per process on
 /// a 2000-task machine would dwarf everything else in the scrape.
 pub fn render(snap: &Snapshot, top_procs: usize) -> String {
+    render_with_alerts(snap, top_procs, &[])
+}
+
+/// As `render`, plus the state of the alert rules being evaluated.
+///
+/// crabmon knows things Prometheus does not: pressure-stall averages, the
+/// busiest device's utilisation, how close a process is to *its own*
+/// descriptor limit, whether a named process has stopped existing. Those were
+/// alertable in the TUI and invisible to anything scraping it, so the rules
+/// most worth paging on were the ones that could not reach a pager.
+///
+/// One series per rule, 1 while it is firing and 0 while it is not — the shape
+/// that makes `crabmon_alert_active == 1` a usable Prometheus expression —
+/// alongside the measurement and the threshold it was compared against, so an
+/// alert can be shown with the number that caused it.
+pub fn render_with_alerts(
+    snap: &Snapshot,
+    top_procs: usize,
+    alerts: &[crate::alerts::RuleState],
+) -> String {
     let mut out = String::new();
+
+    if !alerts.is_empty() {
+        let label = |r: &crate::alerts::RuleState| {
+            format!("rule=\"{}\",kind=\"{}\"", escape_label(&r.name), r.kind.key_name())
+        };
+        metric(
+            &mut out,
+            "alert_active",
+            "1 while a rule is over its threshold and past its hold time.",
+            "gauge",
+            &alerts.iter().map(|r| (label(r), r.active as u8 as f64)).collect::<Vec<_>>(),
+        );
+        metric(
+            &mut out,
+            "alert_value",
+            "The measurement a rule was last evaluated against.",
+            "gauge",
+            &alerts.iter().filter_map(|r| r.value.map(|v| (label(r), v))).collect::<Vec<_>>(),
+        );
+        metric(
+            &mut out,
+            "alert_threshold",
+            "The threshold a rule compares against.",
+            "gauge",
+            &alerts.iter().map(|r| (label(r), r.threshold)).collect::<Vec<_>>(),
+        );
+    }
 
     metric(&mut out, "up", "Always 1; the exporter is answering.", "gauge", &plain(1.0));
     metric(
@@ -347,6 +419,55 @@ pub fn render(snap: &Snapshot, top_procs: usize) -> String {
             .collect::<Vec<_>>(),
     );
 
+    // Per-namespace traffic, which is per container. The kernel accounts
+    // bytes to a namespace rather than to a PID, so this is the finest
+    // honest granularity available without eBPF — and the host's own
+    // namespace is left out, because `network_*_bytes_per_second` above
+    // already carries it per interface.
+    let ns_label = |n: &crate::metrics::NetNamespace| match &n.container {
+        Some(c) => format!("container=\"{}\"", escape_label(c)),
+        // A namespace with no container is still worth a series — `ip netns`,
+        // a sandboxed unit — and its inode is the only stable name it has.
+        None => format!("container=\"\",netns=\"{}\"", n.id),
+    };
+    let containers: Vec<&crate::metrics::NetNamespace> =
+        snap.netns.iter().filter(|n| !n.host).collect();
+    metric(
+        &mut out,
+        "container_receive_bytes_per_second",
+        "Receive rate of a container's network namespace.",
+        "gauge",
+        &containers.iter().map(|n| (ns_label(n), n.rx_bps)).collect::<Vec<_>>(),
+    );
+    metric(
+        &mut out,
+        "container_transmit_bytes_per_second",
+        "Transmit rate of a container's network namespace.",
+        "gauge",
+        &containers.iter().map(|n| (ns_label(n), n.tx_bps)).collect::<Vec<_>>(),
+    );
+    metric(
+        &mut out,
+        "container_receive_bytes_total",
+        "Bytes received in a container's network namespace since it was created.",
+        "counter",
+        &containers.iter().map(|n| (ns_label(n), n.rx_total as f64)).collect::<Vec<_>>(),
+    );
+    metric(
+        &mut out,
+        "container_transmit_bytes_total",
+        "Bytes transmitted in a container's network namespace since it was created.",
+        "counter",
+        &containers.iter().map(|n| (ns_label(n), n.tx_total as f64)).collect::<Vec<_>>(),
+    );
+    metric(
+        &mut out,
+        "container_processes",
+        "Processes crabmon can see in a container's network namespace.",
+        "gauge",
+        &containers.iter().map(|n| (ns_label(n), n.procs as f64)).collect::<Vec<_>>(),
+    );
+
     // The cgroup the exporter itself runs in. On a container host this is the
     // only view of the limit the process is actually up against; the host
     // totals above say nothing about it.
@@ -512,10 +633,21 @@ fn handle(mut stream: TcpStream, body: impl FnOnce() -> String) {
     let _ = stream.set_write_timeout(Some(CLIENT_TIMEOUT));
     let mut line = String::new();
     let peer = stream.try_clone();
-    if BufReader::new(peer.as_ref().unwrap_or(&stream)).read_line(&mut line).is_err() {
+    // `.take(MAX_REQUEST_LINE)`: an unbounded `read_line` grows a `String`
+    // until a newline arrives, and the read timeout only bounds how long a
+    // *single* read may block — a client that keeps sending never trips it. On
+    // loopback that is hundreds of megabytes of resident memory per connection
+    // in the process whose whole job is to make memory pressure visible, and
+    // `MAX_CONNECTIONS` of them at once.
+    let reader = (peer.as_ref().unwrap_or(&stream)).take(MAX_REQUEST_LINE);
+    if BufReader::new(reader).read_line(&mut line).is_err() {
         return;
     }
+    // A line that filled the budget without a newline is not a request line.
     let response = match parse_request_path(&line) {
+        _ if line.len() as u64 >= MAX_REQUEST_LINE && !line.ends_with('\n') => {
+            http_response("431 Request Header Fields Too Large", "text/plain", "too long\n")
+        }
         Some((method, path)) => route(method, path, body),
         None => http_response("400 Bad Request", "text/plain", "malformed request\n"),
     };
@@ -567,7 +699,19 @@ pub fn is_public(bind: &str) -> bool {
 pub fn serve(
     addr: &str,
     top_procs: usize,
-    sample: impl FnMut(Duration) -> Snapshot + Send + 'static,
+    mut sample: impl FnMut(Duration) -> Snapshot + Send + 'static,
+) -> std::io::Result<()> {
+    serve_rendered(addr, move |elapsed| render(&sample(elapsed), top_procs))
+}
+
+/// As `serve`, but the caller renders the body.
+///
+/// `--serve --alerts` evaluates its rules on the sample it just took and
+/// exports their state with it, which means the thing that turns a snapshot
+/// into a response needs the snapshot, not just the numbers in it.
+pub fn serve_rendered(
+    addr: &str,
+    render_body: impl FnMut(Duration) -> String + Send + 'static,
 ) -> std::io::Result<()> {
     let bind = normalise_addr(addr);
     let listener = TcpListener::bind(&bind)?;
@@ -579,7 +723,7 @@ pub fn serve(
         );
     }
 
-    let sampler = Arc::new(Mutex::new((sample, std::time::Instant::now())));
+    let sampler = Arc::new(Mutex::new((render_body, std::time::Instant::now())));
     let live = Arc::new(AtomicUsize::new(0));
 
     for stream in listener.incoming() {
@@ -605,11 +749,10 @@ pub fn serve(
                     // down with it; the sampler state is still usable.
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                let (sample, last) = &mut *guard;
+                let (render_body, last) = &mut *guard;
                 let elapsed = last.elapsed();
                 *last = std::time::Instant::now();
-                let snap = sample(elapsed);
-                render(&snap, top_procs)
+                render_body(elapsed)
             });
             counter.fetch_sub(1, Ordering::Relaxed);
         });
@@ -672,6 +815,205 @@ mod tests {
             text.matches("# TYPE ").count(),
             "HELP and TYPE must be paired"
         );
+    }
+
+    /// Prometheus rejects an entire scrape that repeats a label set within a
+    /// family, so one duplicated series took every other metric with it. A box
+    /// with two identical GPUs — the ordinary ML rig — exported nothing at all.
+    #[test]
+    fn a_repeated_label_set_does_not_take_the_whole_scrape_down_with_it() {
+        let twins = |name: &str, busy: f32| crate::metrics::GpuInfo {
+            name: name.into(),
+            vendor: "NVIDIA".into(),
+            busy_percent: Some(busy),
+            vram_used: Some(1024),
+            vram_total: Some(2048),
+            ..Default::default()
+        };
+        let snap = Snapshot {
+            gpus: vec![
+                twins("NVIDIA GeForce RTX 4090", 10.0),
+                twins("NVIDIA GeForce RTX 4090", 90.0),
+            ],
+            // Two NVMe drives can present the same sensor label too.
+            sensors: vec![
+                crate::metrics::Sensor {
+                    label: "nvme Composite".into(),
+                    temp: 40.0,
+                    critical: None,
+                },
+                crate::metrics::Sensor {
+                    label: "nvme Composite".into(),
+                    temp: 55.0,
+                    critical: None,
+                },
+            ],
+            ..snap()
+        };
+        let text = render(&snap, 10);
+
+        for family in ["crabmon_gpu_busy_percent", "crabmon_temperature_celsius"] {
+            let mut labels: Vec<&str> = text
+                .lines()
+                .filter(|l| l.starts_with(&format!("{family}{{")))
+                .map(|l| l.split_once(' ').map(|(k, _)| k).unwrap_or(l))
+                .collect();
+            let before = labels.len();
+            assert!(before > 0, "{family} is missing entirely:\n{text}");
+            labels.sort_unstable();
+            labels.dedup();
+            assert_eq!(labels.len(), before, "{family} emits a duplicate series:\n{text}");
+        }
+
+        // ...and the rest of the scrape is still there, which is the point.
+        assert!(text.contains("crabmon_up 1"), "{text}");
+        assert!(text.contains("crabmon_memory_total_bytes 1000"), "{text}");
+    }
+
+    /// Deduplication must keep the first sample rather than silently dropping
+    /// a family down to nothing, and must not touch distinct label sets.
+    #[test]
+    fn deduplication_keeps_the_first_sample_and_leaves_distinct_ones_alone() {
+        let mut out = String::new();
+        metric(
+            &mut out,
+            "thing",
+            "help",
+            "gauge",
+            &[("a=\"1\"".into(), 1.0), ("a=\"2\"".into(), 2.0), ("a=\"1\"".into(), 99.0)],
+        );
+        assert!(out.contains("crabmon_thing{a=\"1\"} 1\n"), "{out}");
+        assert!(out.contains("crabmon_thing{a=\"2\"} 2\n"), "{out}");
+        assert!(!out.contains("99"), "the repeat should be dropped, not emitted:\n{out}");
+        assert_eq!(out.matches("# HELP ").count(), 1);
+    }
+
+    /// Per-container network, which is what the kernel will actually account.
+    /// The host's own namespace is excluded: its traffic is already exported
+    /// per interface, and a second copy of it labelled as a container would be
+    /// double counting in anyone's dashboard.
+    #[test]
+    fn container_network_is_exported_and_the_host_namespace_is_not() {
+        use crate::metrics::NetNamespace;
+
+        let snap = Snapshot {
+            netns: vec![
+                NetNamespace {
+                    id: 4_026_531_992,
+                    host: true,
+                    rx_bps: 999_999.0,
+                    tx_bps: 999_999.0,
+                    ..Default::default()
+                },
+                NetNamespace {
+                    id: 4_026_532_001,
+                    container: Some("abc123".into()),
+                    rx_bps: 2048.0,
+                    tx_bps: 1024.0,
+                    rx_total: 50_000,
+                    tx_total: 25_000,
+                    procs: 4,
+                    ..Default::default()
+                },
+                // A namespace with no container: `ip netns`, or a sandboxed
+                // unit. Its inode is the only name it has.
+                NetNamespace { id: 4_026_532_002, rx_bps: 16.0, ..Default::default() },
+            ],
+            ..snap()
+        };
+        let text = render(&snap, 10);
+
+        assert!(
+            text.contains("crabmon_container_receive_bytes_per_second{container=\"abc123\"} 2048"),
+            "{text}"
+        );
+        assert!(text.contains("crabmon_container_processes{container=\"abc123\"} 4"), "{text}");
+        assert!(
+            text.contains("netns=\"4026532002\""),
+            "an unnamed namespace still needs a series:\n{text}"
+        );
+        assert!(!text.contains("999999"), "the host namespace must not be exported again:\n{text}");
+    }
+
+    #[test]
+    fn a_machine_with_no_containers_exports_no_container_series() {
+        // An empty family with only HELP and TYPE is noise in every scrape.
+        let text = render(&snap(), 10);
+        assert!(!text.contains("crabmon_container_"), "{text}");
+    }
+
+    /// crabmon measures things Prometheus cannot: pressure-stall averages, the
+    /// busiest device's utilisation, how close a process is to *its own*
+    /// descriptor limit. All of it was alertable in the TUI and invisible to
+    /// anything scraping it, so the rules most worth paging on were the ones
+    /// that could not reach a pager.
+    #[test]
+    fn alert_rules_are_exported_with_their_state_and_the_value_that_caused_it() {
+        use crate::alerts::{AlertKind, RuleState};
+
+        let states = vec![
+            RuleState {
+                name: "cpu-saturated".into(),
+                kind: AlertKind::Cpu,
+                threshold: 90.0,
+                value: Some(97.5),
+                active: true,
+            },
+            RuleState {
+                name: "nginx gone".into(),
+                kind: AlertKind::Proc,
+                threshold: 1.0,
+                value: Some(3.0),
+                active: false,
+            },
+        ];
+        let text = render_with_alerts(&snap(), 10, &states);
+
+        assert!(
+            text.contains("crabmon_alert_active{rule=\"cpu-saturated\",kind=\"cpu\"} 1"),
+            "{text}"
+        );
+        // A rule that is *not* firing still needs a series: a gauge that only
+        // appears once something is wrong cannot be alerted on, and a
+        // dashboard built on it has nothing to draw until the incident.
+        assert!(
+            text.contains("crabmon_alert_active{rule=\"nginx gone\",kind=\"proc\"} 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("crabmon_alert_value{rule=\"cpu-saturated\",kind=\"cpu\"} 97.5"),
+            "{text}"
+        );
+        assert!(
+            text.contains("crabmon_alert_threshold{rule=\"cpu-saturated\",kind=\"cpu\"} 90"),
+            "{text}"
+        );
+    }
+
+    /// A rule measuring something this machine does not report — a `gpu` rule
+    /// with no GPU — has no value. Exporting 0 would read as "idle", which is
+    /// a different claim from "not measured".
+    #[test]
+    fn a_rule_with_nothing_to_measure_exports_no_value_rather_than_zero() {
+        use crate::alerts::{AlertKind, RuleState};
+
+        let states = vec![RuleState {
+            name: "gpu-hot".into(),
+            kind: AlertKind::Gpu,
+            threshold: 90.0,
+            value: None,
+            active: false,
+        }];
+        let text = render_with_alerts(&snap(), 0, &states);
+        assert!(text.contains("crabmon_alert_active{rule=\"gpu-hot\""), "{text}");
+        assert!(!text.contains("crabmon_alert_value{rule=\"gpu-hot\""), "{text}");
+        // The threshold is still a fact about the rule.
+        assert!(text.contains("crabmon_alert_threshold{rule=\"gpu-hot\""), "{text}");
+    }
+
+    #[test]
+    fn a_run_with_no_alerts_exports_no_alert_families() {
+        assert!(!render(&snap(), 10).contains("crabmon_alert_"));
     }
 
     #[test]
@@ -769,6 +1111,49 @@ mod tests {
         client.write_all(b"GET /healthz HTTP/1.1\r\n\r\n").unwrap();
         let mut response = String::new();
         client.read_to_string(&mut response).expect("the exporter was blocked");
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    }
+
+    /// A client that sends and sends without ever writing a newline. The read
+    /// timeout does not bound this: it limits how long one read may *block*,
+    /// and a sender that keeps the socket busy never blocks it. Unbounded,
+    /// `read_line` grows a `String` for as long as the client cares to type.
+    #[test]
+    fn a_client_that_never_sends_a_newline_is_cut_off_rather_than_buffered() {
+        use std::net::TcpStream;
+
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap().to_string();
+        drop(probe);
+
+        let bound = addr.clone();
+        std::thread::spawn(move || {
+            let _ = serve(&bound, 0, |_| Snapshot::default());
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while TcpStream::connect(&addr).is_err() {
+            assert!(std::time::Instant::now() < deadline, "exporter never came up");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut flood = TcpStream::connect(&addr).expect("connect");
+        flood.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+        let chunk = vec![b'A'; 64 * 1024];
+        let mut sent = 0usize;
+        // Far past the cap; the exporter should stop reading long before this.
+        while sent < 4 * 1024 * 1024 {
+            if flood.write_all(&chunk).is_err() {
+                break; // the exporter answered and closed, which is the point
+            }
+            sent += chunk.len();
+        }
+
+        // ...and it is still answering everybody else.
+        let mut client = TcpStream::connect(&addr).expect("connect");
+        client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        client.write_all(b"GET /healthz HTTP/1.1\r\n\r\n").unwrap();
+        let mut response = String::new();
+        std::io::Read::read_to_string(&mut client, &mut response).expect("the exporter was busy");
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
     }
 

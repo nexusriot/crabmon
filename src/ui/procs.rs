@@ -434,9 +434,20 @@ fn draw_groups(f: &mut Frame<'_>, area: Rect, inner: Rect, app: &mut App) {
     let page = inner.height.saturating_sub(1) as usize;
     app.set_group_page(page, groups.len());
 
-    let header = Row::new(["GROUP", "PROCS", "CPU%", "MEM", "DISK"])
+    // NET is per *namespace*, which is per container — the honest version of
+    // the per-process byte count the kernel does not keep. It only earns a
+    // column when something in view actually has one, so a machine running no
+    // containers is not given a column of dashes.
+    let with_net = groups.iter().any(|g| g.net_bps.is_some());
+    let titles: &[&str] = if with_net {
+        &["GROUP", "PROCS", "CPU%", "MEM", "DISK", "NET"]
+    } else {
+        &["GROUP", "PROCS", "CPU%", "MEM", "DISK"]
+    };
+    let header = Row::new(titles.to_vec())
         .style(Style::default().add_modifier(Modifier::BOLD).fg(app.theme.title));
-    let name_w = inner.width.saturating_sub(34) as usize;
+    let reserved = if with_net { 43 } else { 34 };
+    let name_w = inner.width.saturating_sub(reserved) as usize;
 
     let start = app.group_scroll.min(groups.len());
     let end = (start + page.max(1)).min(groups.len());
@@ -446,7 +457,7 @@ fn draw_groups(f: &mut Frame<'_>, area: Rect, inner: Rect, app: &mut App) {
             app.cfg.thresholds.warn,
             app.cfg.thresholds.crit,
         );
-        Row::new(vec![
+        let mut cells = vec![
             Cell::from(truncate_fit(&g.name, name_w.max(8))),
             Cell::from(format!("{:>5}", g.procs)),
             Cell::from(Span::styled(format!("{:>5.1}", g.cpu), Style::default().fg(color))),
@@ -456,15 +467,28 @@ fn draw_groups(f: &mut Frame<'_>, area: Rect, inner: Rect, app: &mut App) {
             } else {
                 format!("{:>7}", compact_bytes(g.io_bps as u64))
             }),
-        ])
+        ];
+        if with_net {
+            // `None` is a group whose processes report no namespace at all,
+            // which is not the same as a container that moved no bytes.
+            cells.push(Cell::from(match g.net_bps {
+                None => "       -".to_string(),
+                Some((rx, tx)) if rx + tx < 1.0 => "       -".to_string(),
+                Some((rx, tx)) => format!("{:>8}", compact_bytes((rx + tx) as u64)),
+            }));
+        }
+        Row::new(cells)
     });
-    let widths = [
+    let mut widths = vec![
         Constraint::Min(8),
         Constraint::Length(6),
         Constraint::Length(6),
         Constraint::Length(8),
         Constraint::Length(8),
     ];
+    if with_net {
+        widths.push(Constraint::Length(9));
+    }
     let table = Table::new(rows, widths).header(header).highlight_style(app.theme.selection());
     let mut state = TableState::default();
     if !groups.is_empty() {

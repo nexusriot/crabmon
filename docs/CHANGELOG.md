@@ -3,6 +3,139 @@
 Notable changes to crabmon. Versions follow [semantic versioning](https://semver.org),
 with the usual 0.x caveat that minor releases may change behaviour.
 
+## 0.9.0 — unreleased
+
+Everything crabmon measures, reachable from outside the full-screen interface:
+alert rules that run headlessly, a watch that waits on any of them, several
+hosts in one table, and the per-container network figure the kernel will
+actually account. Plus the bugs an end-to-end suite found once there was one.
+
+### Added
+
+- **Alerts without a terminal: `--serve --alerts` and `--stream --alerts`.**
+  The rules, their hold times, their hooks and the flight recorder all ran
+  only inside the TUI, which made the flight recorder — whose whole point is
+  to have a recording of an incident nobody predicted — depend on someone
+  sitting in front of a full-screen interface at the moment the incident
+  happened. Under `--serve` each rule is also exported as
+  `crabmon_alert_active`, `crabmon_alert_value` and `crabmon_alert_threshold`,
+  firing or not, which is what finally makes crabmon's own measurements —
+  pressure stall, device utilisation, a process against *its own* descriptor
+  limit — reachable from a pager. The TUI and the headless modes run the same
+  code: an incident is handled identically whether or not anyone is watching.
+- **`--watch-rule`: wait for a measurement, not just a process list.**
+  `cpu>=90`, `psi:io>20`, `disk:/var>=95`, `net>=1M`, `proc:nginx<1` — any
+  `[[alert]]` kind, spelled compactly, with `--watch-for` as its hold time.
+  Both forms of `--watch` are now alert rules underneath (a process watch is
+  `proc:<query>>=1`), which deletes the second hold-time state machine this
+  mode used to carry and makes a condition behave the same in a shell script,
+  in the config file and under `--serve --alerts`.
+- **Several hosts at once: `--remote web-1,web-2,db-1`.** A fleet table with
+  one row per host — CPU, memory, swap, load, disk utilisation, network,
+  processes — so the machine in trouble is visible before you have picked one.
+  `Enter` points the rest of the interface at the host under the cursor, `W`
+  goes back. Hosts are sampled concurrently, one worker each, so an
+  unreachable machine is one row saying why next to the last numbers it
+  reported, rather than a blank dashboard. A single target behaves exactly as
+  before, with no fleet table and no extra stop in the `Tab` cycle.
+- **Per-container network throughput.** Per-*process* network bytes is the
+  thing a process monitor is asked for most and cannot honestly provide: the
+  kernel does not account bytes to a PID, and getting there means eBPF or
+  packet capture, which need privileges crabmon has promised not to ask for.
+  What the kernel does account is bytes per network *namespace*, which is
+  per container — so the grouped view gains a NET column, and `--serve`
+  exports `crabmon_container_receive_bytes_per_second` and friends. The host's
+  own namespace is excluded, because the per-interface series already carry it.
+- **Open files in the process detail pane.** The fd walk was already there to
+  count descriptors; resolving the links turns it into `lsof` for one process,
+  next to the sockets the pane already lists. "Which log is filling the disk"
+  and "what is this wedged process still holding" used to mean leaving
+  crabmon, which loses the process you were looking at.
+- **`--columns`**, to choose the process table's columns for one run without
+  editing `[procs] columns`. An unknown name is an error that lists the real
+  ones, rather than a column quietly missing from the table.
+- **A hermetic end-to-end suite that runs in a container**
+  (`tests/e2e_docker.rs`, `make e2e`). The binary is built from the checkout by
+  a Dockerfile whose bases are pinned by digest, and exercised inside a
+  container with an empty network namespace, a read-only image, a tmpfs for
+  scratch and a fixed hostname — so assertions are about a machine whose
+  contents are known, rather than about whatever the developer's own `/proc`,
+  network or leftover files happen to hold. Two of the tests assert that
+  sandbox itself, because a sandbox nothing checks is one that quietly stops
+  being a sandbox. Nothing is installed into the image: the exporter is scraped
+  over the container's own loopback by a small bash client, where an
+  `apt-get install curl` would have made every run depend on whatever a Debian
+  mirror held that day. It is what found the `exec` bug above. Opt-in: without
+  `CRABMON_E2E=1` every test in it reports a skip and passes, so a machine with
+  no Docker still runs a green suite.
+
+  `make e2e` needs Docker and nothing else, not even Rust. The harness is
+  itself a `cargo test` suite, so a toolchain has to exist somewhere; it comes
+  from a container too, with the checkout mounted read-only so the run leaves
+  nothing behind. `make e2e-local` is the same tests driven by the toolchain
+  already installed — faster to iterate in, and it hands nothing the Docker
+  socket. Both are CI jobs, the first with no toolchain installed at all.
+- **`--layout fleet`**, and `ui::ALL_LAYOUTS` so the docs tests check the real
+  set rather than a copy of it. The same gap had let `W` be bound in the TUI
+  without ever appearing in the `?` key list; there is now a test for that
+  direction too.
+
+### Fixed
+
+- **A process that `exec`ed kept the name it had beforehand, for ever.** `exec`
+  replaces the program without changing the PID, the parent or the start time,
+  and the sampler reads a process's name only when it first meets a PID and
+  treats an unchanged start time as "nothing to re-read". So a wrapper script
+  that hands off to the real program — every container entrypoint, every unit
+  with a shell in front of it, `sudo`, `nohup` — was reported as `sh` for as
+  long as it ran, with the wrapper's argv, executable and working directory
+  alongside it. The process table, `service:` grouping, `cmd:` filters and
+  `proc` alerts were all looking at a program that was no longer running, and
+  `--watch nginx` could never match an nginx that had been exec'd into.
+  `/proc/<pid>/comm` is now checked every sample — one small read per process,
+  around 10 ms on a 2000-process host — and the heavier re-reads happen only
+  for the processes it shows have actually changed.
+- **`--once`, `--stream` and `--watch` divided every rate by the interval they
+  asked for rather than the one that passed.** Each slept the whole refresh
+  interval and *then* sampled, so a frame took `interval + sample_cost` while
+  the counter deltas in it were still divided by `interval` — every
+  bytes-per-second series overstated by that ratio, which is a few percent on
+  an idle laptop and more than double on a host where a sample costs more than
+  a refresh. `--serve` already measured the real gap between scrapes; the other
+  three now do too, and sleep only the remainder of the interval, so the
+  cadence is the configured one.
+- **Two identical GPUs made the Prometheus exporter return nothing at all.** A
+  card's name is `"<vendor> <driver>"` from sysfs, or whatever `nvidia-smi`
+  calls the model, so a matched pair produced the same `gpu="..."` label twice
+  in one metric family — and Prometheus rejects the *entire* scrape over a
+  duplicate series, exactly as it does over a repeated `HELP` line. Repeated
+  label sets are now dropped rather than taking every other metric with them.
+  Two NVMe drives presenting the same sensor label did the same thing.
+- **A dropped `--remote` stream ran the streaming command as a one-shot.** When
+  a streaming SSH session died for any reason other than an old crabmon at the
+  far end, the next sample fell through to the single-frame path — which still
+  held `crabmon --stream`, a command that by definition never exits. Every tick
+  after the drop paid the full 15-second fetch timeout and left another crabmon
+  running on the remote host, and the real failure was overwritten by whatever
+  that second `ssh` said. The session is simply reopened on the next tick now.
+- **The Prometheus exporter read a request line without a bound.** The read
+  timeout limits how long a single read may block, which a client that keeps
+  sending never trips, so one connection could make the exporter buffer for as
+  long as it cared to type. Request lines are capped at 8 KiB.
+- **The FreeBSD cross-check did not compile.** `setpriority` and
+  `getpriority` take `id_t` for the process on Linux and `int` on the BSDs, so
+  passing a `u32` built on one and not the other. `pid as _` lets each target
+  pick its own.
+- **An unknown name in `panel_order` silently dropped that panel.** The list
+  went straight into the draw loop, where a name no arm matched fell through
+  and did nothing — so a typo, or a panel renamed between releases, cost you
+  the panel with nothing anywhere to say why. `[procs] columns` has always
+  been validated; `panel_order` now is too, including the duplicate that would
+  otherwise split the column between two copies of the same panel.
+- **A negative size in a filter query silently became zero.** `mem>-1M` parsed
+  as `mem>0`, a filter that matches the whole process table; `parse_duration`
+  had always refused the same mistake. Sizes are now rejected the same way.
+
 ## 0.8.0 — unreleased
 
 Six things the existing machinery was one step short of: disks that say when

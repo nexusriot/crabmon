@@ -2,6 +2,7 @@
 //! that makes crabmon scriptable.
 
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 fn crabmon(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_crabmon")).args(args).output().expect("failed to run crabmon")
@@ -139,33 +140,105 @@ fn diff_of_a_missing_file_fails_instead_of_printing_zeros() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("crabmon"));
 }
 
-#[test]
-fn stream_emits_one_parseable_snapshot_per_line() {
-    use std::io::Read;
+/// Read `want` lines from `--stream`, or as many as arrive before `deadline`.
+/// Returns the raw text and the instant each line was read.
+///
+/// Sleeping a fixed wall-clock budget and reading whatever landed is what this
+/// replaced: the first frame costs a priming sample plus a refresh interval
+/// plus a sample, and on a debug build under a loaded CI runner that is most
+/// of a second on its own — so the test failed for reasons that had nothing to
+/// do with streaming.
+fn stream_lines(args: &[&str], want: usize, deadline: Duration) -> (String, Vec<Instant>) {
+    use std::io::{BufRead, BufReader};
     use std::process::Stdio;
 
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_crabmon"))
-        .args(["--stream", "--refresh", "200"])
+        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn");
 
-    // Give it long enough for a couple of frames, then stop it.
-    std::thread::sleep(std::time::Duration::from_millis(900));
-    let _ = child.kill();
-    let mut text = String::new();
-    child.stdout.take().unwrap().read_to_string(&mut text).unwrap();
-    let _ = child.wait();
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send((line, Instant::now())).is_err() {
+                return;
+            }
+        }
+    });
 
-    // Killing the writer can cut the final line in half, which is exactly what
-    // the recording reader already tolerates — so read it the same way.
+    let give_up = Instant::now() + deadline;
+    let mut text = String::new();
+    let mut at = Vec::new();
+    while at.len() < want {
+        let left = give_up.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(left) {
+            Ok((line, now)) => {
+                text.push_str(&line);
+                text.push('\n');
+                at.push(now);
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    (text, at)
+}
+
+#[test]
+fn stream_emits_one_parseable_snapshot_per_line() {
+    let (text, at) = stream_lines(&["--stream", "--refresh", "200"], 2, Duration::from_secs(20));
+    assert_eq!(at.len(), 2, "the stream produced {} frames:\n{text}", at.len());
+
     let frames = crabmon::record::parse_jsonl(&text).expect("the stream must be readable");
-    assert!(!frames.is_empty(), "no frames were streamed");
+    assert_eq!(frames.len(), 2, "no frames were streamed");
     assert!(!frames[0].host.hostname.is_empty());
     assert!(!frames[0].procs.is_empty());
     // One frame per line: a pretty-printed document would break the reader.
-    assert!(text.lines().filter(|l| !l.trim().is_empty()).count() >= frames.len());
+    assert_eq!(text.lines().filter(|l| !l.trim().is_empty()).count(), frames.len());
+}
+
+/// `--stream` used to sleep the whole refresh interval and *then* sample, so a
+/// frame cost `interval + sample_cost` while every rate in it was still a
+/// counter delta divided by the nominal `interval` — every bytes-per-second
+/// series overstated by that ratio. `sampler::Pacer` now marks the clock
+/// before each sample and sleeps only the remainder.
+///
+/// The exact pacing is pinned by the `Pacer` unit tests, which run on a fixed
+/// timeline. This is the end-to-end half: that the binary really does stream
+/// on the cadence it was asked for rather than drifting a sample behind on
+/// every frame. The margin is deliberately wide — how much the old bug cost
+/// depended entirely on how expensive a sample was on the machine running it,
+/// which on an idle developer box is around a tenth of an interval and on a
+/// 2000-process host is more than one.
+#[test]
+fn stream_keeps_to_the_interval_it_was_asked_for() {
+    let refresh = Duration::from_millis(300);
+    let (text, at) = stream_lines(&["--stream", "--refresh", "300"], 6, Duration::from_secs(30));
+    assert_eq!(at.len(), 6, "only {} frames arrived:\n{text}", at.len());
+
+    // First to last rather than a mean of the gaps: these are the times this
+    // process *read* each line, and a test thread that loses the CPU for a
+    // moment reads several at once, which makes individual gaps meaningless
+    // while leaving the span across all of them intact. The first gap also
+    // carries the cold-cache cost of the opening samples — one
+    // `/proc/<pid>/cgroup` read per process — so it is skipped.
+    let span = at[at.len() - 1] - at[1];
+    let mean = span / (at.len() - 2) as u32;
+    // Only an upper bound. Being slower than asked is the bug; being read
+    // later than a frame arrived is the measurement, and both push this the
+    // same way, so the margin is wide. The exact pacing is the `Pacer` unit
+    // tests' job, on a timeline that cannot drift.
+    assert!(
+        mean < refresh * 2,
+        "frames averaged {mean:?} apart for a {refresh:?} refresh:\n{text}"
+    );
 }
 
 #[test]

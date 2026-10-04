@@ -294,13 +294,21 @@ impl MetricSource for RemoteSource {
                 self.last_good = Some(snap.clone());
                 return snap;
             }
-            // Nothing new yet — the first frame is still in flight, or the far
-            // end is slower than we are asking. Keep what is on screen.
-            if self.stream.is_some() && self.last_good.is_some() {
+            // Nothing new yet — the first frame is still in flight, the far end
+            // is slower than we are asking, or the session has just died. In
+            // every one of those cases keep what is on screen; `drain_stream`
+            // clears `self.stream` when the session dies, so the next tick
+            // reopens it.
+            //
+            // Falling through to `fetch()` from here ran the *streaming*
+            // command as a one-shot — `ssh host crabmon --stream`, which by
+            // definition never exits — so a session dropped for any reason
+            // other than an old crabmon on the far end cost a full 15-second
+            // fetch timeout and left a stray crabmon running over there. The
+            // one case that *should* fall through is `drain_stream` having
+            // given up on streaming, which also swaps in the one-shot command.
+            if self.stream_wanted {
                 return self.last_good.clone().unwrap_or_default();
-            }
-            if self.stream.is_some() {
-                return Snapshot::default();
             }
         }
         match self.fetch() {
@@ -316,6 +324,10 @@ impl MetricSource for RemoteSource {
                 self.last_good.clone().unwrap_or_default()
             }
         }
+    }
+
+    fn error(&self) -> Option<String> {
+        self.last_error.clone()
     }
 
     fn label(&self) -> Option<String> {
@@ -473,6 +485,38 @@ mod tests {
         assert!(!src.stream_wanted, "it should stop asking for a stream");
         assert_eq!(src.command(), ONE_SHOT_COMMAND);
         assert!(src.last_error.is_none(), "an expected fallback is not an error");
+    }
+
+    /// A stream that dies for a real reason must not be retried as a one-shot
+    /// of the streaming command: `ssh host crabmon --stream` never exits, so
+    /// every tick paid the 15-second fetch timeout and abandoned a crabmon on
+    /// the far end. The session is simply reopened on the next tick.
+    #[test]
+    fn a_broken_stream_holds_the_last_frame_instead_of_running_the_stream_command_once() {
+        let mut src = RemoteSource::streaming("nonexistent.invalid", 800, vec![]);
+        src.last_good = Some(Snapshot { taken_at_unix: 77, ..Default::default() });
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(Err("ssh: Permission denied (publickey)".to_string())).unwrap();
+        drop(tx);
+        let child = Command::new("true").spawn().unwrap();
+        src.stream = Some(Stream { child, frames: rx });
+
+        let start = std::time::Instant::now();
+        let snap = src.snapshot(Duration::ZERO);
+        assert_eq!(snap.taken_at_unix, 77, "the last good frame must stay on screen");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "it blocked for {:?}; a one-shot of --stream would hit the fetch timeout",
+            start.elapsed()
+        );
+        assert!(src.stream_wanted, "a transport failure is not a reason to stop streaming");
+        assert_eq!(src.command(), stream_command(800), "the command must not be swapped out");
+        // The stream's own failure is what gets reported. Falling through to a
+        // one-shot overwrote it with whatever that second ssh said, which is
+        // how the real cause — a rejected key — came out as a DNS error.
+        let err = src.last_error.clone().expect("the failure still has to be reported");
+        assert!(err.contains("Permission denied"), "{err}");
     }
 
     #[test]

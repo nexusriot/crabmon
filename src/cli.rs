@@ -9,12 +9,13 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Every long flag the parser accepts. The docs tests check this against the
 /// README, the man page and the shell completions.
-pub const LONG_FLAGS: [&str; 28] = [
+pub const LONG_FLAGS: [&str; 31] = [
     "--refresh",
     "--sort",
     "--ascending",
     "--descending",
     "--filter",
+    "--columns",
     "--tree",
     "--layout",
     "--theme",
@@ -31,8 +32,10 @@ pub const LONG_FLAGS: [&str; 28] = [
     "--remote-command",
     "--serve",
     "--stream",
+    "--alerts",
     "--diff",
     "--watch",
+    "--watch-rule",
     "--watch-for",
     "--watch-timeout",
     "--help",
@@ -46,6 +49,8 @@ pub struct Args {
     pub sort: Option<SortBy>,
     pub sort_desc: Option<bool>,
     pub filter: Option<String>,
+    /// Explicit process-table columns, overriding `[procs] columns`.
+    pub columns: Option<Vec<String>>,
     pub theme: Option<String>,
     pub layout: Option<Layout>,
     pub tree: Option<bool>,
@@ -65,10 +70,15 @@ pub struct Args {
     /// Write one JSON snapshot per line forever. What `--remote` runs on the
     /// far end, and usable on its own as a poor man's collector.
     pub stream: bool,
+    /// Evaluate alert rules in `--serve` and `--stream`: run the hooks, write
+    /// flight recordings, and export the rule state.
+    pub alerts: bool,
     /// Compare two snapshots, or the ends of one recording.
     pub diff: Option<(String, Option<String>)>,
     /// Headless: watch for processes matching this query.
     pub watch: Option<String>,
+    /// Headless: watch for a metric condition, e.g. `cpu>=90` or `proc:nginx<1`.
+    pub watch_rule: Option<String>,
     /// How long the watch condition must hold before it counts.
     pub watch_for: Option<u64>,
     /// Give up waiting after this many seconds. 0 waits forever.
@@ -100,6 +110,7 @@ OPTIONS:
     -a, --ascending          Sort ascending
     -d, --descending         Sort descending (the default)
     -f, --filter <QUERY>     Initial process filter, e.g. 'user:root cpu>5'
+        --columns <LIST>     Process-table columns, e.g. 'pid,user,cpu,mem,name'
     -t, --tree               Start in process-tree view
     -l, --layout <NAME>      dashboard|processes|cpu|io
         --theme <NAME>       default|mono|nord|solarized|gruvbox
@@ -116,8 +127,10 @@ OPTIONS:
         --remote-command <C> Command to run on the remote host
         --serve <ADDR>       Serve Prometheus metrics on ADDR, e.g. :9100
         --stream             Print a JSON snapshot per line forever
+        --alerts             With --serve/--stream: run alert rules headlessly
         --diff <A> [B]       Compare two snapshots, or one recording end to end
         --watch <QUERY>      Wait for processes matching QUERY, then exit 1
+        --watch-rule <EXPR>  ...or for a metric: 'cpu>=90', 'proc:nginx<1'
         --watch-for <SECS>   ...only if the match holds this long
         --watch-timeout <S>  ...and give up after this long (0 waits forever)
     -h, --help               Show this help
@@ -204,6 +217,30 @@ where
                 crate::filter::parse(&v).map_err(|e| format!("bad --filter: {e}"))?;
                 out.filter = Some(v);
             }
+            "--columns" => {
+                let v = take_value(&mut i, &args, inline, &flag)?;
+                // Validated here rather than dropped later: a mistyped column
+                // name silently narrows the table, and the one place you would
+                // look for the reason is the list you just typed.
+                let mut cols = Vec::new();
+                for name in v.split(',').map(str::trim).filter(|c| !c.is_empty()) {
+                    if crate::ui::procs::column_by_name(name).is_none() {
+                        return Err(format!(
+                            "unknown column: {name}\nknown columns: {}",
+                            crate::ui::procs::ALL_COLUMNS
+                                .iter()
+                                .map(|c| c.id)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                    }
+                    cols.push(name.to_string());
+                }
+                if cols.is_empty() {
+                    return Err("--columns needs at least one column".into());
+                }
+                out.columns = Some(cols);
+            }
             "-t" | "--tree" => out.tree = Some(true),
             "-l" | "--layout" => {
                 let v = take_value(&mut i, &args, inline, &flag)?;
@@ -244,6 +281,7 @@ where
             }
             "--serve" => out.serve = Some(take_value(&mut i, &args, inline, &flag)?),
             "--stream" => out.stream = true,
+            "--alerts" => out.alerts = true,
             "--diff" => {
                 let a = take_value(&mut i, &args, inline, &flag)?;
                 // A second path may follow; one on its own means "this
@@ -254,7 +292,23 @@ where
                 }
                 out.diff = Some((a, b));
             }
-            "--watch" => out.watch = Some(take_value(&mut i, &args, inline, &flag)?),
+            "--watch" => {
+                let v = take_value(&mut i, &args, inline, &flag)?;
+                // A query that does not parse makes an inert rule: the watch
+                // waits out its whole timeout and then reports, truthfully,
+                // that nothing ever matched. `--filter` and `--watch-rule`
+                // are both checked here for the same reason.
+                crate::filter::parse(&v).map_err(|e| format!("bad --watch: {e}"))?;
+                out.watch = Some(v);
+            }
+            "--watch-rule" => {
+                let v = take_value(&mut i, &args, inline, &flag)?;
+                // Rejected here rather than left to block: a rule that cannot
+                // be meant is a watch that waits out its timeout and then
+                // reports, truthfully, that nothing happened.
+                crate::watch::parse_rule(&v, 0).map_err(|e| format!("bad --watch-rule: {e}"))?;
+                out.watch_rule = Some(v);
+            }
             "--watch-for" => {
                 let v = take_value(&mut i, &args, inline, &flag)?;
                 out.watch_for = Some(v.parse().map_err(|_| format!("bad duration: {v}"))?);
@@ -291,6 +345,7 @@ where
         // out meant `--remote box --watch 'state:D'` paged on the *local*
         // machine's processes while naming the remote host.
         ("--watch", out.watch.is_some()),
+        ("--watch-rule", out.watch_rule.is_some()),
     ] {
         if !on {
             continue;
@@ -302,10 +357,24 @@ where
             return Err(format!("{name} samples this host; it cannot be combined with --replay"));
         }
     }
-    let headless =
-        [out.once, out.serve.is_some(), out.stream, out.watch.is_some(), out.diff.is_some()];
+    let headless = [
+        out.once,
+        out.serve.is_some(),
+        out.stream,
+        out.watch.is_some() || out.watch_rule.is_some(),
+        out.diff.is_some(),
+    ];
     if headless.iter().filter(|s| **s).count() > 1 {
         return Err("--once, --serve, --stream, --watch and --diff are mutually exclusive".into());
+    }
+    if out.watch.is_some() && out.watch_rule.is_some() {
+        return Err("--watch and --watch-rule cannot be combined".into());
+    }
+    // `--alerts` on its own would be a flag that silently does nothing: the
+    // TUI always evaluates rules, and a single `--once` sample cannot satisfy
+    // a hold time, so neither is a mode it means anything in.
+    if out.alerts && !(out.serve.is_some() || out.stream) {
+        return Err("--alerts needs --serve or --stream".into());
     }
     Ok(Parsed::Run(Box::new(out)))
 }
@@ -319,6 +388,84 @@ mod tests {
             Parsed::Run(a) => *a,
             other => panic!("expected Run, got {other:?}"),
         }
+    }
+
+    /// A query that cannot be parsed makes a rule that can never fire, so the
+    /// watch blocks for its whole timeout and then exits 0 — "nothing
+    /// happened" — which is the one answer a monitor must not give wrongly.
+    #[test]
+    fn a_watch_query_that_cannot_parse_is_refused_before_anything_blocks() {
+        let err = parse(["--watch", "re:[unclosed"]).unwrap_err();
+        assert!(err.contains("bad --watch"), "{err}");
+        assert!(err.contains("regex"), "{err}");
+        assert!(parse(["--watch", "cpu>abc"]).is_err());
+        // ...and a query that does parse is kept exactly as written.
+        assert_eq!(run(&["--watch", "nginx cpu>5"]).watch.as_deref(), Some("nginx cpu>5"));
+    }
+
+    #[test]
+    fn a_rule_watch_is_checked_the_same_way() {
+        assert!(parse(["--watch-rule", "nonsense>1"]).unwrap_err().contains("unknown kind"));
+        assert!(parse(["--watch-rule", "cpu"]).unwrap_err().contains("no comparison"));
+        assert_eq!(run(&["--watch-rule", "cpu>=90"]).watch_rule.as_deref(), Some("cpu>=90"));
+    }
+
+    #[test]
+    fn the_two_watch_forms_are_not_combined() {
+        let err = parse(["--watch", "nginx", "--watch-rule", "cpu>=90"]).unwrap_err();
+        assert!(err.contains("cannot be combined"), "{err}");
+    }
+
+    #[test]
+    fn a_rule_watch_refuses_to_silently_sample_the_wrong_host() {
+        // `--watch` has always refused this; `--watch-rule` samples the same
+        // way and has to refuse it too.
+        for mode in [["--watch", "nginx"], ["--watch-rule", "cpu>=90"]] {
+            let mut argv = mode.to_vec();
+            argv.extend(["--remote", "somewhere.invalid"]);
+            let err = parse(&argv).unwrap_err();
+            assert!(err.contains("samples this host"), "{argv:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn alerts_can_be_asked_for_in_the_modes_that_can_run_them() {
+        assert!(run(&["--serve", ":9100", "--alerts"]).alerts);
+        assert!(run(&["--stream", "--alerts"]).alerts);
+        assert!(!run(&["--stream"]).alerts);
+    }
+
+    /// A flag that quietly does nothing is worse than one that is refused.
+    /// The TUI always evaluates rules, and one `--once` sample cannot satisfy
+    /// a hold time, so `--alerts` means nothing in either.
+    #[test]
+    fn alerts_is_refused_where_it_would_do_nothing() {
+        for argv in [vec!["--alerts"], vec!["--once", "--alerts"], vec!["--alerts", "--tree"]] {
+            let err = parse(&argv).unwrap_err();
+            assert!(err.contains("--serve or --stream"), "{argv:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn columns_can_be_chosen_on_the_command_line() {
+        let a = run(&["--columns", "pid,user,cpu,name"]);
+        assert_eq!(a.columns, Some(vec!["pid".into(), "user".into(), "cpu".into(), "name".into()]));
+        // Spacing and case are what someone actually types.
+        assert_eq!(run(&["--columns=PID, MEM"]).columns, Some(vec!["PID".into(), "MEM".into()]));
+    }
+
+    /// A mistyped column used to be dropped silently by `sanitize`, which
+    /// narrows the table with the reason nowhere on screen. On the command
+    /// line the list is right there, so say which name is wrong.
+    #[test]
+    fn an_unknown_column_is_named_rather_than_quietly_dropped() {
+        let err = parse(["--columns", "pid,nonsense"]).unwrap_err();
+        assert!(err.contains("unknown column: nonsense"), "{err}");
+        assert!(err.contains("known columns"), "{err}");
+        assert!(err.contains("pid"), "the error should list what is accepted: {err}");
+
+        assert!(parse(["--columns", ""]).unwrap_err().contains("at least one"));
+        assert!(parse(["--columns", " , "]).unwrap_err().contains("at least one"));
     }
 
     #[test]

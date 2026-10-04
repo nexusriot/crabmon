@@ -188,10 +188,15 @@ fn the_docs_list_every_theme_and_layout_that_exists() {
         assert!(readme.contains(theme), "README omits theme {theme}");
         assert!(man.contains(theme), "man page omits theme {theme}");
     }
-    for layout in ["dashboard", "processes", "cpu", "io"] {
-        assert!(readme.contains(layout), "README omits layout {layout}");
-        assert!(man.contains(layout), "man page omits layout {layout}");
+    for layout in crabmon::ui::ALL_LAYOUTS {
+        let name = layout.name();
+        assert!(readme.contains(name), "README omits layout {name}");
+        assert!(man.contains(name), "man page omits layout {name}");
     }
+    assert!(
+        readme.contains(&format!("{} layouts", number_word(crabmon::ui::ALL_LAYOUTS.len()))),
+        "the README's layout count is stale"
+    );
     // And the counts quoted in prose.
     assert!(
         readme.contains(&format!("{} colour themes", number_word(crabmon::theme::PRESETS.len()))),
@@ -300,6 +305,35 @@ fn man_keys_section() -> String {
     let rest = &man[start..];
     let end = rest[1..].find("\n.SH ").map(|i| i + 1).unwrap_or(rest.len());
     rest[..end].to_string()
+}
+
+/// The `?` popup is the only key list a user sees without leaving the
+/// program, and it was the one nothing checked in this direction: the other
+/// test goes popup → README, so a key bound in `on_normal_key` and never
+/// added to `KEYS` was invisible everywhere it mattered. `W` reached a
+/// release that way.
+#[test]
+fn every_bound_key_appears_in_the_help_popup() {
+    let listed: String = crabmon::ui::popups::KEYS.iter().map(|(k, _)| format!("{k} ")).collect();
+    // The popup lists the canonical spelling of a key that has more than one.
+    // The README and man page carry the aliases, which the test below checks;
+    // repeating them on a screen that already needs scrolling would cost more
+    // than it explains.
+    let canonical = |c: char| match c {
+        ',' => '<',
+        '.' => '>',
+        '=' => '+',
+        '_' => '-',
+        other => other,
+    };
+    for key in bound_keys() {
+        // Some rows group several keys (`c m p n`), so matching a character
+        // inside the key column is the right granularity.
+        assert!(
+            listed.contains(canonical(key)),
+            "key '{key}' is bound in on_normal_key but missing from the ? popup"
+        );
+    }
 }
 
 #[test]

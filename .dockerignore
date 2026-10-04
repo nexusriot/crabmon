@@ -1,0 +1,6 @@
+# The e2e image builds from Cargo.toml, Cargo.lock and src/ only; everything
+# else in the tree is build context the daemon would copy for nothing.
+/target
+/bin
+/dist
+/.git

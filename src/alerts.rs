@@ -116,7 +116,7 @@ pub struct ActiveAlert {
 }
 
 #[derive(Debug, Clone, Default)]
-struct RuleState {
+struct Tracked {
     /// Monotonic seconds at which the condition first held.
     over_since: Option<u64>,
     fired: bool,
@@ -146,7 +146,7 @@ pub struct AlertEngine {
     /// over a threshold and one under it, now that `below` exists — shared a
     /// `fired` flag, so each cleared the other's every refresh and the hook
     /// command re-spawned on every single sample.
-    state: Vec<RuleState>,
+    state: Vec<Tracked>,
     /// `proc` rules' queries, parsed once. Re-parsing a regex per rule per
     /// refresh is not free, and a query that fails to parse must be inert
     /// rather than an error on every frame.
@@ -163,7 +163,7 @@ pub struct AlertEngine {
 
 impl AlertEngine {
     pub fn new(rules: Vec<AlertRule>) -> Self {
-        let state = vec![RuleState::default(); rules.len()];
+        let state = vec![Tracked::default(); rules.len()];
         let queries = rules
             .iter()
             .map(|r| (r.kind == AlertKind::Proc).then(|| filter::parse(&r.query).ok()).flatten())
@@ -271,6 +271,46 @@ impl AlertEngine {
 
     pub fn history_len(&self) -> usize {
         self.history.len()
+    }
+}
+
+/// One rule as the exporter sees it: what it is, what it last measured, and
+/// whether it is firing.
+///
+/// A rule that is *not* firing still needs a series. A gauge that only appears
+/// once something is wrong cannot be alerted on — `absent()` is not the same
+/// question — and a dashboard built on it has nothing to draw until the
+/// incident it was built for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuleState {
+    pub name: String,
+    pub kind: AlertKind,
+    pub threshold: f64,
+    /// The last measurement, or `None` where the rule measures something this
+    /// machine does not report — a `gpu` rule with no GPU, a `psi` rule on a
+    /// kernel without pressure-stall accounting.
+    pub value: Option<f64>,
+    pub active: bool,
+}
+
+impl AlertEngine {
+    /// Every rule and its current state, for the Prometheus exporter.
+    ///
+    /// Measured here rather than remembered from `evaluate`, so a rule that is
+    /// inert on this machine reports no value instead of a stale one.
+    pub fn states(&self, snap: &Snapshot) -> Vec<RuleState> {
+        self.rules
+            .iter()
+            .enumerate()
+            .map(|(i, rule)| RuleState {
+                name: rule.name.clone(),
+                kind: rule.kind,
+                threshold: rule.threshold,
+                value: measure(rule, snap, self.queries.get(i).and_then(|q| q.as_ref()))
+                    .map(|(v, _)| v),
+                active: self.state.get(i).is_some_and(|s| s.fired),
+            })
+            .collect()
     }
 }
 
@@ -459,6 +499,52 @@ mod tests {
         let before = names.len();
         names.dedup();
         assert_eq!(names.len(), before, "two kinds share a spelling");
+    }
+
+    /// Every rule needs a series whether or not it is firing, and the value
+    /// has to be measured now rather than remembered from the last crossing —
+    /// otherwise a rule that recovered would export the number that tripped it
+    /// for ever.
+    #[test]
+    fn rule_states_report_what_is_true_now_not_what_was_true_when_it_fired() {
+        let mut e = AlertEngine::new(vec![rule("cpu", AlertKind::Cpu, 90.0, 0)]);
+        let hot = snap_cpu(95.0);
+        e.evaluate(&hot, 100);
+
+        let states = e.states(&hot);
+        assert_eq!(states.len(), 1);
+        assert!(states[0].active);
+        assert_eq!(states[0].value, Some(95.0));
+        assert_eq!(states[0].threshold, 90.0);
+        assert_eq!(states[0].kind, AlertKind::Cpu);
+
+        // It recovers; the exported value follows the machine, not the rule.
+        let cool = snap_cpu(3.0);
+        e.evaluate(&cool, 200);
+        let states = e.states(&cool);
+        assert!(!states[0].active);
+        assert_eq!(states[0].value, Some(3.0));
+    }
+
+    #[test]
+    fn a_rule_measuring_something_this_machine_lacks_reports_no_value() {
+        // A `gpu` rule on a machine with no GPU. Reporting 0 would read as an
+        // idle GPU, which is a different claim from "there isn't one".
+        let e = AlertEngine::new(vec![rule("gpu", AlertKind::Gpu, 90.0, 0)]);
+        let states = e.states(&Snapshot::default());
+        assert_eq!(states[0].value, None);
+        assert!(!states[0].active);
+    }
+
+    #[test]
+    fn every_rule_gets_a_state_even_the_ones_that_never_fire() {
+        let e = AlertEngine::new(vec![
+            rule("a", AlertKind::Cpu, 90.0, 0),
+            rule("b", AlertKind::Mem, 90.0, 0),
+            rule("c", AlertKind::Swap, 90.0, 0),
+        ]);
+        assert_eq!(e.states(&Snapshot::default()).len(), 3);
+        assert!(AlertEngine::new(Vec::new()).states(&Snapshot::default()).is_empty());
     }
 
     #[test]

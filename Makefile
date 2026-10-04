@@ -3,6 +3,8 @@
 #
 #   make            list the targets
 #   make test       run the whole suite
+#   make e2e        run the end-to-end suite in containers (needs only Docker)
+#   make e2e-local  the same tests, using the toolchain on this machine
 #   make bin        release binary into ./bin
 #   make install    install under PREFIX (default /usr/local)
 #
@@ -16,8 +18,8 @@ ARGS ?=
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build release bin run test test-unit check fmt fmt-check lint ci \
-        deb dist install uninstall clean version
+.PHONY: help build release bin run test test-unit e2e e2e-local check fmt fmt-check \
+        lint ci deb dist install uninstall clean version
 
 help:
 	@$(BUILD) help
@@ -39,6 +41,12 @@ test:
 
 test-unit:
 	@$(BUILD) test-unit
+
+e2e:
+	@$(BUILD) e2e
+
+e2e-local:
+	@$(BUILD) e2e-local
 
 check:
 	@$(BUILD) check

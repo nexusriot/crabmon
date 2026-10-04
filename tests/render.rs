@@ -418,6 +418,123 @@ fn the_grouped_view_replaces_the_process_table() {
     assert!(!s.contains("COMMAND"), "{s}");
 }
 
+/// Per-container network is the honest version of the per-process byte count
+/// the kernel does not keep, so the grouped view is where it belongs. The
+/// column only appears when something in view actually has a namespace — a
+/// machine running no containers should not be given a column of dashes.
+#[test]
+fn the_grouped_view_shows_container_network_only_when_there_is_some() {
+    use crabmon::metrics::NetNamespace;
+
+    let mut a = app();
+    a.cfg.group_by = crabmon::metrics::GroupBy::Service;
+    a.tick();
+    assert!(!screen(&mut a, 160, 48).contains("NET"), "no namespaces, no column");
+
+    let mut snap = common::snapshot();
+    for p in &mut snap.procs {
+        p.netns = Some(4_026_532_001);
+        p.container = Some("abc123def456".into());
+    }
+    snap.netns = vec![NetNamespace {
+        id: 4_026_532_001,
+        container: Some("abc123def456".into()),
+        rx_bps: 2_097_152.0,
+        tx_bps: 1_048_576.0,
+        procs: snap.procs.len(),
+        ..Default::default()
+    }];
+    let mut a = crabmon::App::new(
+        common::config(),
+        Box::new(crabmon::record::ReplaySource::from_frames(vec![snap], "t")),
+    );
+    a.cfg.group_by = crabmon::metrics::GroupBy::Container;
+    let s = screen(&mut a, 160, 48);
+    assert!(s.contains("NET"), "{s}");
+    assert!(s.contains("abc123def456"), "{s}");
+    // 3 MiB/s across the namespace, counted once rather than once per process.
+    assert!(s.contains("3.0M"), "{s}");
+}
+
+/// A fleet row has to answer "which machine" before anyone has picked one,
+/// so every host is drawn whether or not it is the selected one.
+#[test]
+fn the_fleet_table_draws_a_row_per_host() {
+    use crabmon::fleet::FleetSource;
+    use crabmon::metrics::{CpuSample, HostInfo, MetricSource, Snapshot};
+
+    let host = |name: &str, cpu: f32| -> Box<dyn MetricSource> {
+        Box::new(common::FakeSource::single(Snapshot {
+            host: HostInfo {
+                hostname: name.into(),
+                uptime_secs: 90_061,
+                load: [1.5, 1.0, 0.8],
+                ..Default::default()
+            },
+            cpu: CpuSample { per_core: vec![cpu], freq_mhz: vec![] },
+            mem: crabmon::metrics::MemSample {
+                total: 16_000_000_000,
+                used: 8_000_000_000,
+                ..Default::default()
+            },
+            taken_at_unix: 1_700_000_000,
+            ..Default::default()
+        }))
+    };
+    let fleet = FleetSource::new(vec![
+        ("web-1".into(), host("web-1", 12.0)),
+        ("db-1".into(), host("db-1", 95.0)),
+    ]);
+
+    let mut a = crabmon::App::new(common::config(), Box::new(fleet));
+    a.cfg.layout = crabmon::ui::Layout::Fleet;
+    let s = screen(&mut a, 160, 24);
+
+    assert!(s.contains("Fleet"), "{s}");
+    assert!(s.contains("2 hosts"), "{s}");
+    assert!(s.contains("web-1"), "{s}");
+    assert!(s.contains("db-1"), "the unselected host must be drawn too: {s}");
+    assert!(s.contains("95.0"), "its numbers too, not just its name: {s}");
+    assert!(s.contains("LOAD"), "{s}");
+}
+
+/// One unreachable machine is one bad row. Drawing it as zeroes would say the
+/// host is idle, which is the opposite of what is happening.
+#[test]
+fn an_unreachable_host_explains_itself_instead_of_reading_as_idle() {
+    use crabmon::fleet::FleetSource;
+    use crabmon::metrics::{MetricSource, Snapshot};
+
+    struct Down;
+    impl MetricSource for Down {
+        fn snapshot(&mut self, _dt: std::time::Duration) -> Snapshot {
+            Snapshot::default()
+        }
+        fn error(&self) -> Option<String> {
+            Some("db-9: No route to host".into())
+        }
+    }
+
+    let fleet = FleetSource::new(vec![("db-9".into(), Box::new(Down) as Box<dyn MetricSource>)]);
+    let mut a = crabmon::App::new(common::config(), Box::new(fleet));
+    a.cfg.layout = crabmon::ui::Layout::Fleet;
+    let s = screen(&mut a, 160, 24);
+
+    assert!(s.contains("unreachable"), "{s}");
+    assert!(s.contains("No route"), "the reason belongs on the row: {s}");
+}
+
+/// The layout is reachable by name on a single-host run, so it has to say what
+/// it is for rather than drawing an empty table.
+#[test]
+fn the_fleet_layout_on_a_single_host_explains_what_it_is_for() {
+    let mut a = app();
+    a.cfg.layout = crabmon::ui::Layout::Fleet;
+    let s = screen(&mut a, 160, 24);
+    assert!(s.contains("no fleet"), "{s}");
+    assert!(s.contains("--remote"), "{s}");
+}
+
 #[test]
 fn a_replay_shows_its_position_in_the_status_line() {
     let frames: Vec<crabmon::Snapshot> = (0..8).map(|_| snapshot()).collect();
@@ -563,6 +680,46 @@ fn the_detail_pane_lists_listening_ports_and_socket_count() {
     let screen = screen(&mut app, 120, 30);
     assert!(screen.contains("Listening"), "{screen}");
     assert!(screen.contains("8080"), "{screen}");
+}
+
+/// "Which log is filling the disk" and "what is this wedged process still
+/// holding" are questions a monitor is open for, and the answer used to mean
+/// leaving it for `lsof` — which loses the process you were looking at.
+#[test]
+fn the_detail_pane_lists_the_files_the_process_has_open() {
+    use crabmon::metrics::fds::OpenFile;
+
+    let mut app = common::app();
+    app.mode = crabmon::Mode::Detail;
+    app.detail_files = Some(vec![
+        OpenFile { fd: 0, target: "/dev/null".into() },
+        OpenFile { fd: 3, target: "/var/log/crabmon-test.log".into() },
+        OpenFile { fd: 4, target: "pipe:[90210]".into() },
+    ]);
+    let screen = screen(&mut app, 120, 40);
+
+    assert!(screen.contains("Open files"), "{screen}");
+    assert!(screen.contains("crabmon-test.log"), "the path itself must be shown: {screen}");
+    assert!(screen.contains("fd 3"), "{screen}");
+    // Pipes and anonymous inodes are listed but not counted as files: a
+    // process holding three pipes is not a process holding three files.
+    assert!(screen.contains("pipe:[90210]"), "{screen}");
+    assert!(screen.contains("2 files"), "{screen}");
+}
+
+/// A process whose fd table belongs to someone else is not a process holding
+/// nothing, and the pane has to say which of the two it is.
+#[test]
+fn an_unreadable_fd_table_says_so_rather_than_showing_no_files() {
+    let mut app = common::app();
+    app.mode = crabmon::Mode::Detail;
+    app.detail_files = None;
+    assert!(screen(&mut app, 120, 40).contains("not readable"));
+
+    app.detail_files = Some(Vec::new());
+    let screen = screen(&mut app, 120, 40);
+    assert!(screen.contains("Open files"), "{screen}");
+    assert!(!screen.contains("not readable"), "an empty table is readable: {screen}");
 }
 
 #[test]

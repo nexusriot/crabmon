@@ -25,7 +25,7 @@ docs/
 completions/         bash, zsh and fish
 scripts/build.sh     the build driver; build-deb.sh is an alias CI still uses
 src/                 the library, plus a thin binary
-tests/               six integration suites
+tests/               seven integration suites, one of them in a container
 ```
 
 The prose lives under `docs/` with the man page it duplicates, so the three
@@ -57,6 +57,8 @@ src/
   sampler.rs         sampling on a worker thread
   diff.rs            comparing two snapshots
   watch.rs           the headless wait-for-a-condition mode
+  supervisor.rs      alert rules and the flight recorder, outside the TUI
+  fleet.rs           several hosts behind one metric source
   serve.rs           the Prometheus exporter
   audit.rs           the local log of actions taken
   clipboard.rs       OSC 52 copy
@@ -72,7 +74,9 @@ src/
     meminfo.rs       the buffers/cache breakdown
     procgroup.rs     per-process cgroup paths, and what they mean
     sockets.rs       /proc/net joined against a process's fd table
-    fds.rs           open descriptors and the limit they run out against
+    fds.rs           open descriptors, their limit, and what they point at
+    identity.rs      what a process is *now*, after an exec renamed it
+    netns.rs         per-network-namespace traffic, i.e. per container
   ui/
     mod.rs           layout selection and the draw entry point
     header.rs        host banner and status line
@@ -85,6 +89,7 @@ src/
     disks.rs         per-mount gauges
     sensors.rs       grouped temperatures
     gpu.rs           GPU rows
+    fleet.rs         one row per host, when several are being watched
     popups.rs        signal, confirm, renice, affinity, detail, help, alerts
 ```
 
@@ -379,7 +384,7 @@ polling `try_wait` alone cannot tell "slow" from "deadlocked on a full pipe".
 
 ## Layout
 
-`ui::draw` renders a header, one of four layouts, and a status line, then any
+`ui::draw` renders a header, one of five layouts, and a status line, then any
 popup on top.
 
 | Layout | Content |
@@ -415,9 +420,9 @@ terminal or a runaway process:
 
 ## Testing
 
-Over 500 tests: the in-crate unit tests plus six integration suites. All
-are offline and deterministic except `proc_control`, which deliberately touches
-the kernel:
+Over 600 tests: the in-crate unit tests plus seven integration suites. All are
+offline and deterministic except `proc_control`, which deliberately touches the
+kernel, and `e2e_docker`, which builds and runs a container:
 
 - **unit tests** (`src/**`) — formatting, filter parsing, sorting, tree
   flattening, diskstats/cgroup/PSI/meminfo/`iostat`/`nvidia-smi`/`limits`
@@ -452,6 +457,67 @@ the kernel:
   the crate's version and fails with a status on a mistyped command. `make` is a
   front end to `scripts/build.sh`, and a front end that has drifted from what it
   fronts is found when you need the command, not before.
+- **`tests/e2e_docker.rs`** — the shipped binary, built from this checkout by
+  `tests/e2e/Dockerfile` and run inside a container with an empty network
+  namespace: `--once` in both formats, a filter that must be refused, `--watch`
+  in both outcomes, `--stream` read back frame by frame, `--diff` across a
+  recording, and the exporter scraped over the container's own loopback.
+
+  What this buys over `tests/cli.rs`, which also runs the real binary, is a
+  machine whose contents are known. On a developer's laptop "is pid 1 reported"
+  is a question about that laptop; in the container pid 1 is the command the
+  test started and the only other processes are the ones it spawned, so a
+  process appearing between two samples, or changing its name under `exec`,
+  is an assertion rather than a hope. It is also where the binary is tested
+  against the libc it was built against rather than the one that happens to be
+  installed.
+
+  It is also where the features that only exist across machine boundaries are
+  tested: per-container network through a second container's namespace, and
+  alert rules firing their hooks and writing flight recordings with no
+  terminal anywhere.
+
+  **Hermetic**, specifically: every container gets an empty network namespace,
+  a read-only image, a tmpfs for scratch and a fixed hostname and environment.
+  A test cannot reach the network, cannot see the machine running the suite,
+  and cannot find anything an earlier test left behind — which is what lets
+  these run in parallel and in any order. Two of the tests assert exactly
+  those properties, because a sandbox nothing checks is a sandbox that quietly
+  stops being one: loosen a flag and they fail rather than the suite silently
+  becoming less isolated. Nothing is installed into the image either; the
+  exporter is scraped over the container's own loopback by a twenty-line bash
+  client, where an `apt-get install curl` would have made every run depend on
+  whatever a Debian mirror held that day.
+
+  `make e2e` needs **Docker and nothing else, not even Rust**. The harness is
+  a `cargo test` suite, so a toolchain has to exist somewhere;
+  `tests/e2e/Dockerfile.runner` supplies one, together with a Docker CLI
+  copied from the official image rather than installed. The checkout goes in
+  read-only and cargo's output goes to named volumes, so a run cannot leave a
+  root-owned `target/` in somebody's tree. The daemon is the host's, so the
+  containers the tests create are siblings rather than nested — no privileged
+  mode, no daemon inside a daemon — at the cost of handing that container the
+  host's socket, which is root-equivalent access to the machine.
+
+  `make e2e-local` is the same tests driven by whatever toolchain is already
+  installed: no runner container, nothing given the socket, output in the
+  ordinary `target/`. That is the one to iterate in, and the one for anyone
+  who would rather not hand a container their Docker socket. Both are CI jobs,
+  the first with no toolchain installed at all — a path nothing exercises is
+  broken by the time somebody needs it.
+
+  The image is pinned — both bases by digest, the dependencies by `Cargo.lock`
+  with `--locked` — so the same checkout builds the same container. Building it
+  does fetch those dependencies from crates.io, which is the one input that
+  still needs the network. `cargo vendor` would close it and costs 446 MB in
+  the repository (44 MB without the Windows crates this image never compiles),
+  which is not a trade worth making for a test suite: pinning already fixes
+  *what* is fetched.
+
+  It is **opt-in**: `make e2e`, or `CRABMON_E2E=1 cargo test --test e2e_docker`.
+  Without that every test in it reports that it was skipped and passes, because
+  a suite that fails on a machine with no Docker is a suite people delete.
+
 - **`tests/docs.rs`** — that the man page, completions and README still describe
   the flags, sort keys, themes, layouts, groupings, panels, config fields and key
   bindings the code actually has; that the aliases documented in one place are

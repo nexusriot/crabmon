@@ -6,9 +6,9 @@ _crabmon() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     opts="-r --refresh -s --sort -a --ascending -d --descending -f --filter
           -t --tree -l --layout --theme --no-color --no-mouse -1 --once --format
-          -n --top -c --config -g --group --record --replay --remote
-          --remote-command --serve --stream --diff --watch --watch-for
-          --watch-timeout -h --help -V --version"
+          -n --top -c --config -g --group --columns --record --replay --remote
+          --remote-command --serve --stream --alerts --diff --watch --watch-rule
+          --watch-for --watch-timeout -h --help -V --version"
 
     case "$prev" in
         -s|--sort)
@@ -17,15 +17,18 @@ _crabmon() {
         -g|--group)
             COMPREPLY=($(compgen -W "none service container user" -- "$cur"))
             return 0 ;;
+        --columns)
+            COMPREPLY=($(compgen -W "mark pid user state cpu trend mem virt thr ni fd disk time ports name" -- "$cur"))
+            return 0 ;;
         --record|--replay|--diff)
             COMPREPLY=($(compgen -f -- "$cur"))
             return 0 ;;
-        --watch|--watch-for|--watch-timeout)
+        --watch|--watch-rule|--watch-for|--watch-timeout)
             return 0 ;;
         --remote|--remote-command|--serve)
             return 0 ;;
         -l|--layout)
-            COMPREPLY=($(compgen -W "dashboard processes cpu io" -- "$cur"))
+            COMPREPLY=($(compgen -W "dashboard processes cpu io fleet" -- "$cur"))
             return 0 ;;
         --theme)
             COMPREPLY=($(compgen -W "default mono nord solarized gruvbox" -- "$cur"))

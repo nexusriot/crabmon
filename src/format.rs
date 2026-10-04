@@ -97,7 +97,12 @@ pub fn parse_size(s: &str) -> Option<u64> {
         'B' => (&s[..s.len() - 1], 1),
         _ => (s, 1),
     };
-    num.trim().parse::<f64>().ok().map(|v| (v * mult as f64) as u64)
+    let v: f64 = num.trim().parse().ok()?;
+    // A negative or non-finite size is a typo, not a quantity. `as u64`
+    // saturates both of them to 0, which turned `mem>-1M` into `mem>0` — a
+    // filter that silently matches every process — while the sibling
+    // `parse_duration` has always rejected the same mistake.
+    (v.is_finite() && v >= 0.0).then_some((v * mult as f64) as u64)
 }
 
 /// Parse `90`, `30s`, `5m`, `2h`, `3d` into seconds. Used by the filter
@@ -193,6 +198,18 @@ mod tests {
         assert_eq!(parse_size("2g"), Some(2 * 1024 * 1024 * 1024));
         assert_eq!(parse_size("nope"), None);
         assert_eq!(parse_size(""), None);
+    }
+
+    #[test]
+    fn a_size_that_is_not_one_is_rejected_rather_than_read_as_zero() {
+        // `mem>-1M` used to parse as `mem>0`, i.e. a filter that quietly
+        // matched the whole process table. `parse_duration` already refused
+        // the same mistake; the two have to agree.
+        assert_eq!(parse_size("-1M"), None);
+        assert_eq!(parse_size("-100"), None);
+        assert_eq!(parse_size("nan"), None);
+        assert_eq!(parse_size("inf"), None);
+        assert_eq!(parse_size("0"), Some(0), "zero is a real size");
     }
 
     #[test]

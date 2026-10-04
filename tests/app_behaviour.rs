@@ -1072,3 +1072,145 @@ fn descriptors_can_be_filtered_on_like_any_other_column() {
     retype(&mut a, "fd>1000 | thr>0");
     assert!(a.rows().len() > 1, "`|` widens rather than narrows");
 }
+
+// ------------------------------------------------------------------- fleet
+
+/// An `App` over several hosts, each a fixture with a recognisable hostname
+/// and CPU.
+fn fleet_app(hosts: &[(&str, f32)]) -> crabmon::App {
+    use crabmon::fleet::FleetSource;
+    use crabmon::metrics::{CpuSample, HostInfo, MetricSource, Snapshot};
+
+    let sources: Vec<(String, Box<dyn MetricSource>)> = hosts
+        .iter()
+        .map(|(name, cpu)| {
+            let snap = Snapshot {
+                host: HostInfo { hostname: (*name).into(), ..Default::default() },
+                cpu: CpuSample { per_core: vec![*cpu], freq_mhz: vec![] },
+                procs: vec![proc_row(1, None, name, *cpu, 1024)],
+                taken_at_unix: 1_700_000_000,
+                ..Default::default()
+            };
+            let source: Box<dyn MetricSource> = Box::new(FakeSource::single(snap));
+            ((*name).to_string(), source)
+        })
+        .collect();
+    crabmon::App::new(common::config(), Box::new(FleetSource::new(sources)))
+}
+
+#[test]
+fn a_single_host_run_has_no_fleet_and_no_fleet_layout_in_the_way() {
+    // Everything about `--remote box` has to go on working exactly as before,
+    // which means not gaining an extra stop in the Tab cycle.
+    let mut a = app();
+    assert!(a.fleet().is_empty());
+
+    let mut seen = Vec::new();
+    for _ in 0..8 {
+        a.on_key(code(KeyCode::Tab));
+        seen.push(a.cfg.layout);
+    }
+    assert!(
+        !seen.contains(&crabmon::ui::Layout::Fleet),
+        "Tab should not stop at a panel with nothing in it: {seen:?}"
+    );
+}
+
+#[test]
+fn the_fleet_cursor_moves_without_re_pointing_every_other_panel() {
+    // Moving the cursor is looking; Enter is choosing. A dashboard that
+    // followed the cursor would redraw every panel on every keypress.
+    let mut a = fleet_app(&[("web-1", 10.0), ("web-2", 20.0), ("db-1", 90.0)]);
+    a.cfg.layout = crabmon::ui::Layout::Fleet;
+    a.set_fleet_page(10, 3);
+
+    assert_eq!(a.fleet_selected, 0);
+    assert_eq!(a.fleet_target().as_deref(), Some("web-1"));
+
+    a.on_key(key('j'));
+    a.on_key(key('j'));
+    assert_eq!(a.fleet_selected, 2);
+    assert_eq!(a.fleet_target().as_deref(), Some("web-1"), "the chosen host has not changed");
+    assert_eq!(a.snap.host.hostname, "web-1");
+}
+
+#[test]
+fn enter_chooses_the_host_under_the_cursor_and_goes_back_to_the_dashboard() {
+    let mut a = fleet_app(&[("web-1", 10.0), ("db-1", 90.0)]);
+    a.cfg.layout = crabmon::ui::Layout::Fleet;
+    a.set_fleet_page(10, 2);
+
+    a.on_key(key('j'));
+    a.on_key(code(KeyCode::Enter));
+
+    assert_eq!(a.fleet_target().as_deref(), Some("db-1"));
+    assert_eq!(a.snap.host.hostname, "db-1");
+    assert_eq!(a.cfg.layout, crabmon::ui::Layout::Dashboard, "it opens the host it chose");
+    assert!(a.status_text().is_some_and(|s| s.contains("db-1")), "{:?}", a.status_text());
+}
+
+/// Charts are per-machine. Carrying one host's CPU history onto another's
+/// dashboard would draw a line that never happened anywhere.
+#[test]
+fn choosing_a_different_host_clears_the_history_rather_than_splicing_it() {
+    let mut a = fleet_app(&[("web-1", 10.0), ("db-1", 90.0)]);
+    a.cfg.layout = crabmon::ui::Layout::Fleet;
+    a.set_fleet_page(10, 2);
+    for _ in 0..4 {
+        a.tick();
+    }
+    assert!(!a.cpu_hist.is_empty(), "the first host should have some history");
+
+    a.on_key(key('j'));
+    a.on_key(code(KeyCode::Enter));
+    assert!(a.cpu_hist.is_empty(), "the new host starts with no history of its own");
+    assert_eq!(a.selected, 0);
+}
+
+#[test]
+fn the_fleet_cursor_cannot_be_walked_off_either_end() {
+    let mut a = fleet_app(&[("a", 1.0), ("b", 2.0)]);
+    a.cfg.layout = crabmon::ui::Layout::Fleet;
+    a.set_fleet_page(10, 2);
+
+    a.on_key(code(KeyCode::Home));
+    assert_eq!(a.fleet_selected, 0);
+    for _ in 0..20 {
+        a.on_key(key('j'));
+    }
+    assert_eq!(a.fleet_selected, 1, "the cursor stops on the last host");
+    for _ in 0..20 {
+        a.on_key(key('k'));
+    }
+    assert_eq!(a.fleet_selected, 0);
+    a.on_key(code(KeyCode::End));
+    assert_eq!(a.fleet_selected, 1);
+}
+
+#[test]
+fn w_toggles_the_fleet_table_and_says_so_when_there_is_no_fleet() {
+    let mut a = fleet_app(&[("a", 1.0), ("b", 2.0)]);
+    assert_eq!(a.cfg.layout, crabmon::ui::Layout::Dashboard);
+    a.on_key(key('W'));
+    assert_eq!(a.cfg.layout, crabmon::ui::Layout::Fleet);
+    a.on_key(key('W'));
+    assert_eq!(a.cfg.layout, crabmon::ui::Layout::Dashboard);
+
+    // On one machine it is not a silent no-op.
+    let mut a = app();
+    a.on_key(key('W'));
+    assert_eq!(a.cfg.layout, crabmon::ui::Layout::Dashboard);
+    assert!(a.status_text().is_some_and(|s| s.contains("--remote")), "{:?}", a.status_text());
+}
+
+/// Every host is sampled on every tick, so the table shows the machine that is
+/// in trouble before anyone has selected it.
+#[test]
+fn the_fleet_table_is_live_for_hosts_that_are_not_selected() {
+    let mut a = fleet_app(&[("web-1", 10.0), ("db-1", 90.0)]);
+    a.tick();
+    let hosts = a.fleet();
+    assert_eq!(hosts.len(), 2);
+    assert_eq!(hosts[1].snapshot.cpu.avg(), 90.0);
+    assert!(hosts.iter().all(|h| h.is_live()));
+}

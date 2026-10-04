@@ -5,6 +5,7 @@
 
 pub mod cpu;
 pub mod disks;
+pub mod fleet;
 pub mod gpu;
 pub mod header;
 pub mod mem;
@@ -34,7 +35,18 @@ pub enum Layout {
     Cpu,
     /// Network, disks and GPU.
     Io,
+    /// One row per host, when crabmon is watching several at once.
+    Fleet,
 }
+
+/// Every layout, in the order `Tab` cycles them.
+///
+/// A list rather than a hand-maintained one in the docs tests, for the reason
+/// `ALL_SORTS` and `ALL_ALERT_KINDS` exist: the test that checks the README
+/// names every layout was checking a copy, so `fleet` was added to the code
+/// and to the prose without anything verifying the two agreed.
+pub const ALL_LAYOUTS: [Layout; 5] =
+    [Layout::Dashboard, Layout::Processes, Layout::Cpu, Layout::Io, Layout::Fleet];
 
 impl Layout {
     pub fn name(self) -> &'static str {
@@ -43,6 +55,7 @@ impl Layout {
             Layout::Processes => "processes",
             Layout::Cpu => "cpu",
             Layout::Io => "io",
+            Layout::Fleet => "fleet",
         }
     }
 
@@ -52,9 +65,22 @@ impl Layout {
             "processes" | "procs" => Some(Layout::Processes),
             "cpu" => Some(Layout::Cpu),
             "io" => Some(Layout::Io),
+            "fleet" | "hosts" => Some(Layout::Fleet),
             _ => None,
         }
     }
+}
+
+/// Every panel `panel_order` can name, in the default order.
+///
+/// A list rather than seven string literals buried in a `match`, for the same
+/// reason `ALL_SORTS` and `ALL_ALERT_KINDS` exist: the config validator and
+/// the docs tests both need to know what the real set is, and a name that only
+/// appears inside the draw code is a name nothing can check.
+pub const SIDE_PANELS: [&str; 7] = ["net", "psi", "sensors", "disks", "power", "gpu", "cgroup"];
+
+pub fn is_side_panel(name: &str) -> bool {
+    SIDE_PANELS.contains(&name)
 }
 
 pub fn block<'a>(app: &App, title: impl Into<String>) -> Block<'a> {
@@ -91,6 +117,7 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
         Layout::Processes => procs::draw(f, chunks[1], app),
         Layout::Cpu => cpu::draw_detail(f, chunks[1], app),
         Layout::Io => draw_io(f, chunks[1], app),
+        Layout::Fleet => fleet::draw(f, chunks[1], app),
     }
     header::draw_status(f, chunks[2], app);
 
@@ -220,16 +247,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn layout_names_round_trip() {
-        for l in [Layout::Dashboard, Layout::Processes, Layout::Cpu, Layout::Io] {
-            assert_eq!(Layout::parse(l.name()), Some(l));
+    fn every_layout_is_in_the_list_and_parses_from_its_own_name() {
+        for l in ALL_LAYOUTS {
+            assert_eq!(Layout::parse(l.name()), Some(l), "{}", l.name());
         }
+        // ...and cycling visits all of them, which is what makes the list the
+        // real set rather than a convenient subset.
+        let mut seen = vec![ALL_LAYOUTS[0]];
+        while seen.len() < ALL_LAYOUTS.len() {
+            let next = seen[seen.len() - 1].next();
+            assert!(!seen.contains(&next), "the cycle is shorter than the list");
+            seen.push(next);
+        }
+        assert_eq!(seen[seen.len() - 1].next(), ALL_LAYOUTS[0], "the cycle must close");
+    }
+
+    #[test]
+    fn layout_names_round_trip() {
         assert_eq!(Layout::parse("nope"), None);
+        // The aliases, which the round trip above cannot reach.
+        assert_eq!(Layout::parse("dash"), Some(Layout::Dashboard));
+        assert_eq!(Layout::parse("procs"), Some(Layout::Processes));
+        assert_eq!(Layout::parse("hosts"), Some(Layout::Fleet));
     }
 
     #[test]
     fn cycling_layouts_forward_then_back_returns_to_the_start() {
-        for l in [Layout::Dashboard, Layout::Processes, Layout::Cpu, Layout::Io] {
+        for l in ALL_LAYOUTS {
             assert_eq!(l.next().prev(), l);
         }
     }

@@ -11,15 +11,18 @@ _crabmon() {
         '--remote-command[command to run on the remote host]:command:' \
         '--serve[serve Prometheus metrics on ADDR]:address:' \
         '--stream[print one JSON snapshot per line forever]' \
+        '--alerts[with --serve/--stream: evaluate alert rules headlessly]' \
+        '--columns[process-table columns, comma separated]:columns:' \
         '--diff[compare two snapshots, or one recording end to end]:file:_files' \
         '--watch[block until processes match QUERY, then exit 1]:query:' \
+        '--watch-rule[block until a metric condition holds, e.g. cpu>=90]:rule:' \
         '--watch-for[require the match to hold this many seconds]:seconds:' \
         '--watch-timeout[give up after this many seconds; 0 waits forever]:seconds:' \
         '(-a --ascending)'{-a,--ascending}'[sort ascending]' \
         '(-d --descending)'{-d,--descending}'[sort descending (the default)]' \
         '(-f --filter)'{-f,--filter}'[initial process filter]:query:' \
         '(-t --tree)'{-t,--tree}'[start in tree view]' \
-        '(-l --layout)'{-l,--layout}'[initial layout]:layout:(dashboard processes cpu io)' \
+        '(-l --layout)'{-l,--layout}'[initial layout]:layout:(dashboard processes cpu io fleet)' \
         '--theme[colour theme]:theme:(default mono nord solarized gruvbox)' \
         '--no-color[disable colour]' \
         '--no-mouse[do not capture mouse events]' \

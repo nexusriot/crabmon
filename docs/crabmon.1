@@ -1,4 +1,4 @@
-.TH CRABMON 1 "2026-09-29" "crabmon 0.8.0" "User Commands"
+.TH CRABMON 1 "2026-10-04" "crabmon 0.9.0" "User Commands"
 .SH NAME
 crabmon \- terminal system monitor
 .SH SYNOPSIS
@@ -44,7 +44,8 @@ Initial process filter. See \fBFILTER LANGUAGE\fR.
 Start in process-tree view.
 .TP
 .BR \-l ", " \-\-layout " " \fINAME\fR
-Initial layout: \fBdashboard\fR, \fBprocesses\fR, \fBcpu\fR or \fBio\fR.
+Initial layout: \fBdashboard\fR, \fBprocesses\fR, \fBcpu\fR, \fBio\fR or
+\fBfleet\fR.
 .TP
 .B \-\-theme " " \fINAME\fR
 Colour theme: \fBdefault\fR, \fBmono\fR, \fBnord\fR, \fBsolarized\fR or
@@ -74,6 +75,14 @@ Use an alternate config file.
 Aggregate the process table: \fBnone\fR, \fBservice\fR, \fBcontainer\fR or
 \fBuser\fR.
 .TP
+.B \-\-columns " " \fILIST\fR
+Process-table columns, comma separated, overriding \fB[procs] columns\fR —
+e.g. \fBpid,user,cpu,mem,name\fR. Known columns: \fBmark\fR, \fBpid\fR,
+\fBuser\fR, \fBstate\fR, \fBcpu\fR, \fBtrend\fR, \fBmem\fR, \fBvirt\fR,
+\fBthr\fR, \fBni\fR, \fBfd\fR, \fBdisk\fR, \fBtime\fR, \fBports\fR,
+\fBname\fR. An unknown name is an error rather than a column quietly missing
+from the table. \fBname\fR is always drawn last.
+.TP
 .B \-\-record " " \fIPATH\fR
 Record every sample to a JSON Lines file, replacing any file already at that
 path. See \fBRECORDINGS\fR.
@@ -81,9 +90,15 @@ path. See \fBRECORDINGS\fR.
 .B \-\-replay " " \fIPATH\fR
 Drive the interface from a recording instead of sampling this host.
 .TP
-.B \-\-remote " " \fITARGET\fR
+.B \-\-remote " " \fITARGET\fR[,\fITARGET\fR...]
 Monitor \fITARGET\fR over SSH. crabmon must be installed on the far end and
 SSH must work non-interactively; the refresh rate is bounded by the round trip.
+.PP
+Several comma-separated targets open the \fBfleet\fR layout: one row per host,
+sampled concurrently on a worker each, so one unreachable machine costs the
+others nothing. \fBEnter\fR points the rest of the interface at the host under
+the cursor; \fBW\fR returns to the table. A single target behaves exactly as it
+always has, with no fleet table and no extra stop in the \fBTab\fR cycle.
 .TP
 .B \-\-remote\-command " " \fICMD\fR
 Command to run on the remote host. Defaults to
@@ -103,6 +118,15 @@ Print one JSON snapshot per line, forever, trimmed by \fB[record]\fR exactly as
 a recording is. This is what \fB\-\-remote\fR runs on the far end, and it is
 usable on its own as a collector. Samples this host only.
 .TP
+.B \-\-alerts
+With \fB\-\-serve\fR or \fB\-\-stream\fR, evaluate the \fB[[alert]]\fR rules
+on every sample: run the hook commands, write flight recordings, and — under
+\fB\-\-serve\fR — export each rule as \fBcrabmon_alert_active\fR,
+\fBcrabmon_alert_value\fR and \fBcrabmon_alert_threshold\fR. Without it those
+rules run only in the full-screen interface, which means the flight recorder
+depends on someone watching at the moment the incident happens. Notices go to
+standard error, so \fB\-\-stream\fR's output stays one frame per line.
+.TP
 .B \-\-diff " " \fIA\fR " " [\fIB\fR]
 Compare two snapshots and print what changed: CPU, load, memory, swap,
 per-filesystem usage, and the processes that started, exited and moved. Each
@@ -118,6 +142,20 @@ Sample headlessly until processes match \fIQUERY\fR (see \fBFILTER LANGUAGE\fR),
 then print them and exit \fB1\fR. Exits \fB0\fR if \fB\-\-watch\-timeout\fR
 elapses first. A match is the non-zero exit, so \fB||\fR runs on a match and
 \fB&&\fR on a clean run.
+.TP
+.B \-\-watch\-rule " " \fIEXPR\fR
+As \fB\-\-watch\fR, but for a measurement rather than a process list:
+\fIEXPR\fR is \fIkind\fR[:\fItarget\fR]\fIop\fR\fIvalue\fR, where
+\fIkind\fR is any \fB[[alert]]\fR kind. \fBcpu>=90\fR, \fBpsi:io>20\fR,
+\fBdisk:/var>=95\fR, \fBtemp>=80\fR, \fBfd>=90\fR, \fBnet>=1M\fR,
+\fBproc:nginx<1\fR.
+.PP
+\fB>\fR and \fB>=\fR both mean at-or-over and \fB<\fR means strictly under,
+which is how an \fB[[alert]]\fR compares; \fB<=\fR is refused rather than
+quietly read as \fB<\fR. The operator is taken from the right, so a
+\fBproc\fR query may contain one of its own: \fBproc:cpu>5<1\fR is "fewer
+than one process over 5% CPU". A rule that cannot be parsed is an error, not a
+watch that blocks until its timeout and then reports nothing happened.
 .TP
 .B \-\-watch\-for " " \fISECS\fR
 Require the match to hold this many consecutive seconds. A condition that
@@ -142,6 +180,10 @@ Move the selection.
 .B Enter
 Open the process detail pane, or — in the grouped view — open the selected
 group, filtering the process table down to the processes inside it.
+.TP
+.B W
+Show the fleet table, or go back to the dashboard from it. Only meaningful
+when crabmon was started with several \fB\-\-remote\fR targets.
 .TP
 .B /
 Filter processes. \fBEsc\fR clears the filter.

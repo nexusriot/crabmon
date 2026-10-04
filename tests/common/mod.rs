@@ -55,6 +55,7 @@ pub fn proc_row(pid: u32, ppid: Option<u32>, name: &str, cpu: f32, mem: u64) -> 
         fd_limit: None,
         service: Some(format!("{name}.service")),
         container: None,
+        netns: None,
         cmd: format!("/usr/bin/{name} --flag"),
         exe: format!("/usr/bin/{name}"),
         cwd: "/home/vlad".into(),
@@ -223,6 +224,7 @@ pub fn snapshot() -> Snapshot {
                 }),
             }),
         },
+        netns: Vec::new(),
         power: PowerSample {
             batteries: vec![Battery {
                 name: "BAT0".into(),

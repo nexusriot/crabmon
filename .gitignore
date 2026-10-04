@@ -19,13 +19,21 @@
 /crabmon-*.json
 /crabmon-*.csv
 
-# Session recordings from `--record`.
+# Session recordings from `--record`, and the flight recorder's dumps — with
+# `[record] flight_dir` unset, those land in the working directory too, named
+# by `record::dump_name`.
 *.jsonl
 
 # Action log, when `[audit] path` points somewhere relative, or when no
 # platform state directory can be resolved and it falls back to `./crabmon/`.
 /actions.log
 /crabmon/
+
+# `cargo vendor`, which docs/DESIGN.md names as the way to close the last
+# network dependency in the e2e image build. 446 MB of dependencies is not
+# something to drop into a review by accident. `.cargo/` is deliberately not
+# ignored: a `config.toml` there is usually meant to be committed.
+/vendor/
 
 # Profiling output
 perf.data*

@@ -12,8 +12,8 @@ use super::diskstats::{self, DeviceRates, DiskCounters, DiskStats};
 use super::fds::LimitCache;
 use super::procgroup::CgroupPaths;
 use super::{
-    cgroup, fds, gpu, meminfo, netclass, power, procgroup, psi, rate, CpuSample, DiskRow, GpuInfo,
-    HostInfo, MemSample, MetricSource, NetIface, ProcRow, Sensor, Snapshot,
+    cgroup, fds, gpu, identity, meminfo, netclass, netns, power, procgroup, psi, rate, CpuSample,
+    DiskRow, GpuInfo, HostInfo, MemSample, MetricSource, NetIface, ProcRow, Sensor, Snapshot,
 };
 
 /// Device lists (mounted filesystems, interfaces, sensors) are rescanned on this
@@ -48,6 +48,18 @@ pub struct SysinfoSource {
     /// pid → RLIMIT_NOFILE, on the same "read once per process" terms as the
     /// cgroup path: a limit is set at exec and almost never changed after.
     fd_limits: LimitCache,
+    /// pid → what it exec'd into, for the processes whose name the sampler is
+    /// still reporting from before the hand-off.
+    execs: identity::ExecCache,
+    /// pid → network namespace, cached on the same "read once per process"
+    /// terms as the cgroup path: a process is put in its namespace at start
+    /// and practically never moves.
+    netns_of: HashMap<u32, (u64, Option<u64>)>,
+    /// Cumulative per-namespace byte counters, for the rates.
+    netns: netns::NetnsRates,
+    /// The namespace crabmon itself is in, so the host's own traffic is not
+    /// reported as another container's.
+    host_netns: Option<u64>,
     prev_rapl_uj: Option<u64>,
 
     virtual_prefixes: Vec<String>,
@@ -163,6 +175,10 @@ impl SysinfoSource {
             cgroup_paths: CgroupPaths::default(),
             nice_cache: HashMap::new(),
             fd_limits: LimitCache::default(),
+            execs: identity::ExecCache::default(),
+            netns_of: HashMap::new(),
+            netns: netns::NetnsRates::default(),
+            host_netns: netns::id_of(std::process::id()),
             prev_rapl_uj: None,
             virtual_prefixes,
             use_nvidia_smi,
@@ -235,14 +251,41 @@ impl SysinfoSource {
             } else {
                 (None, None)
             };
+            let netns = match self.netns_of.get(&pid_u) {
+                Some((seen, ns)) if *seen == start_time => *ns,
+                _ => {
+                    let ns = netns::id_of(pid_u);
+                    self.netns_of.insert(pid_u, (start_time, ns));
+                    ns
+                }
+            };
             let cgroup_path = self.cgroup_paths.get(pid_u, start_time).map(str::to_string);
             let service = cgroup_path.as_deref().and_then(procgroup::service_of);
             let container = cgroup_path.as_deref().and_then(procgroup::container_of);
 
+            // What the process is running *now*. `exec` keeps the PID and the
+            // start time, and sysinfo reads a process's name only when it
+            // first sees the PID and treats an unchanged start time as
+            // "nothing to re-read" — so a wrapper that execs the real program
+            // kept the wrapper's name, argv, exe and cwd for as long as it
+            // ran. `/proc/<pid>/comm` is one tiny file and always current, so
+            // it is checked for every process on every tick; the heavier
+            // re-reads happen only when it disagrees, and are remembered.
+            let identity::Identity { name, cmd, exe, cwd } = self.execs.resolve(
+                pid_u,
+                start_time,
+                identity::Identity {
+                    name: p.name().to_string(),
+                    cmd: p.cmd().join(" "),
+                    exe: p.exe().map(|e| e.to_string_lossy().to_string()).unwrap_or_default(),
+                    cwd: p.cwd().map(|c| c.to_string_lossy().to_string()).unwrap_or_default(),
+                },
+            );
+
             rows.push(ProcRow {
                 pid: pid_u,
                 ppid: p.parent().map(|p| p.as_u32()),
-                name: p.name().to_string(),
+                name,
                 cpu: p.cpu_usage(),
                 mem: p.memory(),
                 virt: p.virtual_memory(),
@@ -259,9 +302,10 @@ impl SysinfoSource {
                 fd_limit,
                 service,
                 container,
-                cmd: p.cmd().join(" "),
-                exe: p.exe().map(|e| e.to_string_lossy().to_string()).unwrap_or_default(),
-                cwd: p.cwd().map(|c| c.to_string_lossy().to_string()).unwrap_or_default(),
+                netns,
+                cmd,
+                exe,
+                cwd,
             });
         }
 
@@ -271,7 +315,30 @@ impl SysinfoSource {
         self.cgroup_paths.retain_live(&|pid| seen.contains(&pid));
         self.nice_cache.retain(|pid, _| seen.contains(pid));
         self.fd_limits.retain_live(&|pid| seen.contains(&pid));
+        self.execs.retain_live(&|pid| seen.contains(&pid));
+        self.netns_of.retain(|pid, _| seen.contains(pid));
         rows
+    }
+
+    /// `(name, cmd, exe, cwd)` for one process, correcting the sampler's
+    /// cached copies when the process has exec'd since they were taken.
+    ///
+    /// Split out so the exec check is one place rather than four, and so the
+    /// ordinary path — the name is what it always was — is visibly the cheap
+    /// one: a single small read, and nothing else.
+    /// Per-namespace throughput, read once per namespace rather than once per
+    /// process: the counters belong to the namespace, and every process in a
+    /// container reports the same ones.
+    fn collect_netns(&mut self, procs: &[ProcRow], secs: f64) -> Vec<netns::NetNamespace> {
+        let members: Vec<netns::Member<'_>> = procs
+            .iter()
+            .map(|p| netns::Member {
+                pid: p.pid,
+                netns: p.netns,
+                container: p.container.as_deref(),
+            })
+            .collect();
+        self.netns.collect(&members, self.host_netns, secs, netns::counters_of)
     }
 
     fn collect_nets(&mut self, secs: f64) -> Vec<NetIface> {
@@ -419,18 +486,22 @@ impl MetricSource for SysinfoSource {
             detail: meminfo::read(),
         };
 
+        let procs = self.collect_procs(secs);
+        let netns = self.collect_netns(&procs, secs);
+
         Snapshot {
             host,
             cpu,
             mem,
             cgroup: cgroup::read().filter(|c| c.is_interesting()),
-            procs: self.collect_procs(secs),
+            procs,
             nets: self.collect_nets(secs),
             disks: self.collect_disks(secs),
             sensors: self.collect_sensors(),
             gpus: self.collect_gpus(),
             psi: psi::read(),
             power: power::read(&mut self.prev_rapl_uj, secs),
+            netns,
             taken_at_unix: now_unix(),
         }
     }
@@ -451,8 +522,11 @@ pub fn send_signal(_pid: u32, _sig: ()) -> std::io::Result<()> {
 /// Change a process's nice value. Unix only.
 #[cfg(unix)]
 pub fn set_priority(pid: u32, nice: i32) -> std::io::Result<()> {
+    // `pid as _`, not `pid as i32`: the `who` argument is `id_t` on Linux and
+    // `int` on the BSDs, so naming either one breaks the build on the other.
+    //
     // SAFETY: setpriority takes plain integers and reports failure via errno.
-    let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, pid, nice) };
+    let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as _, nice) };
     if rc == -1 {
         return Err(std::io::Error::last_os_error());
     }
@@ -488,7 +562,7 @@ pub fn get_priority(pid: u32) -> Option<i32> {
 #[cfg(all(unix, not(target_os = "linux")))]
 pub fn get_priority(pid: u32) -> Option<i32> {
     // SAFETY: getpriority takes plain integers and touches no Rust state.
-    let v = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid) };
+    let v = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid as _) };
     (v != -1).then_some(v)
 }
 

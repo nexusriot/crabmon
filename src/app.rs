@@ -17,7 +17,7 @@ use crate::export::{self, ExportFormat};
 use crate::filter::{self, Filter};
 use crate::history::History;
 use crate::metrics::procgroup::GroupBy;
-use crate::metrics::{sockets, MetricSource, ProcRow, Snapshot};
+use crate::metrics::{fds, sockets, MetricSource, ProcRow, Snapshot};
 use crate::sort::{self, SortBy};
 use crate::theme::Theme;
 use crate::tree::{self, TreeRow};
@@ -162,6 +162,13 @@ pub struct App {
     /// Bumped once per sample, so the port lookup runs per tick rather than
     /// per draw — the UI redraws several times a second even when idle.
     generation: u64,
+    /// Selection and viewport of the fleet table, kept apart from the process
+    /// table's and the grouped view's for the same reason they are kept apart
+    /// from each other.
+    pub fleet_selected: usize,
+    pub fleet_scroll: usize,
+    fleet_page: usize,
+    fleet_len: usize,
     /// Selection and viewport of the grouped view, kept apart from the process
     /// table's so switching back and forth does not lose either.
     pub group_selected: usize,
@@ -179,6 +186,9 @@ pub struct App {
     proc_hist: HashMap<u32, ProcSeries>,
     /// Sockets of the process whose detail pane is open, fetched on demand.
     pub detail_sockets: Vec<sockets::Socket>,
+    /// Open descriptors of the same process. `None` when its fd table could
+    /// not be read, which the pane says rather than showing an empty list.
+    pub detail_files: Option<Vec<fds::OpenFile>>,
     /// Where actions are logged. `None` disables the audit log.
     pub audit_path: Option<PathBuf>,
     /// Newest-first audit entries, loaded when the viewer opens.
@@ -234,6 +244,10 @@ impl App {
             ports: HashMap::new(),
             ports_at: (0, Vec::new()),
             generation: 0,
+            fleet_selected: 0,
+            fleet_scroll: 0,
+            fleet_page: 1,
+            fleet_len: 0,
             group_selected: 0,
             group_scroll: 0,
             group_page: 1,
@@ -244,6 +258,7 @@ impl App {
             stale: false,
             proc_hist: HashMap::new(),
             detail_sockets: Vec::new(),
+            detail_files: None,
             audit_path: None,
             audit_entries: Vec::new(),
             rows: Vec::new(),
@@ -395,9 +410,111 @@ impl App {
         self.clamp_scroll();
     }
 
+    // ---------------------------------------------------------------- fleet
+
+    /// Every host crabmon is watching. Empty for a single-machine run, which
+    /// is what keeps the fleet layout out of everyone else's way.
+    pub fn fleet(&self) -> Vec<crate::fleet::FleetHost> {
+        self.source.fleet()
+    }
+
+    pub fn in_fleet(&self) -> bool {
+        self.cfg.layout == Layout::Fleet
+    }
+
+    /// The host the rest of the program is drawing — which is not necessarily
+    /// the row the fleet cursor is on, because moving the cursor must not
+    /// re-point every other panel at a different machine on the way past.
+    pub fn fleet_target(&self) -> Option<String> {
+        let hosts = self.fleet();
+        hosts.get(self.source.selected_host()).map(|h| h.target.clone())
+    }
+
+    /// Told by the fleet table how many rows it can show, and how many there
+    /// are, so the selection and viewport stay inside it.
+    pub fn set_fleet_page(&mut self, page: usize, len: usize) {
+        self.fleet_page = page.max(1);
+        self.fleet_len = len;
+        self.clamp_fleet_scroll();
+    }
+
+    fn clamp_fleet_scroll(&mut self) {
+        if self.fleet_len == 0 {
+            self.fleet_selected = 0;
+            self.fleet_scroll = 0;
+            return;
+        }
+        self.fleet_selected = self.fleet_selected.min(self.fleet_len - 1);
+        if self.fleet_selected < self.fleet_scroll {
+            self.fleet_scroll = self.fleet_selected;
+        } else if self.fleet_selected >= self.fleet_scroll + self.fleet_page {
+            self.fleet_scroll = self.fleet_selected + 1 - self.fleet_page;
+        }
+        self.fleet_scroll = self.fleet_scroll.min(self.fleet_len.saturating_sub(self.fleet_page));
+    }
+
+    fn move_fleet_selection(&mut self, delta: isize) {
+        if self.fleet_len == 0 {
+            return;
+        }
+        let next = (self.fleet_selected as isize + delta).clamp(0, self.fleet_len as isize - 1);
+        self.fleet_selected = next as usize;
+        self.clamp_fleet_scroll();
+    }
+
+    /// Point the rest of the program at the host under the cursor, and go
+    /// back to the dashboard to look at it.
+    ///
+    /// The histories are per-source and the selected process is per-host, so
+    /// both are cleared: carrying one machine's CPU chart onto another's
+    /// dashboard would draw a line that never happened.
+    fn open_host(&mut self) {
+        let hosts = self.fleet();
+        let Some(host) = hosts.get(self.fleet_selected) else { return };
+        let target = host.target.clone();
+        self.source.select_host(self.fleet_selected);
+        self.snap = self.source.peek().unwrap_or_else(|| host.snapshot.clone());
+        self.reset_histories();
+        self.selected = 0;
+        self.selected_pid = None;
+        self.tagged.clear();
+        self.pinned.clear();
+        self.cfg.layout = Layout::Dashboard;
+        self.rebuild_view();
+        self.set_status(format!("watching {target}"));
+    }
+
+    /// Drop every time series. Used when the numbers start describing a
+    /// different machine.
+    fn reset_histories(&mut self) {
+        let hist = || History::new(self.cfg.history_len);
+        self.cpu_hist = hist();
+        self.per_core_hist.clear();
+        self.mem_hist = hist();
+        self.swap_hist = hist();
+        self.net_rx_hist = hist();
+        self.net_tx_hist = hist();
+        self.disk_r_hist = hist();
+        self.disk_w_hist = hist();
+        self.proc_hist.clear();
+    }
+
+    /// The next layout, skipping the fleet table when there is no fleet.
+    ///
+    /// Cycling with Tab should not stop at a panel that has nothing to show;
+    /// `--layout fleet` still reaches it, and says why it is empty.
+    fn step_layout(&self, forward: bool) -> Layout {
+        let next = |l: Layout| if forward { l.next() } else { l.prev() };
+        let mut candidate = next(self.cfg.layout);
+        if candidate == Layout::Fleet && self.fleet().is_empty() {
+            candidate = next(candidate);
+        }
+        candidate
+    }
+
     /// The aggregate table shown when grouping is active.
     pub fn groups(&self) -> Vec<GroupRow> {
-        group_rows(self.rows(), self.cfg.group_by)
+        group_rows(self.rows(), self.cfg.group_by, &self.snap)
     }
 
     pub fn grouped(&self) -> bool {
@@ -539,6 +656,10 @@ impl App {
     }
 
     pub fn move_selection(&mut self, delta: isize) {
+        if self.in_fleet() {
+            self.move_fleet_selection(delta);
+            return;
+        }
         if self.grouped() {
             self.move_group_selection(delta);
             return;
@@ -622,7 +743,11 @@ impl App {
             Mode::Help => crate::ui::popups::KEYS.len(),
             Mode::Alerts => self.alerts.rules.len() + self.alerts.history_len(),
             Mode::AuditLog => self.audit_entries.len(),
-            Mode::Detail => crate::ui::popups::DETAIL_FIELDS + self.detail_sockets.len(),
+            Mode::Detail => {
+                crate::ui::popups::DETAIL_FIELDS
+                    + self.detail_sockets.len()
+                    + self.detail_files.as_ref().map_or(0, Vec::len)
+            }
             _ => 0,
         }
     }
@@ -650,14 +775,18 @@ impl App {
             KeyCode::PageDown => self.move_selection(self.page as isize),
             KeyCode::PageUp => self.move_selection(-(self.page as isize)),
             KeyCode::Home => {
-                if self.grouped() {
+                if self.in_fleet() {
+                    self.move_fleet_selection(isize::MIN / 2);
+                } else if self.grouped() {
                     self.move_group_selection(isize::MIN / 2);
                 } else {
                     self.select(0);
                 }
             }
             KeyCode::End => {
-                if self.grouped() {
+                if self.in_fleet() {
+                    self.move_fleet_selection(isize::MAX / 2);
+                } else if self.grouped() {
                     self.move_group_selection(isize::MAX / 2);
                 } else {
                     self.select(self.rows.len().saturating_sub(1));
@@ -685,11 +814,11 @@ impl App {
                 self.rebuild_view();
             }
             KeyCode::Tab => {
-                self.cfg.layout = self.cfg.layout.next();
+                self.cfg.layout = self.step_layout(true);
                 self.set_status(format!("layout: {}", self.cfg.layout.name()));
             }
             KeyCode::BackTab => {
-                self.cfg.layout = self.cfg.layout.prev();
+                self.cfg.layout = self.step_layout(false);
                 self.set_status(format!("layout: {}", self.cfg.layout.name()));
             }
             KeyCode::Char('v') => {
@@ -757,6 +886,17 @@ impl App {
                 self.group_scroll = 0;
                 self.set_status(format!("group by {}", self.cfg.group_by.label()));
             }
+            KeyCode::Char('W') => {
+                if self.fleet().is_empty() {
+                    self.set_status("not a fleet: start with --remote host-a,host-b,…");
+                } else {
+                    self.cfg.layout = match self.in_fleet() {
+                        true => Layout::Dashboard,
+                        false => Layout::Fleet,
+                    };
+                    self.set_status(format!("layout: {}", self.cfg.layout.name()));
+                }
+            }
             KeyCode::Char('y') => self.yank(),
             KeyCode::Char('L') => self.open_audit_log(),
 
@@ -783,12 +923,16 @@ impl App {
             KeyCode::Char('-') | KeyCode::Char('_') => self.nudge_refresh(200),
 
             KeyCode::Enter => {
-                if self.grouped() {
+                if self.in_fleet() {
+                    self.open_host();
+                } else if self.grouped() {
                     self.open_group();
                 } else if let Some(pid) = self.selected_row().map(|r| r.pid) {
                     // Fetched here rather than every tick: joining /proc/net
-                    // against a process's fd table is only cheap for one PID.
+                    // against a process's fd table, and resolving every
+                    // descriptor it holds, are only cheap for one PID.
                     self.detail_sockets = sockets::for_pid(pid);
+                    self.detail_files = fds::open_files(pid);
                     self.open_popup(Mode::Detail);
                 }
             }
@@ -1262,6 +1406,21 @@ impl App {
         }
     }
 
+    /// Run the side effects the last `tick` produced: hook commands, and the
+    /// flight recorder's view of the frame. Returns lines for the status bar.
+    ///
+    /// Split from `tick` because this is the half that spawns processes and
+    /// writes files, and `App` is otherwise free of both — a test can drive a
+    /// whole incident without a hook ever running.
+    pub fn drain_alert_side_effects(
+        &mut self,
+        flight: Option<&mut crate::record::FlightRecorder>,
+    ) -> Vec<String> {
+        let mut notes = crate::supervisor::drain(&mut self.alerts, flight, &self.snap);
+        notes.extend(crate::supervisor::spawn_hooks(&self.alerts.take_commands()));
+        notes
+    }
+
     pub fn persist(&self) {
         if let Some(path) = &self.config_path {
             crate::config::save_to(path, &self.cfg);
@@ -1322,18 +1481,30 @@ pub struct GroupRow {
     pub cpu: f32,
     pub mem: u64,
     pub io_bps: f64,
+    /// Network throughput of the namespaces this group's processes are in.
+    ///
+    /// `None` when none of them reports a namespace — the platform does not
+    /// expose one, or the group is a set of host processes sharing the host's,
+    /// whose traffic the network panel already shows. A group made of one
+    /// container has exactly one namespace, which is what makes this the
+    /// honest per-container figure that per-process bytes cannot be.
+    pub net_bps: Option<(f64, f64)>,
 }
 
 /// Aggregate processes by systemd unit, container or user.
 ///
 /// Processes with no value for the chosen key are collected under `-`, so the
 /// totals still add up to the machine.
-pub fn group_rows(rows: &[ProcRow], by: GroupBy) -> Vec<GroupRow> {
+pub fn group_rows(rows: &[ProcRow], by: GroupBy, snap: &Snapshot) -> Vec<GroupRow> {
     if by == GroupBy::None {
         return Vec::new();
     }
     let mut order: Vec<String> = Vec::new();
     let mut acc: HashMap<String, GroupRow> = HashMap::new();
+    // The namespaces each group's processes are in, as a set: every process in
+    // a container reports the same counters, so adding them per process would
+    // multiply the container's traffic by its process count.
+    let mut namespaces: HashMap<String, HashSet<u64>> = HashMap::new();
     for p in rows {
         let key = match by {
             GroupBy::Service => p.service.clone(),
@@ -1343,14 +1514,22 @@ pub fn group_rows(rows: &[ProcRow], by: GroupBy) -> Vec<GroupRow> {
         }
         .unwrap_or_else(|| "-".to_string());
 
+        if let Some(ns) = p.netns {
+            namespaces.entry(key.clone()).or_default().insert(ns);
+        }
         let entry = acc.entry(key.clone()).or_insert_with(|| {
             order.push(key.clone());
-            GroupRow { name: key, procs: 0, cpu: 0.0, mem: 0, io_bps: 0.0 }
+            GroupRow { name: key, procs: 0, cpu: 0.0, mem: 0, io_bps: 0.0, net_bps: None }
         });
         entry.procs += 1;
         entry.cpu += p.cpu;
         entry.mem = entry.mem.saturating_add(p.mem);
         entry.io_bps += p.io_bps();
+    }
+    for (key, ids) in &namespaces {
+        if let Some(entry) = acc.get_mut(key) {
+            entry.net_bps = Some(snap.netns_totals(ids));
+        }
     }
     let mut out: Vec<GroupRow> = order.into_iter().filter_map(|k| acc.remove(&k)).collect();
     out.sort_by(|a, b| {
@@ -1380,15 +1559,17 @@ impl Layout {
             Layout::Dashboard => Layout::Processes,
             Layout::Processes => Layout::Cpu,
             Layout::Cpu => Layout::Io,
-            Layout::Io => Layout::Dashboard,
+            Layout::Io => Layout::Fleet,
+            Layout::Fleet => Layout::Dashboard,
         }
     }
     pub fn prev(self) -> Layout {
         match self {
-            Layout::Dashboard => Layout::Io,
+            Layout::Dashboard => Layout::Fleet,
             Layout::Processes => Layout::Dashboard,
             Layout::Cpu => Layout::Processes,
             Layout::Io => Layout::Cpu,
+            Layout::Fleet => Layout::Io,
         }
     }
 }
@@ -1435,7 +1616,7 @@ mod tests {
             ProcRow { service: Some("web.service".into()), ..proc(2, "nginx", 7.0, 200) },
             ProcRow { service: Some("db.service".into()), ..proc(3, "postgres", 40.0, 900) },
         ];
-        let groups = group_rows(&rows, GroupBy::Service);
+        let groups = group_rows(&rows, GroupBy::Service, &Snapshot::default());
 
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].name, "db.service", "40% should outrank 12%");
@@ -1454,7 +1635,7 @@ mod tests {
             proc(2, "kworker/0:1", 1.5, 0),
             proc(3, "ksoftirqd/0", 0.5, 0),
         ];
-        let groups = group_rows(&rows, GroupBy::Service);
+        let groups = group_rows(&rows, GroupBy::Service, &Snapshot::default());
 
         assert_eq!(groups.len(), 2);
         let placeholder = groups.iter().find(|g| g.name == "-").expect("no placeholder group");
@@ -1468,8 +1649,8 @@ mod tests {
     #[test]
     fn grouping_is_off_until_a_key_is_chosen() {
         let rows = vec![proc(1, "nginx", 5.0, 100)];
-        assert!(group_rows(&rows, GroupBy::None).is_empty());
-        assert!(group_rows(&[], GroupBy::Service).is_empty());
+        assert!(group_rows(&rows, GroupBy::None, &Snapshot::default()).is_empty());
+        assert!(group_rows(&[], GroupBy::Service, &Snapshot::default()).is_empty());
     }
 
     #[test]
@@ -1484,10 +1665,70 @@ mod tests {
             ProcRow { user: Some("root".into()), ..proc(2, "sshd", 1.0, 50) },
         ];
 
-        let names = |by| group_rows(&rows, by).into_iter().map(|g| g.name).collect::<Vec<_>>();
+        let names = |by| {
+            group_rows(&rows, by, &Snapshot::default())
+                .into_iter()
+                .map(|g| g.name)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(names(GroupBy::Service), vec!["web.service", "-"]);
         assert_eq!(names(GroupBy::Container), vec!["c0ffee", "-"]);
         assert_eq!(names(GroupBy::User), vec!["www-data", "root"]);
+    }
+
+    /// The kernel accounts network bytes to a namespace, not to a process, so
+    /// every process in a container reports the *same* counters. Adding them
+    /// up per process would multiply a container's traffic by however many
+    /// processes it happens to run — a four-process container would read as
+    /// having moved four times what it did.
+    #[test]
+    fn a_container_network_total_counts_its_namespace_once_not_once_per_process() {
+        use crate::metrics::NetNamespace;
+
+        let in_ns = |pid: u32, ns: u64, c: &str| ProcRow {
+            container: Some(c.into()),
+            netns: Some(ns),
+            ..proc(pid, "app", 1.0, 10)
+        };
+        let snap = Snapshot {
+            netns: vec![
+                NetNamespace { id: 42, rx_bps: 1000.0, tx_bps: 250.0, ..Default::default() },
+                NetNamespace { id: 43, rx_bps: 7.0, tx_bps: 7.0, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let rows = vec![
+            in_ns(1, 42, "abc123"),
+            in_ns(2, 42, "abc123"),
+            in_ns(3, 42, "abc123"),
+            in_ns(9, 43, "def456"),
+        ];
+
+        let groups = group_rows(&rows, GroupBy::Container, &snap);
+        let abc = groups.iter().find(|g| g.name == "abc123").expect("abc123");
+        assert_eq!(abc.procs, 3);
+        assert_eq!(abc.net_bps, Some((1000.0, 250.0)), "three processes, one namespace");
+        let def = groups.iter().find(|g| g.name == "def456").expect("def456");
+        assert_eq!(def.net_bps, Some((7.0, 7.0)));
+    }
+
+    /// A process that reports no namespace is not a process that moved no
+    /// bytes — it is a platform that does not say. Zero would draw an idle
+    /// container where there is simply no measurement.
+    #[test]
+    fn a_group_with_no_namespace_has_no_network_figure_rather_than_zero() {
+        let rows = vec![proc(1, "sshd", 1.0, 10), proc(2, "bash", 1.0, 10)];
+        let groups = group_rows(&rows, GroupBy::Service, &Snapshot::default());
+        assert_eq!(groups[0].net_bps, None);
+
+        // ...and a namespace crabmon knows about but has no counters for yet
+        // reports zero, which is a measurement.
+        let row = ProcRow { netns: Some(7), ..proc(3, "app", 1.0, 10) };
+        let snap = Snapshot {
+            netns: vec![crate::metrics::NetNamespace { id: 7, ..Default::default() }],
+            ..Default::default()
+        };
+        assert_eq!(group_rows(&[row], GroupBy::Service, &snap)[0].net_bps, Some((0.0, 0.0)));
     }
 
     #[test]
@@ -1506,7 +1747,7 @@ mod tests {
                 ..proc(2, "postgres", 1.0, 10)
             },
         ];
-        assert_eq!(group_rows(&rows, GroupBy::Service)[0].io_bps, 3584.0);
+        assert_eq!(group_rows(&rows, GroupBy::Service, &Snapshot::default())[0].io_bps, 3584.0);
     }
 
     /// A status message is a receipt for something that just happened. Left on

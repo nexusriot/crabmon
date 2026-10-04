@@ -292,10 +292,7 @@ impl Default for Config {
             history_len: 240,
             thresholds: Thresholds::default(),
             panels: Panels::default(),
-            panel_order: ["net", "psi", "sensors", "disks", "power", "gpu", "cgroup"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            panel_order: crate::ui::SIDE_PANELS.iter().map(|s| s.to_string()).collect(),
             gpu: GpuConfig::default(),
             procs: ProcsConfig::default(),
             export: ExportConfig::default(),
@@ -345,6 +342,22 @@ impl Config {
         // An unknown column name would otherwise render as a blank strip with
         // no hint about the typo.
         self.procs.columns.retain(|c| crate::ui::procs::column_by_name(c).is_some());
+        // The same for the right-hand column. `panel_order` was read straight
+        // into the draw loop, where an unrecognised name fell through a `match`
+        // arm and simply did nothing — so a typo, or a panel renamed between
+        // releases, silently dropped that panel with nothing anywhere to say
+        // why. Dropping the name here at least makes the file and the screen
+        // agree, and a name that survives is one that draws something.
+        self.panel_order.retain(|p| crate::ui::is_side_panel(p));
+        // ...and a file that lists none of them leaves the column blank
+        // forever, which reads as a rendering bug rather than as a setting.
+        if self.panel_order.is_empty() {
+            self.panel_order = crate::ui::SIDE_PANELS.iter().map(|s| s.to_string()).collect();
+        }
+        // A panel named twice would be drawn twice, splitting the column
+        // between two copies of the same thing.
+        let mut seen = std::collections::HashSet::new();
+        self.panel_order.retain(|p| seen.insert(p.clone()));
         // The flight recorder's ring is live memory, and it holds whole
         // frames. A hand-edited `flight = 100000000` would be an OOM in the
         // process that exists to make memory pressure visible.
@@ -408,6 +421,43 @@ mod tests {
     fn a_corrupt_file_falls_back_to_defaults_instead_of_failing_to_start() {
         assert_eq!(Config::parse("this is not toml {{{"), Config::default());
         assert_eq!(Config::parse(""), Config::default());
+    }
+
+    #[test]
+    fn an_unknown_panel_name_is_dropped_rather_than_silently_drawing_nothing() {
+        // `panel_order` went straight into the draw loop, where a name no arm
+        // matched fell through and did nothing at all — so a typo cost you a
+        // panel with nothing anywhere to say why.
+        let cfg = Config::parse("panel_order = [\"net\", \"nonsense\", \"disks\"]").sanitize();
+        assert_eq!(cfg.panel_order, vec!["net", "disks"]);
+        for name in &cfg.panel_order {
+            assert!(crate::ui::is_side_panel(name), "{name} is not a panel");
+        }
+    }
+
+    #[test]
+    fn a_panel_order_that_names_nothing_usable_falls_back_to_the_defaults() {
+        // An empty right-hand column reads as a rendering bug, not a setting.
+        let cfg = Config::parse("panel_order = [\"typo\", \"alsotypo\"]").sanitize();
+        assert_eq!(cfg.panel_order, Config::default().panel_order);
+        let cfg = Config::parse("panel_order = []").sanitize();
+        assert_eq!(cfg.panel_order, Config::default().panel_order);
+    }
+
+    #[test]
+    fn a_panel_named_twice_is_drawn_once() {
+        // Two slots for one panel splits the column between two copies of it.
+        let cfg = Config::parse("panel_order = [\"net\", \"disks\", \"net\"]").sanitize();
+        assert_eq!(cfg.panel_order, vec!["net", "disks"]);
+    }
+
+    /// The default must survive its own validator, or every start would
+    /// silently rewrite the shipped config.
+    #[test]
+    fn every_default_panel_is_one_the_side_column_can_draw() {
+        let cfg = Config::default();
+        assert_eq!(cfg.clone().sanitize().panel_order, cfg.panel_order);
+        assert_eq!(cfg.panel_order.len(), crate::ui::SIDE_PANELS.len());
     }
 
     #[test]
