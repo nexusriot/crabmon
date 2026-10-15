@@ -456,18 +456,10 @@ fn git_ignores(path: &str) -> Option<bool> {
 fn gitignore_covers_the_files_crabmon_writes_into_the_working_directory() {
     // With `[export] dir` unset, `P` writes here — which is the checkout while
     // developing. These names come from `export_path` itself, not a guess.
-    let json = crabmon::export::export_path(
-        std::path::Path::new("."),
-        1_788_297_407,
-        crabmon::export::ExportFormat::Json,
-    );
-    let csv = crabmon::export::export_path(
-        std::path::Path::new("."),
-        1_788_297_407,
-        crabmon::export::ExportFormat::Csv,
-    );
-
-    for path in [json, csv] {
+    // Every format, not a hardcoded pair: `--format text` was added without
+    // a matching ignore rule, and nothing noticed.
+    for format in crabmon::export::ALL_EXPORT_FORMATS {
+        let path = crabmon::export::export_path(std::path::Path::new("."), 1_788_297_407, format);
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         match git_ignores(&name) {
             Some(true) => {}
@@ -476,11 +468,32 @@ fn gitignore_covers_the_files_crabmon_writes_into_the_working_directory() {
         }
     }
 
-    // Recordings, wherever they are written.
-    for name in ["run.jsonl", "recordings/slowdown.jsonl"] {
+    // Recordings and rotating segments, wherever they are written.
+    for name in ["run.jsonl", "recordings/slowdown.jsonl", "crabmon-1788297407.jsonl"] {
         if git_ignores(name) == Some(false) {
             panic!("a recording ({name}) would be committed");
         }
+    }
+
+    // The incident summary beside a flight dump, from the name the recorder
+    // itself produces — so a change to either naming scheme is caught here.
+    let dump = crabmon::record::dump_name("disk / full", 1_788_297_407);
+    for dir in [".", "recordings"] {
+        let summary = crabmon::incident::path_for(&std::path::Path::new(dir).join(&dump));
+        let name = summary.to_string_lossy().to_string();
+        if git_ignores(&name) == Some(false) {
+            panic!("an incident summary ({name}) would be committed");
+        }
+    }
+
+    // A Unix socket from `--serve unix:./crabmon.sock`.
+    if git_ignores("crabmon.sock") == Some(false) {
+        panic!("a serving socket would be committed");
+    }
+
+    // The temporary file an atomic config save renames over the real one.
+    if git_ignores("config.toml.1234.tmp") == Some(false) {
+        panic!("a half-written config would be committed");
     }
 
     // The audit log, when pointed somewhere relative.
@@ -504,7 +517,14 @@ fn gitignore_does_not_swallow_the_projects_own_files() {
         "docs/crabmon.1",
         "docs/crabmon.png",
         "docs/CHANGELOG.md",
+        // The summary rule is `crabmon-*.md`, which must not reach these.
+        "docs/crabmon.png",
+        ".gitignore",
         "completions/crabmon.bash",
+        // The incident-summary rule is `crabmon-*.md`, and the socket and
+        // temp-file rules are globs: none of them may reach a real file.
+        "docs/crabmon.png",
+        ".gitignore",
         ".github/workflows/ci.yml",
         "scripts/build-deb.sh",
         "scripts/build.sh",

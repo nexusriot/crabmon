@@ -15,6 +15,7 @@
 //! cmd:--headless     substring of the full command line
 //! re:^chrom(e|ium)$  regex over the name
 //! cpu>5  mem>100M    numeric comparisons (> >= < <= =)
+//! pss>500M uss>100M   proportional and unique memory (needs [procs] pss)
 //! virt>2G  thr>50    virtual size, thread count
 //! nice<0   fd>1000   scheduling priority, open descriptors
 //! time>2h            run time, in s/m/h/d
@@ -79,6 +80,11 @@ pub enum Term {
     Fds(Cmp, f64),
     /// Descriptors as a percentage of the process's own soft limit.
     FdPercent(Cmp, f64),
+    /// Proportional set size. Needs `[procs] pss`; without it no row reports
+    /// one and the term matches nothing, which is the honest answer.
+    Pss(Cmp, f64),
+    /// Unique set size: what killing the process would actually free.
+    Uss(Cmp, f64),
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +180,11 @@ impl Term {
             Term::Time(c, v) => c.test(p.run_time as f64, *v),
             Term::Fds(c, v) => p.fds.is_some_and(|n| c.test(n as f64, *v)),
             Term::FdPercent(c, v) => p.fd_ratio().is_some_and(|r| c.test(r * 100.0, *v)),
+            // Absent is unknown, not zero, exactly as for threads and
+            // descriptors: a process whose maps cannot be read is not a
+            // process using no memory.
+            Term::Pss(c, v) => p.pss.is_some_and(|n| c.test(n as f64, *v)),
+            Term::Uss(c, v) => p.uss.is_some_and(|n| c.test(n as f64, *v)),
         }
     }
 }
@@ -277,6 +288,12 @@ fn parse_term(body: &str) -> Result<Term, String> {
                 .parse::<f64>()
                 .map(|v| Term::Fds(cmp, v))
                 .map_err(|_| format!("bad number: {value}")),
+            "pss" => parse_size(value)
+                .map(|v| Term::Pss(cmp, v as f64))
+                .ok_or_else(|| format!("bad size: {value}")),
+            "uss" => parse_size(value)
+                .map(|v| Term::Uss(cmp, v as f64))
+                .ok_or_else(|| format!("bad size: {value}")),
             "fd%" | "fdpct" => value
                 .parse::<f64>()
                 .map(|v| Term::FdPercent(cmp, v))
@@ -288,6 +305,43 @@ fn parse_term(body: &str) -> Result<Term, String> {
     }
 
     Ok(Term::Name(body.to_lowercase()))
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+    use crate::metrics::ProcRow;
+
+    fn row(mem: u64, pss: Option<u64>, uss: Option<u64>) -> ProcRow {
+        ProcRow { pid: 1, name: "p".into(), mem, pss, uss, ..Default::default() }
+    }
+
+    #[test]
+    fn pss_and_uss_take_the_same_suffixes_the_other_sizes_take() {
+        let f = parse("pss>100M").unwrap();
+        assert!(f.matches(&row(1 << 30, Some(200 << 20), None)));
+        assert!(!f.matches(&row(1 << 30, Some(50 << 20), None)));
+
+        let f = parse("uss>100M").unwrap();
+        assert!(f.matches(&row(1 << 30, None, Some(200 << 20))));
+    }
+
+    /// Absent is unknown, not zero: without `[procs] pss` no row reports one,
+    /// and a term that matched everything would be worse than one that
+    /// matches nothing.
+    #[test]
+    fn an_unmeasured_process_matches_neither_way() {
+        let row = row(1 << 30, None, None);
+        assert!(!parse("pss>1").unwrap().matches(&row));
+        assert!(!parse("pss<1T").unwrap().matches(&row));
+        assert!(!parse("uss>1").unwrap().matches(&row));
+    }
+
+    #[test]
+    fn a_bad_size_is_an_error_rather_than_an_inert_term() {
+        assert!(parse("pss>nonsense").is_err());
+        assert!(parse("uss>").is_err());
+    }
 }
 
 #[cfg(test)]

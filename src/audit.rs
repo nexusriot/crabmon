@@ -12,9 +12,19 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    Signal { name: String },
-    Renice { nice: i32 },
-    Affinity { cpus: String },
+    Signal {
+        name: String,
+    },
+    Renice {
+        nice: i32,
+    },
+    Affinity {
+        cpus: String,
+    },
+    /// IO scheduling class and level, as `ionice(1)` spells it.
+    IoPriority {
+        value: String,
+    },
 }
 
 impl fmt::Display for Action {
@@ -23,6 +33,7 @@ impl fmt::Display for Action {
             Action::Signal { name } => write!(f, "signal {name}"),
             Action::Renice { nice } => write!(f, "renice {nice}"),
             Action::Affinity { cpus } => write!(f, "affinity {cpus}"),
+            Action::IoPriority { value } => write!(f, "ionice {value}"),
         }
     }
 }
@@ -98,6 +109,8 @@ mod tests {
         assert!(format_entry(0, &Action::Renice { nice: -5 }, 1, "x", Ok(())).contains("renice -5"));
         assert!(format_entry(0, &Action::Affinity { cpus: "0-3".into() }, 1, "x", Ok(()))
             .contains("affinity 0-3"));
+        assert!(format_entry(0, &Action::IoPriority { value: "idle".into() }, 1, "x", Ok(()))
+            .contains("ionice idle"));
     }
 
     #[test]

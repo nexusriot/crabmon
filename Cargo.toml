@@ -1,6 +1,6 @@
 [package]
 name = "crabmon"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 description = "A fast, keyboard-driven terminal system monitor"
 repository = "https://github.com/nexusriot/crabmon"

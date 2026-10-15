@@ -35,6 +35,11 @@ pub const PROC_HIST_LEN: usize = 120;
 /// Kept for callers that only want the sparkline column's window.
 pub const PROC_SPARK_LEN: usize = PROC_HIST_LEN;
 
+/// Samples a process needs before its growth is worth quoting. Two points a
+/// refresh apart is noise, and a column full of noise is a column people
+/// learn to ignore.
+pub const MIN_GROWTH_SAMPLES: usize = 8;
+
 /// Signals offered in the signal menu, in the order they are listed.
 pub const SIGNAL_NAMES: [&str; 9] = [
     "SIGTERM", "SIGKILL", "SIGINT", "SIGHUP", "SIGQUIT", "SIGSTOP", "SIGCONT", "SIGUSR1", "SIGUSR2",
@@ -65,6 +70,8 @@ pub enum Mode {
     ConfirmKill,
     Renice,
     Affinity,
+    /// IO scheduling class and level, the fourth process control.
+    IoPriority,
     Detail,
     Help,
     Alerts,
@@ -150,6 +157,12 @@ pub struct App {
 
     /// Sampling is suspended; the last snapshot stays on screen.
     pub paused: bool,
+    /// PIDs whose subtree is folded away in the tree view.
+    ///
+    /// Kept by PID rather than by position: the table is rebuilt every
+    /// sample, and a fold that moved when a process above it exited would be
+    /// worse than no fold at all.
+    pub collapsed: HashSet<u32>,
     /// PIDs tagged for a bulk action.
     pub tagged: HashSet<u32>,
     /// PIDs held at the top of the table, and shown even when the filter would
@@ -189,6 +202,16 @@ pub struct App {
     /// Open descriptors of the same process. `None` when its fd table could
     /// not be read, which the pane says rather than showing an empty list.
     pub detail_files: Option<Vec<fds::OpenFile>>,
+    /// The rest of what the detail pane shows for one process: how it stands
+    /// with the OOM killer, what IO priority it is running at, which cgroup
+    /// it is actually in, and the environment it was started with. Read when
+    /// the pane opens, like the sockets and the open files, because reading
+    /// four more `/proc` files for every process on every sample to fill a
+    /// pane that shows one of them is the wrong trade.
+    pub detail_oom: crate::metrics::procdetail::OomScore,
+    pub detail_ioprio: Option<crate::metrics::ioprio::IoPriority>,
+    pub detail_cgroup: Option<String>,
+    pub detail_env: Option<Vec<crate::metrics::procdetail::EnvVar>>,
     /// Where actions are logged. `None` disables the audit log.
     pub audit_path: Option<PathBuf>,
     /// Newest-first audit entries, loaded when the viewer opens.
@@ -239,6 +262,7 @@ impl App {
             header_cols: Vec::new(),
             config_path: None,
             paused: false,
+            collapsed: HashSet::new(),
             tagged: HashSet::new(),
             pinned: HashSet::new(),
             ports: HashMap::new(),
@@ -259,6 +283,10 @@ impl App {
             proc_hist: HashMap::new(),
             detail_sockets: Vec::new(),
             detail_files: None,
+            detail_oom: Default::default(),
+            detail_ioprio: None,
+            detail_cgroup: None,
+            detail_env: None,
             audit_path: None,
             audit_entries: Vec::new(),
             rows: Vec::new(),
@@ -283,6 +311,17 @@ impl App {
 
     pub fn source_label(&self) -> Option<String> {
         self.source.label()
+    }
+
+    /// Whether the rows on screen are processes of *this* machine.
+    ///
+    /// Everything crabmon does besides drawing acts on a local PID. Under
+    /// `--remote` or `--replay` the PIDs belong to another host, or to one as
+    /// it was an hour ago, so a local process that happens to hold the same
+    /// number is an unrelated program — and signalling it is the worst thing
+    /// this program could do.
+    pub fn samples_this_host(&self) -> bool {
+        self.source.is_local()
     }
 
     pub fn tick(&mut self) {
@@ -345,6 +384,9 @@ impl App {
         // onto an unrelated process and quietly hoisted to the top.
         self.tagged.retain(|pid| live.contains(pid));
         self.pinned.retain(|pid| live.contains(pid));
+        // A fold outliving its process would silently hide whatever took its
+        // PID next.
+        self.collapsed.retain(|pid| live.contains(pid));
         for p in &self.snap.procs {
             self.proc_hist.entry(p.pid).or_default().push(p);
         }
@@ -357,6 +399,40 @@ impl App {
     /// Everything recorded about one process over time, for the detail pane.
     pub fn proc_series(&self, pid: u32) -> Option<&ProcSeries> {
         self.proc_hist.get(&pid)
+    }
+
+    /// How much resident memory a process has gained or lost over the window
+    /// the history covers.
+    ///
+    /// `None` until there is enough history to say anything: a process
+    /// watched for two samples has not been flat, it has not been measured.
+    /// This reads the series the TREND column and the detail pane already
+    /// keep, so the GROWTH column costs a subtraction rather than any new
+    /// sampling.
+    pub fn mem_growth(&self, pid: u32) -> Option<i64> {
+        let series = self.proc_hist.get(&pid)?;
+        if series.mem.len() < MIN_GROWTH_SAMPLES {
+            return None;
+        }
+        let first = *series.mem.first()? as i64;
+        let last = *series.mem.last()? as i64;
+        Some(last - first)
+    }
+
+    /// When a filesystem will be full at the rate it has been filling.
+    ///
+    /// Read from the alert engine's own series, so the panel and a
+    /// `kind = "fillin"` rule cannot disagree about what is happening to a
+    /// disk.
+    pub fn fill_eta(&self, mount: &str, total: u64, used: u64) -> Option<u64> {
+        self.alerts.trends().fill_eta(mount, total, used, crate::alerts::DEFAULT_TREND_WINDOW)
+    }
+
+    /// The span `mem_growth` covers, for the header and the detail pane.
+    pub fn growth_window(&self, pid: u32) -> Option<Duration> {
+        let series = self.proc_hist.get(&pid)?;
+        (series.mem.len() >= MIN_GROWTH_SAMPLES)
+            .then(|| self.refresh * (series.mem.len() as u32 - 1))
     }
 
     /// Recompute the filtered, sorted (or tree-ordered) process view and keep
@@ -377,7 +453,12 @@ impl App {
             .collect();
 
         if self.cfg.tree {
-            self.tree_rows = tree::flatten(&rows, self.cfg.sort_by, self.cfg.sort_desc);
+            self.tree_rows = tree::flatten_collapsed(
+                &rows,
+                self.cfg.sort_by,
+                self.cfg.sort_desc,
+                &self.collapsed,
+            );
             // `flatten` yields each index exactly once, so the rows can be moved
             // into tree order rather than cloned a second time.
             let mut ordered = Vec::with_capacity(self.tree_rows.len());
@@ -387,7 +468,20 @@ impl App {
             rows = ordered;
         } else {
             self.tree_rows.clear();
-            sort::sort_rows(&mut rows, self.cfg.sort_by, self.cfg.sort_desc);
+            match self.cfg.sort_by {
+                // Growth is a property of the series, not of the row, so the
+                // generic comparator cannot see it.
+                SortBy::Growth => {
+                    let desc = self.cfg.sort_desc;
+                    let growth = |p: &ProcRow| self.mem_growth(p.pid).unwrap_or(i64::MIN);
+                    rows.sort_by(|a, b| {
+                        let primary = growth(a).cmp(&growth(b));
+                        let primary = if desc { primary.reverse() } else { primary };
+                        primary.then_with(|| a.pid.cmp(&b.pid))
+                    });
+                }
+                key => sort::sort_rows(&mut rows, key, self.cfg.sort_desc),
+            }
             // Pins float to the top of a flat list. In tree view they do not:
             // the ordering there is structural, and hoisting a child out of its
             // parent would draw a tree that is not one.
@@ -528,7 +622,13 @@ impl App {
         if self.ports_at.0 == self.generation && self.ports_at.1 == visible {
             return;
         }
-        self.ports = sockets::listening_ports(visible);
+        // The local /proc/net tables say nothing about another host's
+        // processes; joining them by PID attributed local listeners to remote
+        // rows. An empty map draws `-`, which is the honest answer.
+        self.ports = match self.samples_this_host() {
+            true => sockets::listening_ports(visible),
+            false => HashMap::new(),
+        };
         self.ports_at = (self.generation, visible.to_vec());
     }
 
@@ -590,6 +690,29 @@ impl App {
     }
 
     /// Pin or unpin the selected process.
+    /// Fold or unfold the subtree under the cursor.
+    fn toggle_collapse(&mut self) {
+        if !self.cfg.tree {
+            self.set_status("folding needs the tree view (T)");
+            return;
+        }
+        let Some(pid) = self.selected_row().map(|r| r.pid) else { return };
+        // A leaf has nothing to fold, and a marker on one would be noise.
+        let has_children = self
+            .tree_rows
+            .iter()
+            .find(|t| self.rows.get(t.index).is_some_and(|r| r.pid == pid))
+            .is_some_and(|t| t.children > 0);
+        if !has_children && !self.collapsed.contains(&pid) {
+            self.set_status("nothing to fold under this process");
+            return;
+        }
+        if !self.collapsed.insert(pid) {
+            self.collapsed.remove(&pid);
+        }
+        self.rebuild_view();
+    }
+
     fn toggle_pin(&mut self) {
         let Some(row) = self.selected_row() else { return };
         let (pid, name) = (row.pid, row.name.clone());
@@ -675,6 +798,12 @@ impl App {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Action::Quit;
         }
+        // Ctrl-R, in every mode: a config edited mid-incident is exactly
+        // when restarting costs the most, and `r` is renice.
+        if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.reload_config();
+            return Action::None;
+        }
         match self.mode {
             Mode::Normal => self.on_normal_key(key),
             Mode::Filter => {
@@ -691,6 +820,10 @@ impl App {
             }
             Mode::Renice => {
                 self.on_renice_key(key);
+                Action::None
+            }
+            Mode::IoPriority => {
+                self.on_ioprio_key(key);
                 Action::None
             }
             Mode::Affinity => {
@@ -747,6 +880,7 @@ impl App {
                 crate::ui::popups::DETAIL_FIELDS
                     + self.detail_sockets.len()
                     + self.detail_files.as_ref().map_or(0, Vec::len)
+                    + self.detail_env.as_ref().map_or(0, Vec::len)
             }
             _ => 0,
         }
@@ -931,10 +1065,38 @@ impl App {
                     // Fetched here rather than every tick: joining /proc/net
                     // against a process's fd table, and resolving every
                     // descriptor it holds, are only cheap for one PID.
-                    self.detail_sockets = sockets::for_pid(pid);
-                    self.detail_files = fds::open_files(pid);
+                    //
+                    // Only for a local process: reading /proc by PID while
+                    // looking at another host showed whatever local program
+                    // held that number, presented as the remote one's sockets
+                    // and open files.
+                    let local = self.samples_this_host();
+                    self.detail_sockets = if local { sockets::for_pid(pid) } else { Vec::new() };
+                    self.detail_files = if local { fds::open_files(pid) } else { None };
+                    self.detail_oom = match local {
+                        true => crate::metrics::procdetail::oom_score(pid),
+                        false => Default::default(),
+                    };
+                    self.detail_ioprio = local.then(|| crate::metrics::ioprio::get(pid)).flatten();
+                    self.detail_cgroup =
+                        local.then(|| crate::metrics::procdetail::cgroup_path(pid)).flatten();
+                    self.detail_env =
+                        local.then(|| crate::metrics::procdetail::environment(pid)).flatten();
                     self.open_popup(Mode::Detail);
                 }
+            }
+            // The fourth knob: CPU priority does nothing for a process that
+            // is saturating a disk, which is the one everybody actually wants
+            // to turn down.
+            KeyCode::Char('I') => self.open_ioprio(),
+            // Fold the subtree under the cursor. Only in tree view, where
+            // it is the one thing that makes a 200-child browser readable.
+            KeyCode::Char('o') => self.toggle_collapse(),
+            KeyCode::Char('O') => {
+                let n = self.collapsed.len();
+                self.collapsed.clear();
+                self.set_status(format!("unfolded {n}"));
+                self.rebuild_view();
             }
             KeyCode::Char('f') => self.toggle_pin(),
             KeyCode::Char('F') => {
@@ -1023,6 +1185,14 @@ impl App {
     /// on. The aggregate table shows no process rows, so acting from it would
     /// signal whichever process the invisible cursor happened to be on.
     fn targets_for_prompt(&mut self) -> Option<Vec<Target>> {
+        if !self.samples_this_host() {
+            // The PID under the cursor belongs to the far end, or to a
+            // recording. A local process holding that number is a different
+            // program, and signalling, renicing or pinning it to a core is
+            // the most destructive mistake crabmon could make.
+            self.set_status("read-only: these processes are not on this machine");
+            return None;
+        }
         if self.grouped() {
             self.set_status("grouped view: press Enter to open a group first");
             return None;
@@ -1213,9 +1383,14 @@ impl App {
         let Some(targets) = self.targets_for_prompt() else { return };
         let Some(first) = targets.first().cloned() else { return };
         let pid = first.pid;
+        let first_nice = self.rows().iter().find(|r| r.pid == pid).and_then(|r| r.nice);
         self.pending_targets = targets;
         self.target = Some(first);
-        self.input = crate::metrics::sysinfo_source::get_priority(pid)
+        // From the row, not from the local host: `targets_for_prompt` has
+        // already established this is a local process, and the sampler read
+        // the value a moment ago.
+        self.input = first_nice
+            .or_else(|| crate::metrics::sysinfo_source::get_priority(pid))
             .map(|n| n.to_string())
             .unwrap_or_else(|| "0".into());
         self.input_error = None;
@@ -1343,6 +1518,77 @@ impl App {
         }
     }
 
+    fn open_ioprio(&mut self) {
+        let Some(targets) = self.targets_for_prompt() else { return };
+        let Some(first) = targets.first().cloned() else { return };
+        let pid = first.pid;
+        self.pending_targets = targets;
+        self.target = Some(first);
+        // Prefilled with what the process has now, so the prompt says what it
+        // is about to change rather than proposing a value out of nowhere.
+        self.input = crate::metrics::ioprio::get(pid)
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "be 4".into());
+        self.input_error = None;
+        self.mode = Mode::IoPriority;
+    }
+
+    fn on_ioprio_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.input.clear();
+                self.close_prompt();
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Char(c) if c.is_ascii_alphanumeric() || c == ' ' || c == '-' => {
+                self.input.push(c)
+            }
+            KeyCode::Enter => {
+                if self.pending_targets.is_empty() {
+                    self.close_prompt();
+                    return;
+                }
+                match crate::metrics::ioprio::parse(&self.input) {
+                    Ok(prio) => {
+                        let targets = self.action_targets();
+                        let (mut done, mut skipped) = (0usize, 0usize);
+                        for target in &targets {
+                            if !self.target_matches(target) {
+                                skipped += 1;
+                                continue;
+                            }
+                            let action = audit::Action::IoPriority { value: prio.to_string() };
+                            match crate::metrics::ioprio::set(target.pid, prio) {
+                                Ok(()) => {
+                                    self.set_status(format!("{} set to {prio}", target.name));
+                                    self.log_action(action, target.pid, &target.name, Ok(()));
+                                    done += 1;
+                                }
+                                Err(e) => {
+                                    self.set_status(format!("ionice {}: {e}", target.pid));
+                                    self.log_action(
+                                        action,
+                                        target.pid,
+                                        &target.name,
+                                        Err(&e.to_string()),
+                                    );
+                                }
+                            }
+                        }
+                        self.summarise_bulk("ionice", done, skipped, targets.len());
+                        self.tagged.clear();
+                        self.input.clear();
+                        self.close_prompt();
+                    }
+                    Err(e) => self.input_error = Some(e),
+                }
+            }
+            _ => {}
+        }
+    }
+
     // ---------------------------------------------------------------- mouse
 
     pub fn on_mouse(&mut self, ev: MouseEvent) -> Action {
@@ -1416,9 +1662,67 @@ impl App {
         &mut self,
         flight: Option<&mut crate::record::FlightRecorder>,
     ) -> Vec<String> {
-        let mut notes = crate::supervisor::drain(&mut self.alerts, flight, &self.snap);
+        // The rules were evaluated in `tick`; passing what is firing along
+        // lets the summary beside a dump say what tripped it, exactly as the
+        // headless path does.
+        let active = self.active_alerts.clone();
+        let mut notes =
+            crate::supervisor::drain_with_alerts(&mut self.alerts, flight, &self.snap, &active);
         notes.extend(crate::supervisor::spawn_hooks(&self.alerts.take_commands()));
         notes
+    }
+
+    /// Re-read the config file and apply what it says.
+    ///
+    /// Everything that is a *setting* is replaced; everything that is
+    /// session state — the filter you typed, what is tagged, pinned,
+    /// selected, paused, the layout you tabbed to — is kept, because
+    /// reloading is not restarting and losing your place mid-incident is
+    /// the thing this exists to avoid.
+    ///
+    /// A file that does not parse changes nothing at all and says so.
+    pub fn reload_config(&mut self) {
+        let Some(path) = self.config_path.clone() else {
+            self.set_status("no config file to reload");
+            return;
+        };
+        let (loaded, error) = crate::config::load_checked(&path);
+        if let Some(e) = error {
+            self.set_status(format!("config unchanged: {e}"));
+            return;
+        }
+
+        // Session state, carried across.
+        let filter_text = self.filter_text.clone();
+        let layout = self.cfg.layout;
+        let group_by = self.cfg.group_by;
+        let sort_by = self.cfg.sort_by;
+        let sort_desc = self.cfg.sort_desc;
+        let tree = self.cfg.tree;
+        let show_threads = self.cfg.show_threads;
+
+        let history_changed = loaded.history_len != self.cfg.history_len;
+        self.cfg = loaded;
+        self.cfg.filter = filter_text;
+        self.cfg.layout = layout;
+        self.cfg.group_by = group_by;
+        self.cfg.sort_by = sort_by;
+        self.cfg.sort_desc = sort_desc;
+        self.cfg.tree = tree;
+        self.cfg.show_threads = show_threads;
+
+        self.theme = Theme::preset(&self.cfg.theme).unwrap_or_default();
+        self.refresh = Duration::from_millis(self.cfg.refresh_ms);
+        // Rules are rebuilt from the file, which is the main reason to do
+        // this at all — and the engine's hold times and series start again
+        // with them, since a rule that has been edited is a new rule.
+        self.alerts = AlertEngine::new(self.cfg.alerts.clone());
+        self.active_alerts.clear();
+        if history_changed {
+            self.reset_histories();
+        }
+        self.rebuild_view();
+        self.set_status(format!("reloaded {}", path.display()));
     }
 
     pub fn persist(&self) {
@@ -1449,10 +1753,22 @@ pub struct ProcSeries {
     pub mem: Vec<u64>,
     /// Read plus write, in bytes per second.
     pub io: Vec<f32>,
+    /// Which process this is a history *of*. A PID says only which slot the
+    /// kernel handed out, and it hands the same one out again: without this,
+    /// a process that exited between two samples left its trend and its
+    /// sparkline attached to whatever took its number — the detail pane then
+    /// charted two different programs as one continuous series.
+    pub started: u64,
 }
 
 impl ProcSeries {
     fn push(&mut self, p: &ProcRow) {
+        if self.started != p.start_time_unix && !self.cpu.is_empty() {
+            self.cpu.clear();
+            self.mem.clear();
+            self.io.clear();
+        }
+        self.started = p.start_time_unix;
         push_bounded(&mut self.cpu, p.cpu);
         push_bounded(&mut self.mem, p.mem);
         push_bounded(&mut self.io, p.io_bps() as f32);
@@ -1489,6 +1805,15 @@ pub struct GroupRow {
     /// container has exactly one namespace, which is what makes this the
     /// honest per-container figure that per-process bytes cannot be.
     pub net_bps: Option<(f64, f64)>,
+    /// What the group's own cgroup says, where there is one.
+    ///
+    /// Summed per-process figures cannot see a *limit*, so "this container
+    /// is at 94% of what it is allowed" was not expressible at all — and the
+    /// sum itself misses kernel memory, page cache and anything charged to
+    /// the group rather than to a task.
+    pub cgroup_mem: Option<u64>,
+    pub cgroup_mem_ratio: Option<f64>,
+    pub cgroup_cpu_ratio: Option<f64>,
 }
 
 /// Aggregate processes by systemd unit, container or user.
@@ -1519,7 +1844,17 @@ pub fn group_rows(rows: &[ProcRow], by: GroupBy, snap: &Snapshot) -> Vec<GroupRo
         }
         let entry = acc.entry(key.clone()).or_insert_with(|| {
             order.push(key.clone());
-            GroupRow { name: key, procs: 0, cpu: 0.0, mem: 0, io_bps: 0.0, net_bps: None }
+            GroupRow {
+                name: key,
+                procs: 0,
+                cpu: 0.0,
+                mem: 0,
+                io_bps: 0.0,
+                net_bps: None,
+                cgroup_mem: None,
+                cgroup_mem_ratio: None,
+                cgroup_cpu_ratio: None,
+            }
         });
         entry.procs += 1;
         entry.cpu += p.cpu;
@@ -1529,6 +1864,17 @@ pub fn group_rows(rows: &[ProcRow], by: GroupBy, snap: &Snapshot) -> Vec<GroupRo
     for (key, ids) in &namespaces {
         if let Some(entry) = acc.get_mut(key) {
             entry.net_bps = Some(snap.netns_totals(ids));
+        }
+    }
+    // The kernel's own accounting for the group, where the group *is* a
+    // cgroup — which `service` and `container` groupings are, and `user` is
+    // not.
+    if matches!(by, GroupBy::Service | GroupBy::Container) {
+        for (name, entry) in acc.iter_mut() {
+            let Some(stat) = snap.cgroup_named(name) else { continue };
+            entry.cgroup_mem = stat.mem_current;
+            entry.cgroup_mem_ratio = stat.mem_ratio();
+            entry.cgroup_cpu_ratio = stat.cpu_ratio();
         }
     }
     let mut out: Vec<GroupRow> = order.into_iter().filter_map(|k| acc.remove(&k)).collect();
@@ -1579,6 +1925,46 @@ mod tests {
     use super::*;
     use crate::metrics::Snapshot;
     use crate::record::ReplaySource;
+
+    /// Leak-hunting by pressing a key rather than by writing a rule and
+    /// waiting: the column reads the history the app already keeps.
+    #[test]
+    fn growth_is_reported_only_once_there_is_enough_history_to_mean_it() {
+        let mut series = ProcSeries::default();
+        let mut p = proc(1, "leaky", 1.0, 100 << 20);
+        p.start_time_unix = 1;
+        for step in 0..MIN_GROWTH_SAMPLES {
+            p.mem = (100 + step as u64 * 10) << 20;
+            series.push(&p);
+        }
+        assert_eq!(series.mem.len(), MIN_GROWTH_SAMPLES);
+        let grew = *series.mem.last().unwrap() as i64 - *series.mem.first().unwrap() as i64;
+        assert_eq!(grew, ((MIN_GROWTH_SAMPLES as i64 - 1) * 10) << 20);
+    }
+
+    /// A PID is a slot the kernel re-issues. The history hanging off one has
+    /// to belong to the process that is in it now, or the detail pane charts
+    /// two unrelated programs as one continuous series.
+    #[test]
+    fn a_recycled_pid_does_not_inherit_the_previous_process_history() {
+        let mut series = ProcSeries::default();
+        let mut first = proc(4242, "old", 90.0, 1024);
+        first.start_time_unix = 1_000;
+        for _ in 0..5 {
+            series.push(&first);
+        }
+        assert_eq!(series.len(), 5);
+
+        let mut recycled = proc(4242, "new", 1.0, 2048);
+        recycled.start_time_unix = 2_000;
+        series.push(&recycled);
+        assert_eq!(series.len(), 1, "the new process inherited the old one's history");
+        assert_eq!(series.cpu, vec![1.0]);
+
+        // ...and the same process keeps accumulating.
+        series.push(&recycled);
+        assert_eq!(series.len(), 2);
+    }
 
     fn proc(pid: u32, name: &str, cpu: f32, mem: u64) -> ProcRow {
         ProcRow { pid, name: name.into(), cpu, mem, ..Default::default() }

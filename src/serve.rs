@@ -29,6 +29,80 @@ pub const MAX_CONNECTIONS: usize = 16;
 /// bound.
 pub const MAX_REQUEST_LINE: u64 = 8 * 1024;
 
+/// Combine several hosts' exposition text into one scrape, labelling each
+/// host's samples with `host="..."`.
+///
+/// crabmon can already watch a fleet over SSH and can already export what it
+/// measures; the two could not meet, so a fleet had a dashboard and no
+/// metrics. Merging here rather than threading a label through every
+/// `metric` call keeps the single-host path exactly as it was.
+///
+/// Families are grouped and their `HELP`/`TYPE` lines emitted once: Prometheus
+/// rejects a repeated `HELP` for a family, which would lose the whole scrape
+/// rather than one host's worth of it.
+pub fn merge_hosts(parts: &[(String, String)]) -> String {
+    // Insertion-ordered so the output is stable rather than hash-ordered.
+    let mut order: Vec<String> = Vec::new();
+    let mut meta: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut samples: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+
+    for (host, body) in parts {
+        for line in body.lines() {
+            let line = line.trim_end();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(rest) =
+                line.strip_prefix("# HELP ").or_else(|| line.strip_prefix("# TYPE "))
+            {
+                let family = rest.split_whitespace().next().unwrap_or_default().to_string();
+                if !meta.contains_key(&family) {
+                    order.push(family.clone());
+                }
+                let entry = meta.entry(family).or_default();
+                if !entry.iter().any(|l| l == line) {
+                    entry.push(line.to_string());
+                }
+                continue;
+            }
+            let family = line.split(['{', ' ']).next().unwrap_or_default().to_string();
+            if !meta.contains_key(&family) {
+                order.push(family.clone());
+                meta.entry(family.clone()).or_default();
+            }
+            samples.entry(family).or_default().push(labelled(line, host));
+        }
+    }
+
+    let mut out = String::new();
+    for family in order {
+        for line in meta.get(&family).into_iter().flatten() {
+            out.push_str(line);
+            out.push('\n');
+        }
+        for line in samples.get(&family).into_iter().flatten() {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Add `host="..."` to one sample line, whether or not it already has labels.
+fn labelled(line: &str, host: &str) -> String {
+    let host = format!("host=\"{}\"", escape_label(host));
+    match line.find('{') {
+        // `name{a="b"} 1` → `name{host="h",a="b"} 1`
+        Some(at) => format!("{}{{{host},{}", &line[..at], &line[at + 1..]),
+        // `name 1` → `name{host="h"} 1`
+        None => match line.split_once(' ') {
+            Some((name, value)) => format!("{name}{{{host}}} {value}"),
+            None => line.to_string(),
+        },
+    }
+}
+
 /// Escape a Prometheus label value.
 pub fn escape_label(value: &str) -> String {
     value.replace('\\', r"\\").replace('"', "\\\"").replace('\n', r"\n")
@@ -97,6 +171,23 @@ pub fn render_with_alerts(
     top_procs: usize,
     alerts: &[crate::alerts::RuleState],
 ) -> String {
+    render_host(snap, top_procs, alerts, true)
+}
+
+/// As `render_with_alerts`, saying whether the host these numbers came from
+/// could actually be reached.
+///
+/// For a single host the answer is always yes — the exporter is the process
+/// being scraped. For a fleet it is not: a machine that is down still gets a
+/// series, and `crabmon_up{host="db-1"} 1` on a host nobody can reach reads
+/// as "db-1 is fine" when the frame behind it is the last good one, or
+/// zeroes. `up` is the one series whose whole job is to answer that.
+pub fn render_host(
+    snap: &Snapshot,
+    top_procs: usize,
+    alerts: &[crate::alerts::RuleState],
+    reachable: bool,
+) -> String {
     let mut out = String::new();
 
     if !alerts.is_empty() {
@@ -126,7 +217,13 @@ pub fn render_with_alerts(
         );
     }
 
-    metric(&mut out, "up", "Always 1; the exporter is answering.", "gauge", &plain(1.0));
+    metric(
+        &mut out,
+        "up",
+        "1 when this host's metrics are a live sample of it.",
+        "gauge",
+        &plain(reachable as u8 as f64),
+    );
     metric(
         &mut out,
         "cpu_usage_percent",
@@ -180,6 +277,62 @@ pub fn render_with_alerts(
         &plain(snap.mem.swap_total as f64),
     );
     metric(&mut out, "swap_used_bytes", "Used swap.", "gauge", &plain(snap.mem.swap_used as f64));
+
+    // Per-container and per-unit accounting, from each cgroup's own files.
+    // The limit is the series that matters: a container at 98% of a 512 MB
+    // limit is invisible in the host's memory gauge.
+    let cg_label =
+        |c: &crate::metrics::cgroup::CgroupStat| format!("name=\"{}\"", escape_label(&c.name));
+    metric(
+        &mut out,
+        "cgroup_memory_bytes",
+        "Memory charged to a container or unit's own cgroup.",
+        "gauge",
+        &snap
+            .cgroups
+            .iter()
+            .filter_map(|c| c.mem_current.map(|m| (cg_label(c), m as f64)))
+            .collect::<Vec<_>>(),
+    );
+    metric(
+        &mut out,
+        "cgroup_memory_limit_bytes",
+        "A cgroup's memory limit, where it has one.",
+        "gauge",
+        &snap
+            .cgroups
+            .iter()
+            .filter_map(|c| c.mem_max.map(|m| (cg_label(c), m as f64)))
+            .collect::<Vec<_>>(),
+    );
+    metric(
+        &mut out,
+        "cgroup_cpu_cores",
+        "CPU used by a cgroup over the scrape interval, in cores.",
+        "gauge",
+        &snap
+            .cgroups
+            .iter()
+            .filter_map(|c| c.cpu_cores.map(|v| (cg_label(c), v)))
+            .collect::<Vec<_>>(),
+    );
+
+    // Kernel events as a gauge per kind: `crabmon_kernel_events{kind="oom"}`
+    // is the shape that makes "page me if anything was OOM-killed" a
+    // Prometheus expression. Absent entirely where the log is unreadable,
+    // because exporting 0 there would claim the machine is healthy.
+    if snap.kernel_unreadable.is_none() {
+        metric(
+            &mut out,
+            "kernel_events",
+            "Kernel events in the sampler's recent window, by kind.",
+            "gauge",
+            &crate::metrics::kmsg::ALL_EVENT_KINDS
+                .iter()
+                .map(|k| (format!("kind=\"{}\"", k.key_name()), snap.kernel_count(*k) as f64))
+                .collect::<Vec<_>>(),
+        );
+    }
 
     metric(
         &mut out,
@@ -609,10 +762,65 @@ pub fn http_response(status: &str, content_type: &str, body: &str) -> String {
     )
 }
 
+/// Compare two secrets without leaking their contents through how long it
+/// takes.
+///
+/// A naive `==` returns on the first differing byte, which over enough
+/// requests tells a caller how much of a token it has guessed. The exporter
+/// is reachable from the network by design, so the comparison is the obvious
+/// place for that to matter.
+pub fn secret_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    // The length is not a secret — the lengths of the two are compared in
+    // constant time anyway by folding it into the difference.
+    let mut diff = (a.len() ^ b.len()) as u8;
+    for i in 0..a.len().max(b.len()) {
+        diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
+    }
+    diff == 0
+}
+
+/// Whether a request's `Authorization` header satisfies `required`.
+///
+/// `Bearer <token>` is what every scraper already knows how to send —
+/// Prometheus has `bearer_token` and `bearer_token_file` in its scrape
+/// config — so no new vocabulary is invented here.
+pub fn authorized(header: Option<&str>, required: Option<&str>) -> bool {
+    let Some(want) = required else { return true };
+    let Some(given) = header else { return false };
+    let given = given.trim();
+    let token = given
+        .strip_prefix("Bearer ")
+        .or_else(|| given.strip_prefix("bearer "))
+        .unwrap_or(given)
+        .trim();
+    secret_eq(token, want)
+}
+
 /// Route a request to its body. Split out so the routing is testable without a socket.
-pub fn route(method: &str, path: &str, body: impl FnOnce() -> String) -> String {
+///
+/// `token` is the secret a request must present, when one is configured.
+/// `/healthz` stays open whatever the setting: it carries nothing about the
+/// machine, and a liveness probe that needs a credential is a liveness probe
+/// that gets switched off.
+pub fn route(
+    method: &str,
+    path: &str,
+    auth: Option<&str>,
+    token: Option<&str>,
+    body: impl FnOnce() -> String,
+) -> String {
     if method != "GET" {
         return http_response("405 Method Not Allowed", "text/plain", "only GET is supported\n");
+    }
+    if path != "/healthz" && !authorized(auth, token) {
+        let mut response = http_response("401 Unauthorized", "text/plain", "unauthorized\n");
+        // The header a client needs to be told what to send back.
+        response = response.replace(
+            "Content-Type:",
+            "WWW-Authenticate: Bearer realm=\"crabmon\"\r\nContent-Type:",
+        );
+        return response;
     }
     match path {
         "/metrics" => http_response("200 OK", "text/plain; version=0.0.4", &body()),
@@ -626,37 +834,116 @@ pub fn route(method: &str, path: &str, body: impl FnOnce() -> String) -> String 
     }
 }
 
-fn handle(mut stream: TcpStream, body: impl FnOnce() -> String) {
+/// Headers read before a request is answered. A scraper sends a handful;
+/// this only exists so a client cannot make the exporter read for ever.
+pub const MAX_HEADERS: usize = 64;
+
+/// A client connection, whatever it arrived over.
+///
+/// A Unix socket is the natural companion to the bearer token: no port, no
+/// network, and the filesystem does the access control — which is what a
+/// local scraper on a machine that should not be listening actually wants.
+pub trait Conn: Read + Write + Send + Sized + 'static {
+    fn set_timeouts(&self, timeout: Duration);
+    /// A second handle on the same connection, for bounding the read without
+    /// giving up the write.
+    fn try_clone_conn(&self) -> Option<Self>;
+    /// Read through a shared reference. Both socket types implement `Read`
+    /// for `&Self`; naming it here saves every caller a higher-ranked bound.
+    fn read_shared(&self, buf: &mut [u8]) -> std::io::Result<usize>;
+}
+
+impl Conn for TcpStream {
+    fn set_timeouts(&self, timeout: Duration) {
+        let _ = self.set_read_timeout(Some(timeout));
+        let _ = self.set_write_timeout(Some(timeout));
+    }
+    fn try_clone_conn(&self) -> Option<Self> {
+        self.try_clone().ok()
+    }
+    fn read_shared(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (&mut { self }).read(buf)
+    }
+}
+
+#[cfg(unix)]
+impl Conn for std::os::unix::net::UnixStream {
+    fn set_timeouts(&self, timeout: Duration) {
+        let _ = self.set_read_timeout(Some(timeout));
+        let _ = self.set_write_timeout(Some(timeout));
+    }
+    fn try_clone_conn(&self) -> Option<Self> {
+        self.try_clone().ok()
+    }
+    fn read_shared(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (&mut { self }).read(buf)
+    }
+}
+
+fn handle<S: Conn>(mut stream: S, token: Option<&str>, body: impl FnOnce() -> String) {
     // Both directions: a client that stops reading mid-response would otherwise
     // block the write just as effectively as one that never sends a request.
-    let _ = stream.set_read_timeout(Some(CLIENT_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(CLIENT_TIMEOUT));
+    stream.set_timeouts(CLIENT_TIMEOUT);
     let mut line = String::new();
-    let peer = stream.try_clone();
+    let peer = stream.try_clone_conn();
     // `.take(MAX_REQUEST_LINE)`: an unbounded `read_line` grows a `String`
     // until a newline arrives, and the read timeout only bounds how long a
     // *single* read may block — a client that keeps sending never trips it. On
     // loopback that is hundreds of megabytes of resident memory per connection
     // in the process whose whole job is to make memory pressure visible, and
     // `MAX_CONNECTIONS` of them at once.
-    let reader = (peer.as_ref().unwrap_or(&stream)).take(MAX_REQUEST_LINE);
-    if BufReader::new(reader).read_line(&mut line).is_err() {
+    let reader =
+        ReadRef(peer.as_ref().unwrap_or(&stream)).take(MAX_REQUEST_LINE * MAX_HEADERS as u64);
+    let mut reader = BufReader::new(reader);
+    if reader.read_line(&mut line).is_err() {
         return;
+    }
+    // Headers are only read when something is going to look at one: an
+    // exporter with no token configured has no reason to read past the
+    // request line, and reading it would only give a client more to say.
+    let mut auth: Option<String> = None;
+    if token.is_some() {
+        for _ in 0..MAX_HEADERS {
+            let mut header = String::new();
+            match reader.read_line(&mut header) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => return,
+            }
+            if header.trim().is_empty() {
+                break;
+            }
+            if let Some((name, value)) = header.split_once(':') {
+                if name.trim().eq_ignore_ascii_case("authorization") {
+                    auth = Some(value.trim().to_string());
+                }
+            }
+        }
     }
     // A line that filled the budget without a newline is not a request line.
     let response = match parse_request_path(&line) {
         _ if line.len() as u64 >= MAX_REQUEST_LINE && !line.ends_with('\n') => {
             http_response("431 Request Header Fields Too Large", "text/plain", "too long\n")
         }
-        Some((method, path)) => route(method, path, body),
+        Some((method, path)) => route(method, path, auth.as_deref(), token, body),
         None => http_response("400 Bad Request", "text/plain", "malformed request\n"),
     };
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
 }
 
-fn reject(mut stream: TcpStream) {
-    let _ = stream.set_write_timeout(Some(CLIENT_TIMEOUT));
+/// `&S` as a reader, so the request can be read through a borrowed handle
+/// while the response is written through the owned one.
+struct ReadRef<'a, S>(&'a S);
+
+impl<S: Conn> Read for ReadRef<'_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read_shared(buf)
+    }
+}
+
+fn reject<S: Conn>(mut stream: S) {
+    stream.set_timeouts(CLIENT_TIMEOUT);
     let _ = stream
         .write_all(http_response("503 Service Unavailable", "text/plain", "busy\n").as_bytes());
 }
@@ -701,7 +988,7 @@ pub fn serve(
     top_procs: usize,
     mut sample: impl FnMut(Duration) -> Snapshot + Send + 'static,
 ) -> std::io::Result<()> {
-    serve_rendered(addr, move |elapsed| render(&sample(elapsed), top_procs))
+    serve_rendered(addr, None, move |elapsed| render(&sample(elapsed), top_procs))
 }
 
 /// As `serve`, but the caller renders the body.
@@ -711,22 +998,95 @@ pub fn serve(
 /// into a response needs the snapshot, not just the numbers in it.
 pub fn serve_rendered(
     addr: &str,
+    token: Option<String>,
     render_body: impl FnMut(Duration) -> String + Send + 'static,
 ) -> std::io::Result<()> {
+    if let Some(path) = unix_socket_path(addr) {
+        return serve_unix(path, token, render_body);
+    }
     let bind = normalise_addr(addr);
     let listener = TcpListener::bind(&bind)?;
     eprintln!("crabmon: serving metrics on http://{bind}/metrics");
-    if is_public(&bind) {
-        eprintln!(
-            "crabmon: {bind} is reachable from the network; \
+    match (&token, is_public(&bind)) {
+        (Some(_), _) => eprintln!("crabmon: scrapes need an Authorization: Bearer header"),
+        (None, true) => eprintln!(
+            "crabmon: {bind} is reachable from the network with no token set; \
              per-process metrics include command lines"
-        );
+        ),
+        (None, false) => {}
     }
+    accept_loop(listener.incoming(), token, render_body)
+}
+
+/// Whether an address names a Unix socket rather than a host and port.
+///
+/// `unix:/run/crabmon.sock` is explicit; a bare path is accepted too,
+/// because anything starting with `/` or `./` is not a port and guessing
+/// right is better than an error about an unparseable address.
+pub fn unix_socket_path(addr: &str) -> Option<&str> {
+    let addr = addr.trim();
+    if let Some(path) = addr.strip_prefix("unix:") {
+        return (!path.is_empty()).then_some(path);
+    }
+    (addr.starts_with('/') || addr.starts_with("./")).then_some(addr)
+}
+
+/// Serve over a Unix socket: no port, no network, and the filesystem does
+/// the access control.
+#[cfg(unix)]
+fn serve_unix(
+    path: &str,
+    token: Option<String>,
+    render_body: impl FnMut(Duration) -> String + Send + 'static,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+
+    // A socket left behind by a killed process would otherwise make every
+    // later start fail with "address in use". Removed only when nothing is
+    // actually listening on it, so two exporters cannot steal each other's.
+    if std::path::Path::new(path).exists() && std::os::unix::net::UnixStream::connect(path).is_err()
+    {
+        let _ = std::fs::remove_file(path);
+    }
+    let listener = UnixListener::bind(path)?;
+    // Not the umask's business: a scrape carries every command line on the
+    // machine, and a permissive umask would hand that to everyone.
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660));
+    eprintln!("crabmon: serving metrics on unix:{path}");
+    if token.is_some() {
+        eprintln!("crabmon: scrapes need an Authorization: Bearer header");
+    }
+    accept_loop(listener.incoming(), token, render_body)
+}
+
+#[cfg(not(unix))]
+fn serve_unix(
+    _path: &str,
+    _token: Option<String>,
+    _render_body: impl FnMut(Duration) -> String + Send + 'static,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "unix sockets are not available on this platform",
+    ))
+}
+
+/// The accept loop, over whatever kind of socket the listener is.
+fn accept_loop<S: Conn>(
+    incoming: impl Iterator<Item = std::io::Result<S>>,
+    token: Option<String>,
+    render_body: impl FnMut(Duration) -> String + Send + 'static,
+) -> std::io::Result<()> {
+    // Shared rather than cloned per connection: it never changes, and a
+    // secret copied once per request is a secret in more places than it
+    // needs to be.
+    let token = token.map(std::sync::Arc::<str>::from);
 
     let sampler = Arc::new(Mutex::new((render_body, std::time::Instant::now())));
     let live = Arc::new(AtomicUsize::new(0));
 
-    for stream in listener.incoming() {
+    for stream in incoming {
         let stream = match stream {
             Ok(s) => s,
             Err(e) => {
@@ -740,9 +1100,19 @@ pub fn serve_rendered(
         }
         live.fetch_add(1, Ordering::Relaxed);
         let sampler = Arc::clone(&sampler);
-        let counter = Arc::clone(&live);
-        let spawned = std::thread::Builder::new().name("crabmon-http".into()).spawn(move || {
-            handle(stream, || {
+        // Released by `Drop`, not by a statement at the end of the thread
+        // body: a panic anywhere inside `handle` — or in the sampling closure
+        // it calls — skipped that statement and leaked the slot for good.
+        // Sixteen of those and the exporter answers 503 to everything, for
+        // the rest of its life, while still accepting connections.
+        //
+        // Dropping the closure also covers a thread that could not be spawned
+        // at all, since `spawn` takes it by value.
+        let slot = ConnectionSlot(Arc::clone(&live));
+        let token = token.clone();
+        let _ = std::thread::Builder::new().name("crabmon-http".into()).spawn(move || {
+            let _slot = slot;
+            handle(stream, token.as_deref(), || {
                 let mut guard = match sampler.lock() {
                     Ok(g) => g,
                     // A panic in a previous handler must not take the exporter
@@ -754,13 +1124,18 @@ pub fn serve_rendered(
                 *last = std::time::Instant::now();
                 render_body(elapsed)
             });
-            counter.fetch_sub(1, Ordering::Relaxed);
         });
-        if spawned.is_err() {
-            live.fetch_sub(1, Ordering::Relaxed);
-        }
     }
     Ok(())
+}
+
+/// One live connection's share of `MAX_CONNECTIONS`, given back when dropped.
+struct ConnectionSlot(Arc<AtomicUsize>);
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -793,6 +1168,63 @@ mod tests {
             nets: vec![NetIface { name: "eth0".into(), rx_bps: 1024.0, ..Default::default() }],
             ..Default::default()
         }
+    }
+
+    /// `crabmon_up{host="db-1"} 1` for a machine nobody can reach reads as
+    /// "db-1 is fine", which is the opposite of what happened.
+    #[test]
+    fn an_unreachable_host_in_a_fleet_is_not_up() {
+        let down = render_host(&Snapshot::default(), 0, &[], false);
+        assert!(down.contains("crabmon_up 0"), "{down}");
+        let live = render_host(&snap(), 0, &[], true);
+        assert!(live.contains("crabmon_up 1"), "{live}");
+    }
+
+    /// A fleet had a dashboard and no metrics: crabmon could watch several
+    /// hosts over SSH and could export what it measured, and the two could
+    /// not meet.
+    #[test]
+    fn several_hosts_merge_into_one_scrape_with_a_host_label() {
+        let a = render(&snap(), 2);
+        let b = render(&snap(), 2);
+        let merged = merge_hosts(&[("web-1".into(), a), ("db-1".into(), b)]);
+
+        assert!(merged.contains("crabmon_up{host=\"web-1\"} 1"), "{merged}");
+        assert!(merged.contains("crabmon_up{host=\"db-1\"} 1"), "{merged}");
+        // Labels a series already had survive alongside it.
+        assert!(merged.contains("crabmon_cpu_core_usage_percent{host=\"web-1\",core=\"0\"}"));
+
+        // A repeated HELP line loses the *whole* scrape, not one host's.
+        for family in ["crabmon_up", "crabmon_cpu_usage_percent"] {
+            let helps =
+                merged.lines().filter(|l| l.starts_with(&format!("# HELP {family} "))).count();
+            assert_eq!(helps, 1, "{family} declared {helps} times:\n{merged}");
+        }
+    }
+
+    /// Every sample of a family has to sit under that family's own
+    /// HELP/TYPE pair, not be scattered through the scrape.
+    #[test]
+    fn merged_families_stay_grouped() {
+        let merged =
+            merge_hosts(&[("a".into(), render(&snap(), 1)), ("b".into(), render(&snap(), 1))]);
+        let mut seen: Vec<&str> = Vec::new();
+        for line in merged.lines() {
+            if line.starts_with('#') {
+                continue;
+            }
+            let family = line.split(['{', ' ']).next().unwrap_or_default();
+            if seen.last() != Some(&family) {
+                assert!(!seen.contains(&family), "{family} appears in two places:\n{merged}");
+                seen.push(family);
+            }
+        }
+    }
+
+    #[test]
+    fn a_host_name_is_escaped_like_any_other_label() {
+        let merged = merge_hosts(&[("we\"ird".into(), "crabmon_up 1\n".into())]);
+        assert!(merged.contains("host=\"we\\\"ird\""), "{merged}");
     }
 
     #[test]
@@ -1045,6 +1477,25 @@ mod tests {
         assert!(!render(&s, 0).contains("crabmon_process_cpu_percent"));
     }
 
+    /// Exporting zero where the log cannot be read would claim the machine
+    /// is healthy on every host with `dmesg_restrict=1`.
+    #[test]
+    fn kernel_events_are_exported_but_not_invented() {
+        let mut snap = snap();
+        snap.kernel = vec![crate::metrics::kmsg::parse_record(
+            "4,1,1000000,-;Out of memory: Killed process 1 (init)",
+        )
+        .unwrap()];
+        let out = render(&snap, 10);
+        assert!(out.contains("crabmon_kernel_events{kind=\"oom\"} 1"), "{out}");
+        assert!(out.contains("crabmon_kernel_events{kind=\"segfault\"} 0"), "{out}");
+
+        snap.kernel.clear();
+        snap.kernel_unreadable = Some("needs root".into());
+        let out = render(&snap, 10);
+        assert!(!out.contains("kernel_events"), "an unreadable log reported as healthy:\n{out}");
+    }
+
     #[test]
     fn absent_hardware_produces_no_series_rather_than_zeros() {
         let text = render(&Snapshot::default(), 0);
@@ -1065,16 +1516,204 @@ mod tests {
         assert!(text.contains("crabmon_pressure_some_ratio{resource=\"io\"} 0.0255"), "{text}");
     }
 
+    /// No port, no network, and the filesystem does the access control.
+    #[cfg(unix)]
+    #[test]
+    fn metrics_can_be_served_over_a_unix_socket() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+
+        let dir = std::env::temp_dir().join(format!("crabmon-sock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metrics.sock");
+        let addr = format!("unix:{}", path.display());
+
+        std::thread::spawn({
+            let addr = addr.clone();
+            move || {
+                let _ = serve_rendered(&addr, None, |_| "socket body\n".into());
+            }
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while UnixStream::connect(&path).is_err() {
+            assert!(std::time::Instant::now() < deadline, "the socket never appeared");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut c = UnixStream::connect(&path).expect("connect");
+        c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        c.write_all(b"GET /metrics HTTP/1.1\r\n\r\n").unwrap();
+        let mut response = String::new();
+        let _ = c.read_to_string(&mut response);
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("socket body"), "{response}");
+
+        // A scrape carries every command line on the machine; a permissive
+        // umask must not hand that to everyone.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode & 0o007, 0, "the socket is world-accessible: {mode:o}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A socket left behind by a killed exporter must not stop the next one
+    /// starting, and must not let it steal a live one.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_socket_file_is_replaced_but_a_live_one_is_not() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("crabmon-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Stale: a plain file where a socket used to be.
+        let stale = dir.join("stale.sock");
+        std::fs::write(&stale, "").unwrap();
+        let addr = format!("unix:{}", stale.display());
+        std::thread::spawn({
+            let addr = addr.clone();
+            move || {
+                let _ = serve_rendered(&addr, None, |_| String::new());
+            }
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::os::unix::net::UnixStream::connect(&stale).is_err() {
+            assert!(std::time::Instant::now() < deadline, "a stale socket was not replaced");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Live: something is already listening, so binding must fail rather
+        // than unlink it.
+        let live = dir.join("live.sock");
+        let _held = UnixListener::bind(&live).unwrap();
+        let err = serve_rendered(&format!("unix:{}", live.display()), None, |_| String::new());
+        assert!(err.is_err(), "a live socket was stolen");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_address_says_whether_it_is_a_socket_or_a_port() {
+        assert_eq!(unix_socket_path("unix:/run/crabmon.sock"), Some("/run/crabmon.sock"));
+        assert_eq!(unix_socket_path("/run/crabmon.sock"), Some("/run/crabmon.sock"));
+        assert_eq!(unix_socket_path("./crabmon.sock"), Some("./crabmon.sock"));
+        assert_eq!(unix_socket_path(":9100"), None);
+        assert_eq!(unix_socket_path("9100"), None);
+        assert_eq!(unix_socket_path("127.0.0.1:9100"), None);
+        assert_eq!(unix_socket_path("unix:"), None);
+    }
+
+    /// The exporter publishes every command line on the machine. Binding it
+    /// off loopback was one flag away and there was no way to ask for a
+    /// password.
+    #[test]
+    fn a_configured_token_is_required_for_metrics() {
+        let token = Some("s3cret");
+        let deny = route("GET", "/metrics", None, token, || "body".into());
+        assert!(deny.starts_with("HTTP/1.1 401"), "{deny}");
+        assert!(deny.contains("WWW-Authenticate"), "a 401 has to say what to send: {deny}");
+        assert!(!deny.contains("body"), "the body leaked past the check: {deny}");
+
+        let wrong = route("GET", "/metrics", Some("Bearer nope"), token, || "body".into());
+        assert!(wrong.starts_with("HTTP/1.1 401"), "{wrong}");
+
+        let ok = route("GET", "/metrics", Some("Bearer s3cret"), token, || "body".into());
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+        assert!(ok.contains("body"));
+    }
+
+    /// A liveness probe that needs a credential is a liveness probe that
+    /// gets switched off, and `/healthz` says nothing about the machine.
+    #[test]
+    fn health_stays_open_even_with_a_token_set() {
+        let out = route("GET", "/healthz", None, Some("s3cret"), String::new);
+        assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+    }
+
+    #[test]
+    fn with_no_token_configured_everything_is_open_as_before() {
+        let out = route("GET", "/metrics", None, None, || "body".into());
+        assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+    }
+
+    #[test]
+    fn the_header_is_accepted_in_the_spellings_clients_send() {
+        for header in ["Bearer s3cret", "bearer s3cret", " Bearer  s3cret ", "s3cret"] {
+            assert!(authorized(Some(header), Some("s3cret")), "{header} was refused");
+        }
+        for header in ["Bearer s3cre", "Bearer s3crett", "", "Basic s3cret"] {
+            assert!(!authorized(Some(header), Some("s3cret")), "{header} was accepted");
+        }
+    }
+
+    /// A comparison that returns on the first differing byte tells a caller
+    /// how much of the token it has guessed.
+    #[test]
+    fn secrets_compare_without_short_circuiting() {
+        assert!(secret_eq("abc", "abc"));
+        assert!(!secret_eq("abc", "abd"));
+        assert!(!secret_eq("abc", "abcd"));
+        assert!(!secret_eq("", "a"));
+        assert!(secret_eq("", ""));
+    }
+
+    /// End to end over a socket, because the header has to be *read* as well
+    /// as checked, and the request line alone used to be all that was read.
+    #[test]
+    fn a_scrape_over_a_socket_must_carry_the_token() {
+        use std::io::Read;
+        use std::net::TcpStream;
+
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap().to_string();
+        drop(probe);
+
+        let bound = addr.clone();
+        std::thread::spawn(move || {
+            let _ = serve_rendered(&bound, Some("s3cret".into()), |_| "metrics body\n".into());
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while TcpStream::connect(&addr).is_err() {
+            assert!(std::time::Instant::now() < deadline, "exporter never came up");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let ask = |request: &str| -> String {
+            let mut c = TcpStream::connect(&addr).expect("connect");
+            c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            c.write_all(request.as_bytes()).unwrap();
+            let mut response = String::new();
+            let _ = c.read_to_string(&mut response);
+            response
+        };
+
+        let anonymous = ask("GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(anonymous.starts_with("HTTP/1.1 401"), "{anonymous}");
+        assert!(!anonymous.contains("metrics body"), "the body leaked: {anonymous}");
+
+        let authed =
+            ask("GET /metrics HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer s3cret\r\n\r\n");
+        assert!(authed.starts_with("HTTP/1.1 200"), "{authed}");
+        assert!(authed.contains("metrics body"), "{authed}");
+
+        assert!(ask("GET /healthz HTTP/1.1\r\n\r\n").starts_with("HTTP/1.1 200"));
+    }
+
     #[test]
     fn requests_are_routed_and_bad_methods_rejected() {
         assert_eq!(parse_request_path("GET /metrics HTTP/1.1"), Some(("GET", "/metrics")));
         assert_eq!(parse_request_path("GET /metrics?x=1 HTTP/1.1"), Some(("GET", "/metrics")));
         assert_eq!(parse_request_path(""), None);
 
-        assert!(route("GET", "/metrics", || "body".into()).starts_with("HTTP/1.1 200 OK"));
-        assert!(route("GET", "/healthz", String::new).contains("200 OK"));
-        assert!(route("GET", "/nope", String::new).contains("404"));
-        assert!(route("POST", "/metrics", String::new).contains("405"));
+        assert!(
+            route("GET", "/metrics", None, None, || "body".into()).starts_with("HTTP/1.1 200 OK")
+        );
+        assert!(route("GET", "/healthz", None, None, String::new).contains("200 OK"));
+        assert!(route("GET", "/nope", None, None, String::new).contains("404"));
+        assert!(route("POST", "/metrics", None, None, String::new).contains("405"));
     }
 
     #[test]
@@ -1117,6 +1756,66 @@ mod tests {
     /// A client that sends and sends without ever writing a newline. The read
     /// timeout does not bound this: it limits how long one read may *block*,
     /// and a sender that keeps the socket busy never blocks it. Unbounded,
+    /// A handler that panics must give its connection slot back. It used to
+    /// decrement the counter with a statement at the end of the thread body,
+    /// which a panic skipped: `MAX_CONNECTIONS` panics and the exporter
+    /// answered 503 to everything for the rest of its life.
+    #[test]
+    fn a_panicking_scrape_does_not_cost_the_exporter_a_connection_slot() {
+        use std::io::Read;
+        use std::net::TcpStream;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap().to_string();
+        drop(probe);
+
+        // Panic on every scrape but the last round, so the slots have to come
+        // back for the final request to be answered at all.
+        let scrapes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&scrapes);
+        let bound = addr.clone();
+        std::thread::spawn(move || {
+            let _ = serve_rendered(&bound, None, move |_| {
+                if counter.fetch_add(1, Ordering::SeqCst) < MAX_CONNECTIONS * 2 {
+                    panic!("scrape blew up");
+                }
+                "ok\n".to_string()
+            });
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while TcpStream::connect(&addr).is_err() {
+            assert!(std::time::Instant::now() < deadline, "exporter never came up");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let scrape = |addr: &str| -> String {
+            let mut c = TcpStream::connect(addr).expect("connect");
+            c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            c.write_all(b"GET /metrics HTTP/1.1\r\n\r\n").unwrap();
+            let mut response = String::new();
+            let _ = c.read_to_string(&mut response);
+            response
+        };
+
+        for _ in 0..MAX_CONNECTIONS * 2 {
+            scrape(&addr);
+        }
+        // Give the last panicking handler time to unwind before asking again.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let response = scrape(&addr);
+            if response.starts_with("HTTP/1.1 200 OK") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the exporter never recovered its connection slots: {response}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// `read_line` grows a `String` for as long as the client cares to type.
     #[test]
     fn a_client_that_never_sends_a_newline_is_cut_off_rather_than_buffered() {

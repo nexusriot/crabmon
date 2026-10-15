@@ -7,7 +7,7 @@ use ratatui::widgets::{Gauge, Paragraph};
 use ratatui::Frame;
 
 use crate::app::App;
-use crate::format::{human_bps, human_bytes, truncate_fit};
+use crate::format::{human_bps, human_bytes, human_duration, truncate_fit};
 use crate::metrics::DiskRow;
 use crate::ui::block;
 
@@ -16,7 +16,28 @@ use crate::ui::block;
 /// figures the panel is actually for.
 const BUSY_FROM: f64 = 0.5;
 
+/// Longest ETA worth drawing. Past a week "it is filling" is not news, and
+/// a label that always carries a number is one nobody reads.
+pub const FILL_HORIZON: u64 = 7 * 24 * 3600;
+
+/// `full in 3h 20m`, or nothing.
+///
+/// A percentage cannot ask this question: 95% of a 4 TB array is days of
+/// warning and 95% of a 20 GB root is twenty minutes, and the same alert
+/// fires far too late on one and far too early on the other.
+pub fn fill_text(eta_secs: Option<u64>) -> String {
+    match eta_secs {
+        Some(eta) if eta <= FILL_HORIZON => format!("  full in {}", human_duration(eta)),
+        _ => String::new(),
+    }
+}
+
 pub fn disk_label(d: &DiskRow, mount_width: usize) -> String {
+    disk_label_with_eta(d, mount_width, None)
+}
+
+/// As `disk_label`, with the fill prediction the app has been measuring.
+pub fn disk_label_with_eta(d: &DiskRow, mount_width: usize, eta_secs: Option<u64>) -> String {
     let io = if d.read_bps + d.write_bps < 1.0 {
         String::new()
     } else {
@@ -41,10 +62,11 @@ pub fn disk_label(d: &DiskRow, mount_width: usize) -> String {
         String::new()
     };
     format!(
-        "{}  {} / {}{inodes}{busy}{io}",
+        "{}  {} / {}{inodes}{}{busy}{io}",
         truncate_fit(&d.mount, mount_width),
         human_bytes(d.used),
-        human_bytes(d.total)
+        human_bytes(d.total),
+        fill_text(eta_secs)
     )
 }
 
@@ -93,7 +115,10 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &App) {
                 app.cfg.thresholds.crit,
             )))
             .ratio(ratio)
-            .label(Span::styled(disk_label(d, mount_width), Style::default().fg(app.theme.title)));
+            .label(Span::styled(
+                disk_label_with_eta(d, mount_width, app.fill_eta(&d.mount, d.total, d.used)),
+                Style::default().fg(app.theme.title),
+            ));
         f.render_widget(gauge, *slot);
     }
 }
@@ -101,6 +126,31 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// "95% full" fires far too late on a 4 TB array and far too early on a
+    /// 20 GB root. Time to full is the same number on both.
+    #[test]
+    fn a_filling_disk_says_when_it_will_be_full() {
+        let d = DiskRow {
+            mount: "/var".into(),
+            total: 10_000_000_000,
+            used: 9_000_000_000,
+            ..Default::default()
+        };
+        let label = disk_label_with_eta(&d, 18, Some(3600));
+        assert!(label.contains("full in"), "{label}");
+        assert!(label.contains("01:00:00") || label.contains("1h"), "{label}");
+    }
+
+    /// A disk that is not filling, or that will take a year, says nothing:
+    /// a label that always carries a number is one nobody reads.
+    #[test]
+    fn a_disk_that_is_not_filling_soon_says_nothing_about_it() {
+        let d = DiskRow { mount: "/".into(), total: 100, used: 1, ..Default::default() };
+        assert!(!disk_label_with_eta(&d, 18, None).contains("full in"));
+        assert!(!disk_label_with_eta(&d, 18, Some(FILL_HORIZON + 1)).contains("full in"));
+        assert!(disk_label_with_eta(&d, 18, Some(FILL_HORIZON)).contains("full in"));
+    }
 
     #[test]
     fn idle_disks_omit_the_io_suffix() {

@@ -12,8 +12,9 @@ use super::diskstats::{self, DeviceRates, DiskCounters, DiskStats};
 use super::fds::LimitCache;
 use super::procgroup::CgroupPaths;
 use super::{
-    cgroup, fds, gpu, identity, meminfo, netclass, netns, power, procgroup, psi, rate, CpuSample,
-    DiskRow, GpuInfo, HostInfo, MemSample, MetricSource, NetIface, ProcRow, Sensor, Snapshot,
+    cgroup, fds, gpu, identity, kmsg, meminfo, netclass, netns, power, procgroup, psi, rate, smaps,
+    CpuSample, DiskRow, GpuInfo, HostInfo, MemSample, MetricSource, NetIface, ProcRow, Sensor,
+    Snapshot,
 };
 
 /// Device lists (mounted filesystems, interfaces, sensors) are rescanned on this
@@ -61,12 +62,22 @@ pub struct SysinfoSource {
     /// reported as another container's.
     host_netns: Option<u64>,
     prev_rapl_uj: Option<u64>,
+    /// Follows `/dev/kmsg`. Opened once and drained per sample: the device
+    /// replays the whole ring on open, which is what makes an OOM kill from
+    /// twenty minutes ago visible the moment crabmon starts.
+    kmsg: kmsg::KmsgReader,
+    /// Last `usage_usec` per cgroup, so its CPU reads as a rate rather than
+    /// as a total since the container started.
+    prev_cgroup_usage: HashMap<String, u64>,
 
     virtual_prefixes: Vec<String>,
     use_nvidia_smi: bool,
     /// Count each process's open descriptors. Off by default: it is a
     /// `getdents` sweep per process per sample.
     count_fds: bool,
+    /// Read `/proc/<pid>/smaps_rollup` per process. Opt-in for the same
+    /// reason the descriptor walk is: one more read per process per sample.
+    read_pss: bool,
     host: HostInfo,
 }
 
@@ -180,15 +191,23 @@ impl SysinfoSource {
             netns: netns::NetnsRates::default(),
             host_netns: netns::id_of(std::process::id()),
             prev_rapl_uj: None,
+            kmsg: kmsg::KmsgReader::open(),
+            prev_cgroup_usage: HashMap::new(),
             virtual_prefixes,
             use_nvidia_smi,
             count_fds: false,
+            read_pss: false,
             host,
         }
     }
 
     /// Ask for the FD column's data. A builder rather than a constructor
     /// argument so every existing caller keeps the cheap behaviour.
+    pub fn with_pss(mut self, read_pss: bool) -> SysinfoSource {
+        self.read_pss = read_pss;
+        self
+    }
+
     pub fn with_fds(mut self, count_fds: bool) -> SysinfoSource {
         self.count_fds = count_fds;
         self
@@ -251,6 +270,17 @@ impl SysinfoSource {
             } else {
                 (None, None)
             };
+            // `None` when it was not asked for, so an absent figure is
+            // never confused with a process that shares nothing.
+            //
+            // Threads are skipped: every thread of a process shares one
+            // address space, so `smaps_rollup` reports the *process's*
+            // figures for each of them. Showing that on a thread row would
+            // invite exactly the double-counting PSS exists to remove — and
+            // on a machine with thousands of threads it is thousands of
+            // reads for numbers already shown one row up.
+            let is_process = p.tasks().is_some();
+            let rollup = (self.read_pss && is_process).then(|| smaps::read(pid_u)).flatten();
             let netns = match self.netns_of.get(&pid_u) {
                 Some((seen, ns)) if *seen == start_time => *ns,
                 _ => {
@@ -288,6 +318,8 @@ impl SysinfoSource {
                 name,
                 cpu: p.cpu_usage(),
                 mem: p.memory(),
+                pss: rollup.map(|r| r.pss),
+                uss: rollup.map(|r| r.uss),
                 virt: p.virtual_memory(),
                 state: status_char(p.status()),
                 uid: p.user_id().map(|u| **u),
@@ -435,6 +467,49 @@ impl SysinfoSource {
         out
     }
 
+    /// Read each container's and unit's own cgroup accounting.
+    ///
+    /// The paths come from the processes just collected, so nothing is
+    /// enumerated that is not actually running, and the set is capped: a host
+    /// with hundreds of containers must not turn a panel into hundreds of
+    /// file reads per refresh.
+    fn collect_cgroups(&mut self, secs: f64) -> Vec<cgroup::CgroupStat> {
+        let mut paths: Vec<String> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        for pid in self.sys.processes().keys() {
+            let Some(path) = self.cgroup_paths.peek(pid.as_u32()) else { continue };
+            // Only groups that are a container or a unit: the rest are slices
+            // and scopes nobody is asking about.
+            if procgroup::container_of(path).is_none() && procgroup::service_of(path).is_none() {
+                continue;
+            }
+            if seen.insert(path) {
+                paths.push(path.to_string());
+                if paths.len() >= cgroup::MAX_CGROUPS {
+                    break;
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity(paths.len());
+        let mut usage: HashMap<String, u64> = HashMap::with_capacity(paths.len());
+        for path in paths {
+            let prev = self.prev_cgroup_usage.get(&path).copied();
+            let Some((stat, now)) = cgroup::read_stat(&path, prev, secs) else { continue };
+            if let Some(now) = now {
+                usage.insert(path.clone(), now);
+            }
+            if stat.is_interesting() {
+                out.push(stat);
+            }
+        }
+        // Dropped groups take their previous usage with them, so a container
+        // id reused later starts a fresh rate rather than a huge delta.
+        self.prev_cgroup_usage = usage;
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
     fn collect_sensors(&self) -> Vec<Sensor> {
         let mut out: Vec<Sensor> = self
             .components
@@ -459,6 +534,7 @@ impl MetricSource for SysinfoSource {
     fn snapshot(&mut self, dt: Duration) -> Snapshot {
         let secs = dt.as_secs_f64();
         self.relist_if_due();
+        self.kmsg.drain();
 
         self.sys.refresh_specifics(refresh_kind());
         self.networks.refresh();
@@ -494,6 +570,7 @@ impl MetricSource for SysinfoSource {
             cpu,
             mem,
             cgroup: cgroup::read().filter(|c| c.is_interesting()),
+            cgroups: self.collect_cgroups(secs),
             procs,
             nets: self.collect_nets(secs),
             disks: self.collect_disks(secs),
@@ -502,6 +579,8 @@ impl MetricSource for SysinfoSource {
             psi: psi::read(),
             power: power::read(&mut self.prev_rapl_uj, secs),
             netns,
+            kernel: self.kmsg.events().to_vec(),
+            kernel_unreadable: self.kmsg.error.clone(),
             taken_at_unix: now_unix(),
         }
     }

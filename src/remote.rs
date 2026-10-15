@@ -59,6 +59,20 @@ impl Drop for Stream {
     }
 }
 
+/// Shortest gap between attempts to reopen a dropped stream, and the longest
+/// it backs off to. A host that is down fails fast — `ConnectTimeout=5` or an
+/// immediate refusal — so without a gap the UI spawned a fresh `ssh` (and two
+/// reader threads) on every refresh, several times a second, for as long as
+/// the host stayed unreachable.
+pub const RECONNECT_MIN: Duration = Duration::from_secs(1);
+pub const RECONNECT_MAX: Duration = Duration::from_secs(30);
+
+/// How long to wait before the `n`th consecutive reconnect attempt.
+pub fn reconnect_delay(failures: u32) -> Duration {
+    let factor = 1u64.checked_shl(failures.min(16)).unwrap_or(u64::MAX);
+    RECONNECT_MIN.saturating_mul(factor.min(u32::MAX as u64) as u32).min(RECONNECT_MAX)
+}
+
 pub struct RemoteSource {
     target: String,
     /// The command run on the far end; overridable for a non-standard path.
@@ -68,6 +82,15 @@ pub struct RemoteSource {
     stream_wanted: bool,
     ssh_options: Vec<String>,
     stream: Option<Stream>,
+    /// Earliest a dropped stream may be reopened, and how many times in a row
+    /// it has dropped. Reset as soon as a frame arrives, so a single blip
+    /// costs one second rather than the full backoff.
+    retry_at: Option<std::time::Instant>,
+    failures: u32,
+    /// Bumped only when a *new* frame actually arrives. `last_good` is handed
+    /// out again whenever the far end stalls, and a caller that cannot tell
+    /// the two apart charts an outage as flat, real-looking measurement.
+    frames: u64,
     last_good: Option<Snapshot>,
     pub last_error: Option<String>,
 }
@@ -142,6 +165,9 @@ impl RemoteSource {
             stream_wanted: false,
             ssh_options,
             stream: None,
+            retry_at: None,
+            failures: 0,
+            frames: 0,
             last_good: None,
             last_error: None,
         }
@@ -239,6 +265,14 @@ impl RemoteSource {
         }
         if dead {
             self.stream = None;
+            self.failures = self.failures.saturating_add(1);
+            self.retry_at = Some(std::time::Instant::now() + reconnect_delay(self.failures));
+        }
+        if newest.is_some() {
+            // A session that is producing frames is working; the next drop
+            // should be retried promptly rather than at yesterday's backoff.
+            self.failures = 0;
+            self.retry_at = None;
         }
         newest
     }
@@ -284,13 +318,23 @@ impl MetricSource for RemoteSource {
     fn snapshot(&mut self, _dt: Duration) -> Snapshot {
         if self.stream_wanted {
             if self.stream.is_none() {
+                // Back off between attempts. An unreachable host fails in
+                // milliseconds, so reopening on every tick was a process and
+                // two threads per refresh for as long as it stayed down.
+                if self.retry_at.is_some_and(|at| std::time::Instant::now() < at) {
+                    return self.last_good.clone().unwrap_or_default();
+                }
                 if let Err(e) = self.open_stream() {
                     self.last_error = Some(format!("{}: {e}", self.target));
+                    self.failures = self.failures.saturating_add(1);
+                    self.retry_at =
+                        Some(std::time::Instant::now() + reconnect_delay(self.failures));
                     return self.last_good.clone().unwrap_or_default();
                 }
             }
             if let Some(snap) = self.drain_stream() {
                 self.last_error = None;
+                self.frames = self.frames.wrapping_add(1);
                 self.last_good = Some(snap.clone());
                 return snap;
             }
@@ -314,6 +358,7 @@ impl MetricSource for RemoteSource {
         match self.fetch() {
             Ok(snap) => {
                 self.last_error = None;
+                self.frames = self.frames.wrapping_add(1);
                 self.last_good = Some(snap.clone());
                 snap
             }
@@ -324,6 +369,14 @@ impl MetricSource for RemoteSource {
                 self.last_good.clone().unwrap_or_default()
             }
         }
+    }
+
+    fn frame_id(&self) -> Option<u64> {
+        Some(self.frames)
+    }
+
+    fn is_local(&self) -> bool {
+        false
     }
 
     fn error(&self) -> Option<String> {
@@ -341,6 +394,20 @@ impl MetricSource for RemoteSource {
 
 #[cfg(test)]
 mod tests {
+    /// The backoff that stops an unreachable host costing an `ssh` process
+    /// and two threads on every refresh.
+    #[test]
+    fn reconnect_backs_off_and_is_bounded() {
+        use super::{reconnect_delay, RECONNECT_MAX, RECONNECT_MIN};
+        assert_eq!(reconnect_delay(0), RECONNECT_MIN);
+        assert!(reconnect_delay(1) > reconnect_delay(0));
+        assert!(reconnect_delay(3) > reconnect_delay(2));
+        // Including the arithmetic a long outage would otherwise overflow.
+        for n in [8u32, 16, 64, 1000, u32::MAX] {
+            assert_eq!(reconnect_delay(n), RECONNECT_MAX, "failures = {n}");
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -426,6 +493,20 @@ mod tests {
             .unwrap();
         let out = wait_with_timeout(child, Duration::from_secs(10)).unwrap();
         assert_eq!(out.stdout.len(), 400_000);
+    }
+
+    /// A held frame is not a measurement. Counting it as one charted an
+    /// outage as a flat line of real-looking numbers and kept the
+    /// `sampling…` notice off the screen for the whole of it.
+    #[test]
+    fn a_held_frame_is_not_reported_as_a_new_sample() {
+        let mut src = RemoteSource::new("nonexistent.invalid", None, vec![]);
+        src.last_good = Some(Snapshot { taken_at_unix: 99, ..Default::default() });
+        let before = src.frame_id();
+        for _ in 0..3 {
+            src.snapshot(Duration::ZERO);
+            assert_eq!(src.frame_id(), before, "an outage was charted as measurement");
+        }
     }
 
     #[test]

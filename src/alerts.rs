@@ -1,6 +1,8 @@
 //! Threshold alerts. A rule fires only after its condition has held for
 //! `for_secs`, which keeps a single busy frame from lighting up the status bar.
 
+use std::collections::{HashMap, VecDeque};
+
 use serde::{Deserialize, Serialize};
 
 use crate::filter;
@@ -30,12 +32,42 @@ pub enum AlertKind {
     /// How many processes match `query`. With `below`, this is how you alert
     /// on something having *stopped*.
     Proc,
+    /// Growth of a series over time rather than its level: "this process's
+    /// RSS has risen by 200 MB in the last ten minutes".
+    ///
+    /// `target` names the series — `mem` or `swap` for the machine — or a
+    /// `query` selects processes and the worst grower among them is the one
+    /// measured. `threshold` is in bytes and `over_secs` is the window.
+    Trend,
+    /// How close a container or unit is to *its own* cgroup memory limit,
+    /// as a percentage.
+    ///
+    /// `target` names a container id or a unit; empty means whichever is
+    /// closest to its limit. The host's memory gauge cannot ask this: a
+    /// container at 98% of a 512 MB limit is about to be OOM-killed on a
+    /// machine showing 30% memory used.
+    Cgroup,
+    /// Seconds until a filesystem is full at the rate it is filling.
+    ///
+    /// `target` names a mount; empty means whichever will fill first. Use
+    /// `below`, since the alarming direction is *less* time: "under three
+    /// hours" is `threshold = 10800` with `below = true`.
+    FillIn,
+    /// Kernel events in the current sample. `target` names a kind — `oom`,
+    /// `segfault`, `io-error`, `oops` — and an empty target counts all of
+    /// them.
+    ///
+    /// This is the rule nothing else could express: every other kind
+    /// measures a level, and "a process was killed twenty minutes ago"
+    /// leaves no level behind to measure. Memory is back to normal by the
+    /// time anyone looks, which is exactly why the kill went unexplained.
+    Kernel,
 }
 
 /// Every kind a rule can be, so the docs can be checked against the code
 /// rather than against a hand-maintained list — the same reason `ALL_SORTS`
 /// and `ALL_GROUPINGS` exist.
-pub const ALL_ALERT_KINDS: [AlertKind; 12] = [
+pub const ALL_ALERT_KINDS: [AlertKind; 16] = [
     AlertKind::Cpu,
     AlertKind::Mem,
     AlertKind::Swap,
@@ -48,6 +80,10 @@ pub const ALL_ALERT_KINDS: [AlertKind; 12] = [
     AlertKind::Net,
     AlertKind::Fd,
     AlertKind::Proc,
+    AlertKind::Trend,
+    AlertKind::FillIn,
+    AlertKind::Cgroup,
+    AlertKind::Kernel,
 ];
 
 impl AlertKind {
@@ -66,6 +102,10 @@ impl AlertKind {
             AlertKind::Net => "net",
             AlertKind::Fd => "fd",
             AlertKind::Proc => "proc",
+            AlertKind::Trend => "trend",
+            AlertKind::FillIn => "fillin",
+            AlertKind::Cgroup => "cgroup",
+            AlertKind::Kernel => "kernel",
         }
     }
 }
@@ -79,6 +119,14 @@ pub struct AlertRule {
     pub threshold: f64,
     #[serde(default)]
     pub for_secs: u64,
+    /// The window a `trend` rule measures growth over, in seconds. Ignored
+    /// by every other kind. 0 means `DEFAULT_TREND_WINDOW`.
+    ///
+    /// Distinct from `for_secs`, which is how long the *answer* has to hold
+    /// before the rule fires: a leak alert wants both — measured over ten
+    /// minutes, and still true two minutes later.
+    #[serde(default)]
+    pub over_secs: u64,
     /// Fire when the measurement is *strictly under* the threshold instead of
     /// at or over it.
     ///
@@ -159,6 +207,10 @@ pub struct AlertEngine {
     pending_fired: Vec<String>,
     /// Newest-last transitions, bounded by `MAX_HISTORY`.
     history: Vec<AlertEvent>,
+    /// Series behind the `trend` rules. Kept by the engine rather than by
+    /// the TUI so that a leak is detected identically under `--serve
+    /// --alerts` and `--stream --alerts`, where there is no `App` at all.
+    trends: TrendTracker,
 }
 
 impl AlertEngine {
@@ -166,7 +218,15 @@ impl AlertEngine {
         let state = vec![Tracked::default(); rules.len()];
         let queries = rules
             .iter()
-            .map(|r| (r.kind == AlertKind::Proc).then(|| filter::parse(&r.query).ok()).flatten())
+            // `trend` rules carry a query for the same reason `proc` rules
+            // do — it selects the processes being measured — so it has to be
+            // parsed here too, or the rule silently measures the machine
+            // instead of the processes it named.
+            .map(|r| {
+                matches!(r.kind, AlertKind::Proc | AlertKind::Trend)
+                    .then(|| filter::parse(&r.query).ok())
+                    .flatten()
+            })
             .collect();
         Self {
             rules,
@@ -175,6 +235,7 @@ impl AlertEngine {
             pending_commands: Vec::new(),
             pending_fired: Vec::new(),
             history: Vec::new(),
+            trends: TrendTracker::default(),
         }
     }
 
@@ -184,10 +245,14 @@ impl AlertEngine {
         let mut active = Vec::new();
         let at_unix = snap.taken_at_unix;
         let mut events: Vec<AlertEvent> = Vec::new();
+        self.observe_trends(snap);
         for (i, rule) in self.rules.iter().enumerate() {
-            let Some((value, unit)) =
-                measure(rule, snap, self.queries.get(i).and_then(|q| q.as_ref()))
-            else {
+            let Some((value, unit)) = measure(
+                rule,
+                snap,
+                self.queries.get(i).and_then(|q| q.as_ref()),
+                Some(&self.trends),
+            ) else {
                 continue;
             };
             let st = &mut self.state[i];
@@ -225,16 +290,29 @@ impl AlertEngine {
                 self.pending_fired.push(rule.name.clone());
                 events.push(AlertEvent { name: rule.name.clone(), fired: true, at_unix, value });
             }
+            // The process that is actually growing, when the rule is about
+            // processes: "leak ≥ 200 MiB" is a fact about the machine, and
+            // "leak: postgres +412 MiB in 10m" is something to act on.
+            let subject = match rule.kind {
+                AlertKind::Trend => self
+                    .queries
+                    .get(i)
+                    .and_then(|q| q.as_ref())
+                    .and_then(|f| self.trends.worst_proc_growth(f, snap, rule.window(), rule.below))
+                    .map(|(_, span, name)| {
+                        format!(" ({name} over {})", crate::format::human_duration(span))
+                    })
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
             active.push(ActiveAlert {
                 name: rule.name.clone(),
                 message: format!(
-                    "{} {:.1}{} {} {:.1}{}",
+                    "{} {} {} {}{subject}",
                     rule.name,
-                    value,
-                    unit,
+                    quantity(value, unit),
                     if rule.below { "<" } else { "≥" },
-                    rule.threshold,
-                    unit
+                    quantity(rule.threshold, unit),
                 ),
                 value,
                 threshold: rule.threshold,
@@ -253,6 +331,37 @@ impl AlertEngine {
         if overflow > 0 {
             self.history.drain(..overflow);
         }
+    }
+
+    /// Feed the sample to the trend series, if any rule needs them.
+    ///
+    /// Per-process series are only kept when a `trend` rule actually has a
+    /// query: tracking every process costs a map entry per process per
+    /// sample, and most configurations never ask for it.
+    fn observe_trends(&mut self, snap: &Snapshot) {
+        let windowed =
+            |kind: AlertKind| self.rules.iter().filter(move |r| r.kind == kind).map(|r| r.window());
+        // Machine and per-mount series are kept always — a handful of
+        // entries — so the disks panel can show a fill ETA without anybody
+        // having written a rule. Per-process series are the expensive half
+        // and are only kept when a rule asks for them.
+        let window = windowed(AlertKind::Trend)
+            .chain(windowed(AlertKind::FillIn))
+            .max()
+            .unwrap_or(DEFAULT_TREND_WINDOW);
+        let track_procs =
+            self.rules.iter().any(|r| r.kind == AlertKind::Trend && !r.query.is_empty());
+        self.trends.observe(snap, window, track_procs);
+    }
+
+    /// The trend series, so the interface can draw what the rules measure.
+    pub fn trends(&self) -> &TrendTracker {
+        &self.trends
+    }
+
+    /// Series currently tracked, so the cost of a trend rule is assertable.
+    pub fn tracked_trends(&self) -> usize {
+        self.trends.tracked_procs()
     }
 
     pub fn take_commands(&mut self) -> Vec<String> {
@@ -306,11 +415,255 @@ impl AlertEngine {
                 name: rule.name.clone(),
                 kind: rule.kind,
                 threshold: rule.threshold,
-                value: measure(rule, snap, self.queries.get(i).and_then(|q| q.as_ref()))
-                    .map(|(v, _)| v),
+                value: measure(
+                    rule,
+                    snap,
+                    self.queries.get(i).and_then(|q| q.as_ref()),
+                    Some(&self.trends),
+                )
+                .map(|(v, _)| v),
                 active: self.state.get(i).is_some_and(|s| s.fired),
             })
             .collect()
+    }
+}
+
+/// A measurement with its unit, in whatever spelling that unit deserves.
+///
+/// Bytes get `human_bytes`, because `+432013312.0B` is a number nobody reads
+/// as 412 MiB, and a trend alert is read in a hurry.
+fn quantity(value: f64, unit: &str) -> String {
+    if unit != "B" {
+        return format!("{value:.1}{unit}");
+    }
+    let sign = if value < 0.0 { "-" } else { "+" };
+    format!("{sign}{}", crate::format::human_bytes(value.abs() as u64))
+}
+
+/// How far back a `trend` rule looks when it does not say.
+///
+/// Five minutes: long enough that a build or a garbage collection is not a
+/// leak, short enough to catch one before the machine does.
+pub const DEFAULT_TREND_WINDOW: u64 = 300;
+
+impl AlertRule {
+    /// The window this rule measures over.
+    pub fn window(&self) -> u64 {
+        match self.over_secs {
+            0 => DEFAULT_TREND_WINDOW,
+            n => n,
+        }
+    }
+}
+
+/// Growth over time, which is the one shape a threshold cannot express.
+///
+/// Every other alert kind compares a level against a line: "memory is over
+/// 90%". That catches the machine that is already in trouble. It does not
+/// catch the process whose RSS has gone up by 200 MB every ten minutes since
+/// Tuesday and will take the box out on Friday — by the time that crosses a
+/// line, the useful window for doing something about it has closed.
+///
+/// What is kept is deliberately small: a handful of points per series,
+/// thinned so that a series spans its window in `POINTS` samples however
+/// often crabmon is sampling. A full history of every process's RSS would be
+/// megabytes of live memory in a program whose job is to make memory
+/// pressure visible.
+#[derive(Debug, Default)]
+pub struct TrendTracker {
+    /// Machine-wide series, by name: `mem`, `swap`.
+    machine: HashMap<&'static str, Series>,
+    /// Per-process RSS, keyed by pid *and* start time: a recycled PID is a
+    /// different program, and charting the two as one series is how you get
+    /// a leak alert for a process that has only just started.
+    procs: HashMap<(u32, u64), ProcSeries>,
+    /// Bytes used per mount point, which is what turns "95% full" into "full
+    /// in three hours".
+    disks: HashMap<String, Series>,
+}
+
+/// Points kept per series. Eight is enough to measure a slope across a
+/// window and to survive a sample or two being missed.
+const POINTS: usize = 8;
+
+/// Processes tracked at once. A machine that forks thousands of short-lived
+/// processes must not turn a leak detector into a memory leak.
+const MAX_TRACKED: usize = 4096;
+
+#[derive(Debug, Default, Clone)]
+struct Series {
+    /// Thinned history, oldest first: `(taken_at_unix, value)`, roughly one
+    /// point per `window / POINTS`.
+    points: VecDeque<(u64, u64)>,
+    /// The current sample, always. Kept apart from `points` so that the
+    /// thinning cannot slide the newest point forward and leave the series
+    /// measuring the gap between two samples instead of the window.
+    latest: Option<(u64, u64)>,
+}
+
+#[derive(Debug, Clone)]
+struct ProcSeries {
+    series: Series,
+    name: String,
+    /// The sample this was last seen in, so processes that have exited can
+    /// be dropped rather than tracked for ever.
+    last_seen: u64,
+}
+
+impl Series {
+    /// Record a point, keeping about `POINTS` of them across `window`.
+    fn push(&mut self, at: u64, value: u64, window: u64) {
+        self.latest = Some((at, value));
+        let spacing = (window / POINTS as u64).max(1);
+        let due = match self.points.back() {
+            None => true,
+            Some((last_at, _)) => at.saturating_sub(*last_at) >= spacing,
+        };
+        if due {
+            self.points.push_back((at, value));
+        }
+        // Points that have fallen out of the window, but never the last one:
+        // a series with no baseline has no slope.
+        while self.points.len() > 1
+            && self.points.front().is_some_and(|(t, _)| at.saturating_sub(*t) > window)
+        {
+            self.points.pop_front();
+        }
+        while self.points.len() > POINTS {
+            self.points.pop_front();
+        }
+    }
+
+    /// Change from the oldest point still in the window to the current
+    /// sample, and how long that took.
+    ///
+    /// `None` until the series actually spans half the window: a rule that
+    /// fired on two samples taken a second apart would be reporting noise as
+    /// a trend.
+    fn growth(&self, window: u64) -> Option<(i64, u64)> {
+        let (last_at, last) = self.latest?;
+        let (first_at, first) = *self.points.front()?;
+        let span = last_at.saturating_sub(first_at);
+        if span == 0 || span * 2 < window {
+            return None;
+        }
+        Some((last as i64 - first as i64, span))
+    }
+}
+
+impl TrendTracker {
+    /// Record one sample. `window` is the longest any rule is looking back,
+    /// and `track_procs` says whether any rule needs per-process series at
+    /// all — tracking every process costs a map entry per process per
+    /// sample, and most configurations never ask for it.
+    pub fn observe(&mut self, snap: &Snapshot, window: u64, track_procs: bool) {
+        let at = snap.taken_at_unix;
+        if at == 0 {
+            return;
+        }
+        self.machine.entry("mem").or_default().push(at, snap.mem.used, window);
+        self.machine.entry("swap").or_default().push(at, snap.mem.swap_used, window);
+
+        // A handful of mounts, eight points each: cheap enough to keep
+        // always, which is what lets the disks panel show an ETA without
+        // anybody having written a rule.
+        for d in &snap.disks {
+            self.disks.entry(d.mount.clone()).or_default().push(at, d.used, window);
+        }
+        self.disks.retain(|mount, _| snap.disks.iter().any(|d| &d.mount == mount));
+
+        if !track_procs {
+            self.procs.clear();
+            return;
+        }
+        for p in &snap.procs {
+            let key = (p.pid, p.start_time_unix);
+            if let Some(entry) = self.procs.get_mut(&key) {
+                entry.series.push(at, p.mem, window);
+                entry.last_seen = at;
+                continue;
+            }
+            if self.procs.len() >= MAX_TRACKED {
+                continue;
+            }
+            let mut series = Series::default();
+            series.push(at, p.mem, window);
+            self.procs.insert(key, ProcSeries { series, name: p.name.clone(), last_seen: at });
+        }
+        // A process that has exited keeps nothing: its leak is over.
+        self.procs.retain(|_, entry| entry.last_seen == at);
+    }
+
+    /// Growth of a machine-wide series over its window.
+    pub fn machine_growth(&self, name: &str, window: u64) -> Option<(i64, u64)> {
+        self.machine.get(name)?.growth(window)
+    }
+
+    /// The matching process that has grown the most, with its name.
+    ///
+    /// The worst one, because a rule that averaged across matches would be
+    /// quietest exactly when one process is running away from the rest.
+    pub fn worst_proc_growth(
+        &self,
+        filter: &crate::filter::Filter,
+        snap: &Snapshot,
+        window: u64,
+        shrinking: bool,
+    ) -> Option<(i64, u64, String)> {
+        let matched: std::collections::HashSet<(u32, u64)> = snap
+            .procs
+            .iter()
+            .filter(|p| filter.matches(p))
+            .map(|p| (p.pid, p.start_time_unix))
+            .collect();
+        self.procs
+            .iter()
+            .filter(|(key, _)| matched.contains(key))
+            .filter_map(|(_, entry)| {
+                entry.series.growth(window).map(|(d, span)| (d, span, entry.name.clone()))
+            })
+            // `below` rules are looking for the biggest *fall*, so the
+            // extreme to report is the other end.
+            .reduce(|a, b| match shrinking {
+                true if b.0 < a.0 => b,
+                false if b.0 > a.0 => b,
+                _ => a,
+            })
+    }
+
+    /// Series currently tracked, for tests and for the cost of it to be
+    /// assertable.
+    pub fn tracked_procs(&self) -> usize {
+        self.procs.len()
+    }
+
+    /// Seconds until a filesystem is full at the rate it has been filling,
+    /// or `None` when it is not filling or has not been watched long enough.
+    ///
+    /// This is the disk question worth paging on. A percentage cannot ask
+    /// it: 95% of a 4 TB array is 200 GB of headroom and days of warning,
+    /// while 95% of a 20 GB root is twenty minutes — the same alert fires
+    /// far too late on one and far too early on the other. Time to full is
+    /// the same number on both.
+    pub fn fill_eta(&self, mount: &str, total: u64, used: u64, window: u64) -> Option<u64> {
+        let (delta, span) = self.disks.get(mount)?.growth(window)?;
+        // Not filling, or shrinking: there is no "when".
+        if delta <= 0 || span == 0 {
+            return None;
+        }
+        let free = total.checked_sub(used)?;
+        let bytes_per_sec = delta as f64 / span as f64;
+        (bytes_per_sec > 0.0).then(|| (free as f64 / bytes_per_sec) as u64)
+    }
+
+    /// The mount that will fill first, and when.
+    pub fn soonest_full(&self, snap: &Snapshot, window: u64) -> Option<(String, u64)> {
+        snap.disks
+            .iter()
+            .filter_map(|d| {
+                self.fill_eta(&d.mount, d.total, d.used, window).map(|eta| (d.mount.clone(), eta))
+            })
+            .min_by_key(|(_, eta)| *eta)
     }
 }
 
@@ -322,6 +675,7 @@ fn measure(
     rule: &AlertRule,
     snap: &Snapshot,
     query: Option<&filter::Filter>,
+    trends: Option<&TrendTracker>,
 ) -> Option<(f64, &'static str)> {
     let v = match rule.kind {
         AlertKind::Cpu => snap.cpu.avg(),
@@ -353,6 +707,63 @@ fn measure(
                 .map(|b| (b, "%"))
         }
         AlertKind::Psi => return psi_value(&rule.target, snap).map(|v| (v, "%")),
+        // A slope, in bytes, over the rule's own window. `None` until the
+        // series actually spans that window: a rule that fired on two
+        // samples a second apart would be reporting noise as a trend.
+        AlertKind::Trend => {
+            let trends = trends?;
+            let window = rule.window();
+            // An empty query parses into the filter that matches
+            // *everything*, so the machine series has to be chosen by the
+            // query being absent rather than by the filter being empty.
+            let growth = match query.filter(|_| !rule.query.trim().is_empty()) {
+                Some(filter) => trends
+                    .worst_proc_growth(filter, snap, window, rule.below)
+                    .map(|(delta, _, _)| delta),
+                None => {
+                    let series = match rule.target.trim() {
+                        "" | "mem" | "memory" | "rss" => "mem",
+                        "swap" => "swap",
+                        _ => return None,
+                    };
+                    trends.machine_growth(series, window).map(|(delta, _)| delta)
+                }
+            }?;
+            return Some((growth as f64, "B"));
+        }
+        // The group's own limit, which the host's gauges cannot see: a
+        // container at 98% of a 512 MB limit is about to be killed on a
+        // machine reporting 30% memory used.
+        AlertKind::Cgroup => {
+            return match rule.target.trim() {
+                "" => snap
+                    .cgroups
+                    .iter()
+                    .filter_map(|c| c.mem_ratio())
+                    .fold(None, |acc, r| Some(acc.map_or(r, |a: f64| a.max(r)))),
+                name => snap.cgroup_named(name).and_then(|c| c.mem_ratio()),
+            }
+            .map(|r| (r * 100.0, "%"));
+        }
+        // Seconds, counted down rather than up: the alarming direction is
+        // less time, so these rules are written with `below`.
+        AlertKind::FillIn => {
+            let trends = trends?;
+            let window = rule.window();
+            let eta = match rule.target.trim() {
+                "" => trends.soonest_full(snap, window).map(|(_, eta)| eta),
+                mount => snap
+                    .disks
+                    .iter()
+                    .find(|d| d.mount == mount)
+                    .and_then(|d| trends.fill_eta(&d.mount, d.total, d.used, window)),
+            }?;
+            return Some((eta as f64, "s"));
+        }
+        // A count, not a level. The snapshot carries the events the kernel
+        // has reported, so a rule with `threshold = 1` fires on the first
+        // OOM kill and clears once it has aged out of the window.
+        AlertKind::Kernel => return kernel_count(&rule.target, snap).map(|n| (n as f64, "")),
         // Utilisation, not capacity: a device can be pinned at 4 MB/s of small
         // random reads while both its throughput and its free space look fine.
         AlertKind::Io => {
@@ -406,6 +817,51 @@ fn measure(
 /// The PSI figure a rule's `target` names: `cpu`, `mem`/`memory` or `io`,
 /// optionally suffixed `.full`. An empty target is the worst `some` reading
 /// across all three, which is the same number the status line shows.
+/// The resource names a `psi` rule's target may use, with or without a
+/// `.full` suffix. Exposed so a rule can be *rejected* for naming something
+/// that does not exist rather than silently measuring nothing for ever.
+pub const PSI_RESOURCES: [&str; 4] = ["cpu", "mem", "memory", "io"];
+
+/// Whether `target` names a pressure line this machine's kernel could report.
+pub fn psi_target_is_known(target: &str) -> bool {
+    if target.is_empty() {
+        return true;
+    }
+    let resource = target.split_once('.').map(|(r, _)| r).unwrap_or(target);
+    let suffix = target.split_once('.').map(|(_, s)| s).unwrap_or("");
+    let line_ok = suffix.is_empty()
+        || suffix.eq_ignore_ascii_case("full")
+        || suffix.eq_ignore_ascii_case("some");
+    line_ok && PSI_RESOURCES.iter().any(|r| r.eq_ignore_ascii_case(resource))
+}
+
+/// How many kernel events of the named kind a snapshot carries.
+///
+/// `None` — not zero — when the kernel log could not be read at all, so a
+/// rule on a host where `/dev/kmsg` needs root reports nothing rather than
+/// "no process has ever been OOM-killed here".
+pub fn kernel_count(target: &str, snap: &Snapshot) -> Option<usize> {
+    if snap.kernel_unreadable.is_some() {
+        return None;
+    }
+    if target.is_empty() {
+        return Some(snap.kernel.len());
+    }
+    let kind = crate::metrics::kmsg::ALL_EVENT_KINDS
+        .into_iter()
+        .find(|k| k.key_name().eq_ignore_ascii_case(target))?;
+    Some(snap.kernel_count(kind))
+}
+
+/// Whether `target` names a kernel event kind, so a rule can be refused for
+/// naming one that does not exist rather than measuring nothing for ever.
+pub fn kernel_target_is_known(target: &str) -> bool {
+    target.is_empty()
+        || crate::metrics::kmsg::ALL_EVENT_KINDS
+            .iter()
+            .any(|k| k.key_name().eq_ignore_ascii_case(target))
+}
+
 fn psi_value(target: &str, snap: &Snapshot) -> Option<f64> {
     if target.is_empty() {
         return snap.psi.is_available().then(|| snap.psi.worst_avg10());
@@ -438,6 +894,7 @@ pub fn default_rules() -> Vec<AlertRule> {
             kind: AlertKind::Cpu,
             threshold: 90.0,
             for_secs: 30,
+            over_secs: 0,
             below: false,
             target: String::new(),
             query: String::new(),
@@ -449,6 +906,7 @@ pub fn default_rules() -> Vec<AlertRule> {
             kind: AlertKind::Disk,
             threshold: 95.0,
             for_secs: 0,
+            over_secs: 0,
             below: false,
             target: String::new(),
             query: String::new(),
@@ -456,6 +914,363 @@ pub fn default_rules() -> Vec<AlertRule> {
             command_clear: String::new(),
         },
     ]
+}
+
+#[cfg(test)]
+mod trend_tests {
+    use super::*;
+    use crate::metrics::{MemSample, ProcRow};
+
+    fn trend_rule(query: &str, threshold: f64, over_secs: u64) -> AlertRule {
+        AlertRule {
+            name: "leak".into(),
+            kind: AlertKind::Trend,
+            threshold,
+            for_secs: 0,
+            over_secs,
+            below: false,
+            target: if query.is_empty() { "mem".into() } else { String::new() },
+            query: query.into(),
+            command: String::new(),
+            command_clear: String::new(),
+        }
+    }
+
+    /// A machine whose memory climbs steadily over `secs`.
+    fn climbing(at: u64, used: u64, rss: u64) -> Snapshot {
+        Snapshot {
+            mem: MemSample { total: 16 << 30, used, ..Default::default() },
+            procs: vec![ProcRow {
+                pid: 42,
+                name: "postgres".into(),
+                mem: rss,
+                start_time_unix: 1,
+                ..Default::default()
+            }],
+            taken_at_unix: at,
+            ..Default::default()
+        }
+    }
+
+    /// The shape no threshold can express: nothing is over any line, and the
+    /// machine is going to fall over on Friday.
+    #[test]
+    fn a_steady_climb_fires_even_though_no_level_is_near_a_threshold() {
+        let mut e = AlertEngine::new(vec![trend_rule("", (1 << 30) as f64, 600)]);
+        let base = 1_700_000_000;
+        let mut fired = None;
+        for step in 0..=10u64 {
+            // 4 GiB over ten minutes, in a 16 GiB machine: memory never goes
+            // above a quarter, so every `mem` rule stays quiet.
+            let used = (2 << 30) + step * (4 << 30) / 10;
+            let active = e.evaluate(&climbing(base + step * 60, used, 1 << 20), step * 60);
+            if !active.is_empty() && fired.is_none() {
+                fired = Some(active[0].clone());
+            }
+        }
+        let fired = fired.expect("a 4 GiB climb never fired a 1 GiB trend rule");
+        assert!(fired.value >= (1u64 << 30) as f64, "{fired:?}");
+        assert!(fired.message.contains("GiB"), "bytes must read as bytes: {}", fired.message);
+    }
+
+    /// ...and a flat machine does not.
+    #[test]
+    fn a_flat_series_never_fires() {
+        let mut e = AlertEngine::new(vec![trend_rule("", (1 << 30) as f64, 600)]);
+        let base = 1_700_000_000;
+        for step in 0..=10u64 {
+            let active = e.evaluate(&climbing(base + step * 60, 2 << 30, 1 << 20), step * 60);
+            assert!(active.is_empty(), "a flat series fired: {active:?}");
+        }
+    }
+
+    /// Two samples a second apart are noise, not a trend.
+    #[test]
+    fn a_series_that_has_not_spanned_its_window_reports_nothing_yet() {
+        let mut e = AlertEngine::new(vec![trend_rule("", 1024.0, 600)]);
+        let base = 1_700_000_000;
+        assert!(e.evaluate(&climbing(base, 1 << 30, 1 << 20), 0).is_empty());
+        assert!(e.evaluate(&climbing(base + 1, 8 << 30, 1 << 20), 1).is_empty());
+    }
+
+    /// The point of a per-process rule is to name the process.
+    #[test]
+    fn a_process_rule_names_the_one_that_is_growing() {
+        let mut e = AlertEngine::new(vec![trend_rule("postgres", (100 << 20) as f64, 600)]);
+        let base = 1_700_000_000;
+        let mut fired = None;
+        for step in 0..=10u64 {
+            let rss = (100 << 20) + step * (400 << 20) / 10;
+            let active = e.evaluate(&climbing(base + step * 60, 2 << 30, rss), step * 60);
+            if !active.is_empty() && fired.is_none() {
+                fired = Some(active[0].clone());
+            }
+        }
+        let fired = fired.expect("a 400 MiB RSS climb never fired");
+        assert!(fired.message.contains("postgres"), "{}", fired.message);
+    }
+
+    /// A recycled PID is a different program; charting the two as one series
+    /// is how a freshly started process looks like a leak.
+    #[test]
+    fn a_recycled_pid_starts_a_new_series() {
+        let mut e = AlertEngine::new(vec![trend_rule("postgres", (1 << 20) as f64, 600)]);
+        let base = 1_700_000_000;
+        for step in 0..6u64 {
+            e.evaluate(&climbing(base + step * 60, 2 << 30, 1 << 20), step * 60);
+        }
+        // Same PID, different start time, and holding a great deal more.
+        let mut reborn = climbing(base + 600, 2 << 30, 4 << 30);
+        reborn.procs[0].start_time_unix = 2;
+        let active = e.evaluate(&reborn, 600);
+        assert!(active.is_empty(), "a new process was reported as a leak: {active:?}");
+    }
+
+    /// Per-process series cost a map entry per process per sample, so they
+    /// are only kept when a rule actually asks for them.
+    #[test]
+    fn processes_are_only_tracked_when_a_rule_needs_them() {
+        let mut machine_only = AlertEngine::new(vec![trend_rule("", (1 << 30) as f64, 600)]);
+        machine_only.evaluate(&climbing(1_700_000_000, 1 << 30, 1 << 20), 0);
+        assert_eq!(machine_only.tracked_trends(), 0, "processes were tracked unasked");
+
+        let mut per_proc = AlertEngine::new(vec![trend_rule("postgres", (1 << 30) as f64, 600)]);
+        per_proc.evaluate(&climbing(1_700_000_000, 1 << 30, 1 << 20), 0);
+        assert_eq!(per_proc.tracked_trends(), 1);
+    }
+
+    /// A machine that forks constantly must not turn a leak detector into a
+    /// memory leak.
+    #[test]
+    fn the_number_of_tracked_processes_is_bounded() {
+        let mut e = AlertEngine::new(vec![trend_rule("re:.", (1 << 30) as f64, 600)]);
+        let mut snap = climbing(1_700_000_000, 1 << 30, 1 << 20);
+        snap.procs = (0..MAX_TRACKED as u32 * 2)
+            .map(|pid| ProcRow {
+                pid,
+                name: format!("p{pid}"),
+                mem: 1 << 20,
+                start_time_unix: 1,
+                ..Default::default()
+            })
+            .collect();
+        e.evaluate(&snap, 0);
+        assert!(e.tracked_trends() <= MAX_TRACKED, "tracked {}", e.tracked_trends());
+    }
+
+    /// A process that exits takes its series with it: its leak is over.
+    #[test]
+    fn an_exited_process_is_forgotten() {
+        let mut e = AlertEngine::new(vec![trend_rule("postgres", (1 << 30) as f64, 600)]);
+        e.evaluate(&climbing(1_700_000_000, 1 << 30, 1 << 20), 0);
+        assert_eq!(e.tracked_trends(), 1);
+
+        let mut gone = climbing(1_700_000_060, 1 << 30, 0);
+        gone.procs.clear();
+        e.evaluate(&gone, 60);
+        assert_eq!(e.tracked_trends(), 0);
+    }
+
+    /// `below` turns the same rule into "this is being freed", which is the
+    /// shape of a cache being dropped or a service restarting.
+    #[test]
+    fn below_measures_the_biggest_fall() {
+        let mut rule = trend_rule("", -(1i64 << 30) as f64, 600);
+        rule.below = true;
+        let mut e = AlertEngine::new(vec![rule]);
+        let base = 1_700_000_000;
+        let mut fired = false;
+        for step in 0..=10u64 {
+            let used = (8 << 30) - step * (4u64 << 30) / 10;
+            fired |= !e.evaluate(&climbing(base + step * 60, used, 1 << 20), step * 60).is_empty();
+        }
+        assert!(fired, "a 4 GiB fall never fired a -1 GiB rule");
+    }
+
+    /// The disk question worth paging on, which a percentage cannot ask.
+    #[test]
+    fn a_filling_disk_is_measured_in_time_not_percent() {
+        use crate::metrics::DiskRow;
+
+        let mut rule = trend_rule("", 3600.0, 600);
+        rule.kind = AlertKind::FillIn;
+        rule.target = "/var".into();
+        rule.below = true;
+        let mut e = AlertEngine::new(vec![rule]);
+
+        let base = 1_700_000_000;
+        let mut fired = None;
+        for step in 0..=10u64 {
+            // 10 GB filesystem gaining 100 MB a minute: ~40 minutes left at
+            // the end of the window, which is under the hour the rule wants.
+            let used = (5u64 << 30) + step * (100 << 20);
+            let snap = Snapshot {
+                disks: vec![DiskRow {
+                    mount: "/var".into(),
+                    total: 10 << 30,
+                    used,
+                    ..Default::default()
+                }],
+                taken_at_unix: base + step * 60,
+                ..Default::default()
+            };
+            let active = e.evaluate(&snap, step * 60);
+            if !active.is_empty() && fired.is_none() {
+                fired = Some(active[0].clone());
+            }
+        }
+        let fired = fired.expect("a filesystem filling in under an hour never fired");
+        assert!(fired.value > 0.0 && fired.value < 3600.0, "{fired:?}");
+    }
+
+    /// A disk that is not filling has no "when", and a rule that invented
+    /// one would fire on every idle machine for ever.
+    #[test]
+    fn a_disk_that_is_not_filling_measures_nothing() {
+        use crate::metrics::DiskRow;
+
+        let mut rule = trend_rule("", 3600.0, 600);
+        rule.kind = AlertKind::FillIn;
+        rule.below = true;
+        let mut e = AlertEngine::new(vec![rule]);
+        let base = 1_700_000_000;
+        for step in 0..=10u64 {
+            let snap = Snapshot {
+                disks: vec![DiskRow {
+                    mount: "/".into(),
+                    total: 10 << 30,
+                    // Shrinking, then flat: neither has a time to full.
+                    used: (5u64 << 30) - step * (1 << 20),
+                    ..Default::default()
+                }],
+                taken_at_unix: base + step * 60,
+                ..Default::default()
+            };
+            assert!(e.evaluate(&snap, step * 60).is_empty(), "a draining disk fired");
+        }
+    }
+
+    /// A container at 98% of a 512 MB limit is invisible in a host memory
+    /// gauge showing 30% used.
+    #[test]
+    fn a_cgroup_rule_measures_a_group_against_its_own_limit() {
+        use crate::metrics::cgroup::CgroupStat;
+
+        let mut rule = trend_rule("", 90.0, 600);
+        rule.kind = AlertKind::Cgroup;
+        rule.target = "api".into();
+        let mut e = AlertEngine::new(vec![rule]);
+
+        let snap = Snapshot {
+            cgroups: vec![
+                CgroupStat {
+                    name: "api".into(),
+                    mem_current: Some(500 << 20),
+                    mem_max: Some(512 << 20),
+                    ..Default::default()
+                },
+                CgroupStat {
+                    name: "idle".into(),
+                    mem_current: Some(1 << 20),
+                    mem_max: Some(512 << 20),
+                    ..Default::default()
+                },
+            ],
+            // The host has plenty: that is the whole point.
+            mem: crate::metrics::MemSample { total: 64 << 30, used: 8 << 30, ..Default::default() },
+            taken_at_unix: 1_700_000_000,
+            ..Default::default()
+        };
+        let active = e.evaluate(&snap, 0);
+        assert_eq!(active.len(), 1, "{active:?}");
+        assert!(active[0].value > 97.0, "{:?}", active[0]);
+    }
+
+    /// An untargeted rule watches whichever group is closest to its limit.
+    #[test]
+    fn an_untargeted_cgroup_rule_takes_the_worst_group() {
+        use crate::metrics::cgroup::CgroupStat;
+
+        let mut rule = trend_rule("", 90.0, 600);
+        rule.kind = AlertKind::Cgroup;
+        // The helper fills in a machine series; an untargeted cgroup rule
+        // means "whichever group is worst".
+        rule.target = String::new();
+        let mut e = AlertEngine::new(vec![rule]);
+        let snap = Snapshot {
+            cgroups: vec![
+                CgroupStat {
+                    name: "quiet".into(),
+                    mem_current: Some(1),
+                    mem_max: Some(100),
+                    ..Default::default()
+                },
+                CgroupStat {
+                    name: "loud".into(),
+                    mem_current: Some(99),
+                    mem_max: Some(100),
+                    ..Default::default()
+                },
+            ],
+            taken_at_unix: 1_700_000_000,
+            ..Default::default()
+        };
+        assert_eq!(e.evaluate(&snap, 0).len(), 1);
+    }
+
+    /// A group with no limit has no ratio, and a rule that invented one
+    /// would fire on every unlimited unit on the machine.
+    #[test]
+    fn a_group_with_no_limit_measures_nothing() {
+        use crate::metrics::cgroup::CgroupStat;
+
+        let mut rule = trend_rule("", 1.0, 600);
+        rule.kind = AlertKind::Cgroup;
+        rule.target = String::new();
+        let mut e = AlertEngine::new(vec![rule]);
+        let snap = Snapshot {
+            cgroups: vec![CgroupStat {
+                name: "unlimited".into(),
+                mem_current: Some(8 << 30),
+                mem_max: None,
+                ..Default::default()
+            }],
+            taken_at_unix: 1_700_000_000,
+            ..Default::default()
+        };
+        assert!(e.evaluate(&snap, 0).is_empty());
+    }
+
+    /// Per-mount series are kept whether or not a rule asks, because the
+    /// panel draws the ETA and nobody should have to write a rule for that.
+    #[test]
+    fn mounts_are_tracked_even_with_no_rules_at_all() {
+        use crate::metrics::DiskRow;
+
+        let mut e = AlertEngine::new(Vec::new());
+        for step in 0..=8u64 {
+            let snap = Snapshot {
+                disks: vec![DiskRow {
+                    mount: "/".into(),
+                    total: 1000,
+                    used: 100 + step * 50,
+                    ..Default::default()
+                }],
+                taken_at_unix: 1_700_000_000 + step * 60,
+                ..Default::default()
+            };
+            e.evaluate(&snap, step * 60);
+        }
+        let eta = e.trends().fill_eta("/", 1000, 500, DEFAULT_TREND_WINDOW);
+        assert!(eta.is_some(), "no ETA without a rule");
+    }
+
+    #[test]
+    fn a_byte_quantity_reads_as_bytes_and_keeps_its_sign() {
+        assert_eq!(quantity(1024.0, "B"), "+1.0 KiB");
+        assert_eq!(quantity(-1024.0, "B"), "-1.0 KiB");
+        assert_eq!(quantity(90.0, "%"), "90.0%");
+    }
 }
 
 #[cfg(test)]
@@ -469,6 +1284,7 @@ mod tests {
             kind,
             threshold,
             for_secs,
+            over_secs: 0,
             below: false,
             target: String::new(),
             query: String::new(),

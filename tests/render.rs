@@ -220,6 +220,7 @@ fn a_firing_alert_takes_over_the_status_line() {
         kind: crabmon::alerts::AlertKind::Disk,
         threshold: 90.0,
         for_secs: 0,
+        over_secs: 0,
         below: false,
         query: String::new(),
         target: "/boot".into(),
@@ -677,7 +678,7 @@ fn the_detail_pane_lists_listening_ports_and_socket_count() {
         remote: "0.0.0.0:0".into(),
         state: "LISTEN".into(),
     }];
-    let screen = screen(&mut app, 120, 30);
+    let screen = screen(&mut app, 120, 60);
     assert!(screen.contains("Listening"), "{screen}");
     assert!(screen.contains("8080"), "{screen}");
 }
@@ -696,7 +697,7 @@ fn the_detail_pane_lists_the_files_the_process_has_open() {
         OpenFile { fd: 3, target: "/var/log/crabmon-test.log".into() },
         OpenFile { fd: 4, target: "pipe:[90210]".into() },
     ]);
-    let screen = screen(&mut app, 120, 40);
+    let screen = screen(&mut app, 120, 60);
 
     assert!(screen.contains("Open files"), "{screen}");
     assert!(screen.contains("crabmon-test.log"), "the path itself must be shown: {screen}");
@@ -707,17 +708,104 @@ fn the_detail_pane_lists_the_files_the_process_has_open() {
     assert!(screen.contains("2 files"), "{screen}");
 }
 
+/// The dashboard shows memory *now*; the process that was killed is by
+/// definition no longer in the table.
+#[test]
+fn the_kernel_panel_names_what_was_killed_and_when() {
+    let mut app = common::app();
+    app.snap.host.uptime_secs = 2_000;
+    app.snap.kernel = vec![crabmon::metrics::kmsg::parse_record(
+        "4,1,1234567890,-;Out of memory: Killed process 4242 (postgres)",
+    )
+    .unwrap()];
+
+    let screen = screen(&mut app, 120, 50);
+    assert!(screen.contains("Kernel"), "{screen}");
+    assert!(screen.contains("OOM"), "{screen}");
+    assert!(screen.contains("postgres"), "{screen}");
+}
+
+/// "Nothing has gone wrong" and "I am not allowed to look" are different
+/// answers, and only one of them is reassuring.
+#[test]
+fn an_unreadable_kernel_log_says_why_rather_than_showing_an_empty_panel() {
+    let mut app = common::app();
+    app.snap.kernel_unreadable = Some("needs root or dmesg_restrict=0".into());
+
+    let screen = screen(&mut app, 120, 50);
+    assert!(screen.contains("unreadable"), "{screen}");
+    assert!(screen.contains("dmesg_restrict"), "{screen}");
+}
+
+/// A healthy machine should not carry a panel that says "nothing reported"
+/// for ever.
+#[test]
+fn a_quiet_readable_kernel_log_takes_no_space_at_all() {
+    let mut app = common::app();
+    app.snap.kernel.clear();
+    app.snap.kernel_unreadable = None;
+    let screen = screen(&mut app, 120, 50);
+    assert!(!screen.contains("Kernel"), "an idle panel took space: {screen}");
+}
+
+/// "Why did the OOM killer pick *that* process" is the most common
+/// postmortem question a monitor is asked, and nothing on any panel could
+/// answer it.
+#[test]
+fn the_detail_pane_says_how_a_process_stands_with_the_oom_killer() {
+    let mut app = common::app();
+    app.mode = crabmon::Mode::Detail;
+    app.detail_oom = crabmon::metrics::procdetail::OomScore { score: Some(820), adj: Some(500) };
+    app.detail_ioprio =
+        Some(crabmon::metrics::ioprio::IoPriority::new(crabmon::metrics::ioprio::IoClass::Idle, 0));
+    app.detail_cgroup = Some("/system.slice/nginx.service".into());
+
+    let screen = screen(&mut app, 120, 60);
+    assert!(screen.contains("OOM score"), "{screen}");
+    assert!(screen.contains("820"), "{screen}");
+    assert!(screen.contains("adj +500"), "the thumb on the scale is the point: {screen}");
+    assert!(screen.contains("IO prio"), "{screen}");
+    assert!(screen.contains("idle"), "{screen}");
+    assert!(screen.contains("nginx.service"), "{screen}");
+}
+
+/// A monitor is a thing people screenshot into tickets and project onto a
+/// wall during an incident.
+#[test]
+fn the_detail_pane_shows_environment_names_but_withholds_credentials() {
+    use crabmon::metrics::procdetail::EnvVar;
+
+    let mut app = common::app();
+    app.mode = crabmon::Mode::Detail;
+    app.detail_env = Some(vec![
+        EnvVar { name: "PATH".into(), value: "/usr/bin".into(), hidden: false },
+        EnvVar { name: "AWS_SECRET_ACCESS_KEY".into(), value: String::new(), hidden: true },
+    ]);
+
+    let screen = screen(&mut app, 120, 70);
+    assert!(screen.contains("PATH=/usr/bin"), "{screen}");
+    assert!(
+        screen.contains("AWS_SECRET_ACCESS_KEY"),
+        "knowing it is set is the point, so the name must not be truncated: {screen}"
+    );
+    assert!(screen.contains("<hidden>"), "{screen}");
+    assert!(screen.contains("1 withheld"), "the summary has to admit it: {screen}");
+}
+
 /// A process whose fd table belongs to someone else is not a process holding
 /// nothing, and the pane has to say which of the two it is.
 #[test]
 fn an_unreadable_fd_table_says_so_rather_than_showing_no_files() {
     let mut app = common::app();
     app.mode = crabmon::Mode::Detail;
+    // The environment line draws the same distinction, so it is pinned here
+    // to keep this test about the fd table.
+    app.detail_env = Some(Vec::new());
     app.detail_files = None;
-    assert!(screen(&mut app, 120, 40).contains("not readable"));
+    assert!(screen(&mut app, 120, 60).contains("not readable"));
 
     app.detail_files = Some(Vec::new());
-    let screen = screen(&mut app, 120, 40);
+    let screen = screen(&mut app, 120, 60);
     assert!(screen.contains("Open files"), "{screen}");
     assert!(!screen.contains("not readable"), "an empty table is readable: {screen}");
 }

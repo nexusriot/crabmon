@@ -16,6 +16,7 @@ pub mod filter;
 pub mod fleet;
 pub mod format;
 pub mod history;
+pub mod incident;
 pub mod metrics;
 pub mod record;
 pub mod remote;

@@ -76,6 +76,10 @@ pub struct FleetSource {
     /// Bumped whenever any host produces a new frame, so `App` can tell a
     /// genuinely new sample from the same one handed out again.
     frames: u64,
+    /// The selected host and what its own source last called its frame. The
+    /// count used to move on every poll, so a host that had gone quiet was
+    /// charted as flat measurement instead of showing the `sampling…` notice.
+    last_frame: Option<(usize, Option<u64>)>,
 }
 
 impl FleetSource {
@@ -94,6 +98,7 @@ impl FleetSource {
                 .collect(),
             selected: 0,
             frames: 0,
+            last_frame: None,
         }
     }
 
@@ -122,7 +127,16 @@ impl FleetSource {
                 host.seen = true;
             }
         }
-        self.frames = self.frames.wrapping_add(1);
+        // Switching hosts is new measurement too, even when the host being
+        // switched to has been sitting on the same frame for a while. A host
+        // whose source has no frame id of its own samples afresh on every
+        // call by definition, so there is nothing to deduplicate there.
+        let inner = self.hosts.get(self.selected).and_then(|h| h.source.frame_id());
+        let current = (self.selected, inner);
+        if inner.is_none() || self.last_frame != Some(current) {
+            self.frames = self.frames.wrapping_add(1);
+        }
+        self.last_frame = Some(current);
         self.hosts.get(self.selected).map(|h| h.latest.clone()).unwrap_or_default()
     }
 }
@@ -180,6 +194,11 @@ impl MetricSource for FleetSource {
 
     fn frame_id(&self) -> Option<u64> {
         Some(self.frames)
+    }
+
+    fn is_local(&self) -> bool {
+        // A fleet is remote hosts by construction.
+        false
     }
 }
 

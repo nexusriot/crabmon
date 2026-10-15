@@ -86,6 +86,111 @@ pub fn looks_containerized(cgroup_path: &str, dockerenv_exists: bool) -> bool {
             .any(|m| cgroup_path.contains(m))
 }
 
+/// One cgroup's own accounting, as the kernel keeps it.
+///
+/// Summing per-process figures is the only way crabmon could describe a
+/// container before this, and it is wrong in both directions: it misses
+/// kernel memory, page cache and anything charged to the group rather than
+/// to a task, it misses processes that came and went between samples, and —
+/// the part that matters most — it cannot see the *limit*, so "this
+/// container is at 94% of what it is allowed" was not expressible at all.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CgroupStat {
+    /// The cgroup path, which is also its identity across samples.
+    pub path: String,
+    /// What to call it: a container id or a systemd unit.
+    pub name: String,
+    /// True when the name came from a container id rather than a unit.
+    pub container: bool,
+    pub mem_current: Option<u64>,
+    /// `None` when unlimited.
+    pub mem_max: Option<u64>,
+    /// CPU used over the sampling interval, in cores.
+    pub cpu_cores: Option<f64>,
+    /// `None` when unlimited.
+    pub cpu_quota_cores: Option<f64>,
+}
+
+impl CgroupStat {
+    /// How close the group is to its own memory limit, 0..=1. `None` when it
+    /// has no limit, which is not the same as having room.
+    pub fn mem_ratio(&self) -> Option<f64> {
+        match (self.mem_current, self.mem_max) {
+            (Some(c), Some(m)) if m > 0 => Some((c as f64 / m as f64).clamp(0.0, 1.0)),
+            _ => None,
+        }
+    }
+
+    /// How close it is to its CPU quota, 0..=1.
+    pub fn cpu_ratio(&self) -> Option<f64> {
+        match (self.cpu_cores, self.cpu_quota_cores) {
+            (Some(c), Some(q)) if q > 0.0 => Some((c / q).clamp(0.0, 1.0)),
+            _ => None,
+        }
+    }
+
+    /// Worth a row: something is limited, or something is being used.
+    pub fn is_interesting(&self) -> bool {
+        self.mem_max.is_some() || self.cpu_quota_cores.is_some() || self.mem_current.is_some()
+    }
+}
+
+/// `usage_usec 1234567` out of `cpu.stat`.
+pub fn parse_cpu_usage_usec(content: &str) -> Option<u64> {
+    content.lines().find_map(|l| {
+        let mut it = l.split_whitespace();
+        (it.next()? == "usage_usec").then(|| it.next()?.parse().ok())?
+    })
+}
+
+/// Cgroups read per sample. A machine running hundreds of containers would
+/// otherwise turn a panel into a few hundred file reads every refresh.
+pub const MAX_CGROUPS: usize = 128;
+
+/// Read one cgroup's files. `prev_usage` carries the last `usage_usec` so a
+/// CPU figure can be a rate rather than a total since boot.
+pub fn read_stat(
+    path: &str,
+    prev_usage: Option<u64>,
+    secs: f64,
+) -> Option<(CgroupStat, Option<u64>)> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let base: PathBuf = ["/sys/fs/cgroup", path.trim_start_matches('/')].iter().collect();
+    if !base.exists() {
+        return None;
+    }
+    let read = |name: &str| fs::read_to_string(base.join(name)).ok();
+
+    let usage = read("cpu.stat").as_deref().and_then(parse_cpu_usage_usec);
+    let cpu_cores = match (prev_usage, usage) {
+        // Microseconds of CPU per second of wall clock is cores.
+        (Some(prev), Some(now)) if secs > 0.0 && now >= prev => {
+            Some((now - prev) as f64 / 1_000_000.0 / secs)
+        }
+        _ => None,
+    };
+
+    let container = crate::metrics::procgroup::container_of(path);
+    let name = container
+        .clone()
+        .or_else(|| crate::metrics::procgroup::service_of(path))
+        .unwrap_or_else(|| path.to_string());
+
+    let stat = CgroupStat {
+        path: path.to_string(),
+        name,
+        container: container.is_some(),
+        mem_current: read("memory.current").and_then(|s| s.trim().parse().ok()),
+        mem_max: read("memory.max").and_then(|s| parse_mem_max(&s)),
+        cpu_cores,
+        cpu_quota_cores: read("cpu.max").and_then(|s| parse_cpu_max(&s)),
+    };
+    Some((stat, usage))
+}
+
 /// Read the calling process's cgroup. Linux only; `None` elsewhere.
 pub fn read() -> Option<CgroupInfo> {
     if !cfg!(target_os = "linux") {
@@ -115,6 +220,47 @@ pub fn read() -> Option<CgroupInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_usage_is_read_out_of_cpu_stat() {
+        let stat = "usage_usec 12345678\nuser_usec 10000000\nsystem_usec 2345678\n";
+        assert_eq!(parse_cpu_usage_usec(stat), Some(12_345_678));
+        assert_eq!(parse_cpu_usage_usec("nr_periods 0\n"), None);
+        assert_eq!(parse_cpu_usage_usec(""), None);
+        assert_eq!(parse_cpu_usage_usec("usage_usec notanumber"), None);
+    }
+
+    /// The question per-process sums cannot answer.
+    #[test]
+    fn a_group_reports_how_close_it_is_to_its_own_limits() {
+        let s = CgroupStat {
+            mem_current: Some(940),
+            mem_max: Some(1000),
+            cpu_cores: Some(1.8),
+            cpu_quota_cores: Some(2.0),
+            ..Default::default()
+        };
+        assert_eq!(s.mem_ratio(), Some(0.94));
+        assert_eq!(s.cpu_ratio(), Some(0.9));
+
+        // Unlimited is not the same as having room.
+        let unlimited = CgroupStat { mem_current: Some(940), ..Default::default() };
+        assert_eq!(unlimited.mem_ratio(), None);
+        assert_eq!(unlimited.cpu_ratio(), None);
+    }
+
+    #[test]
+    fn a_ratio_is_clamped_rather_than_exceeding_one() {
+        let over = CgroupStat {
+            mem_current: Some(2000),
+            mem_max: Some(1000),
+            cpu_cores: Some(9.0),
+            cpu_quota_cores: Some(1.0),
+            ..Default::default()
+        };
+        assert_eq!(over.mem_ratio(), Some(1.0));
+        assert_eq!(over.cpu_ratio(), Some(1.0));
+    }
 
     #[test]
     fn unified_hierarchy_wins_over_legacy_lines() {

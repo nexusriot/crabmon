@@ -1,4 +1,4 @@
-//! Snapshot export: `P` in the TUI, or `--once --format json|csv` headless.
+//! Snapshot export: `P` in the TUI, or `--once --format json|csv|text` headless.
 
 use std::path::{Path, PathBuf};
 
@@ -10,13 +10,28 @@ use crate::metrics::{ProcRow, Snapshot};
 pub enum ExportFormat {
     Json,
     Csv,
+    /// An aligned table for a person to read, the `top -b -n1` shape.
+    ///
+    /// Without it the only way to get the numbers out of crabmon was JSON or
+    /// CSV, so "what is this box doing right now" over SSH meant either
+    /// opening a full-screen interface or piping through `jq`.
+    Text,
 }
+
+/// Every format a snapshot can be written in, so the docs and `.gitignore`
+/// can be checked against the code rather than against a hand-kept list —
+/// the same reason `ALL_SORTS` and `ALL_ALERT_KINDS` exist. A format added
+/// without a matching ignore rule is an exported snapshot committed by
+/// accident, which is how `.txt` slipped through.
+pub const ALL_EXPORT_FORMATS: [ExportFormat; 3] =
+    [ExportFormat::Json, ExportFormat::Csv, ExportFormat::Text];
 
 impl ExportFormat {
     pub fn parse(s: &str) -> Option<ExportFormat> {
         match s.trim().to_ascii_lowercase().as_str() {
             "json" => Some(ExportFormat::Json),
             "csv" => Some(ExportFormat::Csv),
+            "text" | "txt" | "plain" => Some(ExportFormat::Text),
             _ => None,
         }
     }
@@ -25,6 +40,7 @@ impl ExportFormat {
         match self {
             ExportFormat::Json => "json",
             ExportFormat::Csv => "csv",
+            ExportFormat::Text => "txt",
         }
     }
 }
@@ -63,12 +79,14 @@ fn csv_field(s: &str) -> String {
 /// Column order of the CSV export. Every `ProcRow` field the JSON carries is
 /// here too: a CSV that silently drops the cgroup, nice and path columns sends
 /// people back to the JSON for exactly the questions CSV is good at.
-pub const CSV_COLUMNS: [&str; 22] = [
+pub const CSV_COLUMNS: [&str; 24] = [
     "pid",
     "ppid",
     "name",
     "cpu_percent",
     "mem_bytes",
+    "pss_bytes",
+    "uss_bytes",
     "virt_bytes",
     "state",
     "user",
@@ -94,12 +112,14 @@ pub fn procs_to_csv(procs: &[ProcRow]) -> String {
     for p in procs {
         let opt = |v: &Option<String>| csv_field(v.as_deref().unwrap_or(""));
         out.push_str(&format!(
-            "{},{},{},{:.1},{},{},{},{},{},{},{},{},{},{},{},{:.0},{:.0},{},{},{},{},{}\n",
+            "{},{},{},{:.1},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.0},{:.0},{},{},{},{},{}\n",
             p.pid,
             p.ppid.map(|v| v.to_string()).unwrap_or_default(),
             csv_field(&p.name),
             p.cpu,
             p.mem,
+            p.pss.map(|v| v.to_string()).unwrap_or_default(),
+            p.uss.map(|v| v.to_string()).unwrap_or_default(),
             p.virt,
             p.state,
             opt(&p.user),
@@ -126,7 +146,66 @@ pub fn render(snap: &Snapshot, format: ExportFormat) -> String {
     match format {
         ExportFormat::Json => to_json(snap),
         ExportFormat::Csv => procs_to_csv(&snap.procs),
+        ExportFormat::Text => to_text(snap),
     }
+}
+
+/// Width the text table assumes when nothing says otherwise. Wide enough for
+/// the columns worth having, narrow enough to paste into a ticket.
+pub const TEXT_WIDTH: u16 = 100;
+
+/// A readable summary: a header line of machine-wide figures, then the
+/// process table as the TUI would lay it out at `TEXT_WIDTH`.
+///
+/// The column planner does the laying out, so the text dump and the
+/// interface agree about what is worth showing and in what order.
+pub fn to_text(snap: &Snapshot) -> String {
+    to_text_with(snap, &[], TEXT_WIDTH)
+}
+
+/// As `to_text`, honouring a configured column list and a width.
+///
+/// A `[procs] columns` list is a statement about which columns are worth
+/// having, and it would be odd for that to apply to the interface and not to
+/// the dump of the same table.
+pub fn to_text_with(snap: &Snapshot, columns: &[String], width: u16) -> String {
+    use crate::format::{human_bps, human_bytes, human_duration};
+
+    let mut out = String::new();
+    let host = match snap.host.hostname.is_empty() {
+        true => "localhost".to_string(),
+        false => snap.host.hostname.clone(),
+    };
+    out.push_str(&format!(
+        "{host}  {} {}  up {}  load {:.2} {:.2} {:.2}\n",
+        snap.host.os,
+        snap.host.kernel,
+        human_duration(snap.host.uptime_secs),
+        snap.host.load[0],
+        snap.host.load[1],
+        snap.host.load[2],
+    ));
+    out.push_str(&format!(
+        "cpu {:>5.1}%   mem {} / {} ({} cache)",
+        snap.cpu.avg(),
+        human_bytes(snap.mem.used),
+        human_bytes(snap.mem.total),
+        human_bytes(snap.mem.detail.buff_cache()),
+    ));
+    if snap.mem.swap_total > 0 {
+        out.push_str(&format!(
+            "   swap {} / {}",
+            human_bytes(snap.mem.swap_used),
+            human_bytes(snap.mem.swap_total)
+        ));
+    }
+    let (rx, tx) = snap.net_totals(false);
+    if rx > 0.0 || tx > 0.0 {
+        out.push_str(&format!("   net ↓ {} ↑ {}", human_bps(rx), human_bps(tx)));
+    }
+    out.push_str("\n\n");
+    out.push_str(&crate::ui::procs::text_table_with(&snap.procs, columns, width));
+    out
 }
 
 /// `crabmon-<unix-timestamp>.<ext>` inside `dir`.
@@ -164,6 +243,21 @@ mod tests {
         assert_eq!(v["mem"]["total"], 16_035_467_264u64);
         assert_eq!(v["procs"][0]["name"], "init");
         assert_eq!(v["crabmon_version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    /// Every variant must round-trip through the spelling the config file
+    /// and `--format` use, or a format is unreachable from either.
+    #[test]
+    fn every_format_parses_from_its_own_name_and_has_an_extension() {
+        for format in ALL_EXPORT_FORMATS {
+            let name = match format {
+                ExportFormat::Json => "json",
+                ExportFormat::Csv => "csv",
+                ExportFormat::Text => "text",
+            };
+            assert_eq!(ExportFormat::parse(name), Some(format), "{name}");
+            assert!(!format.extension().is_empty(), "{name} has no extension");
+        }
     }
 
     #[test]

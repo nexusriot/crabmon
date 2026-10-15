@@ -8,6 +8,7 @@ pub mod disks;
 pub mod fleet;
 pub mod gpu;
 pub mod header;
+pub mod kernel;
 pub mod mem;
 pub mod net;
 pub mod popups;
@@ -77,7 +78,8 @@ impl Layout {
 /// reason `ALL_SORTS` and `ALL_ALERT_KINDS` exist: the config validator and
 /// the docs tests both need to know what the real set is, and a name that only
 /// appears inside the draw code is a name nothing can check.
-pub const SIDE_PANELS: [&str; 7] = ["net", "psi", "sensors", "disks", "power", "gpu", "cgroup"];
+pub const SIDE_PANELS: [&str; 8] =
+    ["net", "psi", "kernel", "sensors", "disks", "power", "gpu", "cgroup"];
 
 pub fn is_side_panel(name: &str) -> bool {
     SIDE_PANELS.contains(&name)
@@ -126,6 +128,7 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
         Mode::ConfirmKill => popups::confirm_kill(f, size, app),
         Mode::Renice => popups::renice(f, size, app),
         Mode::Affinity => popups::affinity(f, size, app),
+        Mode::IoPriority => popups::ioprio(f, size, app),
         Mode::Detail => popups::detail(f, size, app),
         Mode::Help => popups::help(f, size, app),
         Mode::Alerts => popups::alerts(f, size, app),
@@ -185,6 +188,12 @@ fn draw_side_column(f: &mut Frame<'_>, area: Rect, app: &mut App) {
             "psi" if app.cfg.panels.psi && app.snap.psi.is_available() => {
                 ("psi", Constraint::Length(6))
             }
+            // Only when there is something to say, or a reason there is
+            // not: a panel that reads "nothing reported" on every healthy
+            // machine for ever is a panel nobody looks at.
+            "kernel" if app.cfg.panels.kernel && kernel::has_content(app) => {
+                ("kernel", Constraint::Length(kernel::height(app)))
+            }
             "power" if app.cfg.panels.power && app.snap.power.is_available() => {
                 ("power", Constraint::Length(app.snap.power.batteries.len().max(1) as u16 + 3))
             }
@@ -204,6 +213,7 @@ fn draw_side_column(f: &mut Frame<'_>, area: Rect, app: &mut App) {
             "gpu" => gpu::draw(f, slot, app),
             "cgroup" => mem::draw_cgroup(f, slot, app),
             "psi" => psi::draw(f, slot, app),
+            "kernel" => kernel::draw(f, slot, app),
             "power" => power::draw(f, slot, app),
             _ => {}
         }

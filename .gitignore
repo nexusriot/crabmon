@@ -15,14 +15,30 @@
 
 # Snapshots written by the `P` key. With `[export] dir` unset — the default —
 # these land in the working directory, which is the checkout while developing.
-# See `export::export_path`.
+# One rule per `export::ExportFormat`; see `export::export_path`.
 /crabmon-*.json
 /crabmon-*.csv
+/crabmon-*.txt
 
-# Session recordings from `--record`, and the flight recorder's dumps — with
-# `[record] flight_dir` unset, those land in the working directory too, named
-# by `record::dump_name`.
+# Session recordings from `--record`, the rotating segments from
+# `--record-rotate`, and the flight recorder's dumps — with `[record]
+# flight_dir` unset, those land in the working directory too, named by
+# `record::dump_name` and `record::segment_name`.
 *.jsonl
+
+# The human-readable incident summary written beside every flight dump, by
+# `incident::path_for`. Unanchored, because it follows the dump wherever
+# `flight_dir` puts it — but narrow enough not to swallow README.md or
+# anything under docs/.
+crabmon-*.md
+
+# A Unix socket from `--serve unix:...` with a relative path.
+*.sock
+
+# The temporary file `config::save_to` renames over the real config. It only
+# survives a crash mid-save, and only lands here when `--config` points into
+# the checkout.
+*.toml.*.tmp
 
 # Action log, when `[audit] path` points somewhere relative, or when no
 # platform state directory can be resolved and it falls back to `./crabmon/`.

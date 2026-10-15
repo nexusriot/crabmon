@@ -17,35 +17,67 @@ and it can print all of it as JSON or CSV for scripts.
   full-screen layout with one bar per core and live clock speeds.
 - **Memory & swap** — usage gauges colour-coded green → yellow → red, with the
   reclaimable buffers/cache share spelled out so a scary "used" figure has its
-  context.
+  context. Per process, `[procs] pss` adds **PSS** — the process's private
+  pages plus its share of every page it shares — because RSS counts a page
+  shared by eight Chromium processes eight times, so adding up a tree's RSS
+  can exceed the memory the machine has. On this machine the two differ by
+  almost half. A **GROWTH** column sorts by what each process has gained over
+  the window the trend charts cover, so a leak is found by pressing a key
+  rather than by writing a rule and waiting.
 - **Processes** — PID, user, state, CPU%, a CPU sparkline, RSS, virtual size,
   thread count, nice, disk IO, run time, listening ports and command, sortable on
   every column (keyboard or by clicking the header), with a tree view, a query
   language, and a detail pane on `Enter` showing the process's open sockets and
   the files it is holding open — "which log is filling the disk" without
-  leaving crabmon for `lsof` and losing the process you were looking at.
+  leaving crabmon for `lsof` and losing the process you were looking at. The
+  same pane carries its OOM score and the `oom_score_adj` anybody has put on
+  the scale, its IO priority, the cgroup it is really in, and the environment
+  it was started with — with the values of variables that look like
+  credentials withheld, because a monitor is a thing people screenshot into
+  tickets and project onto a wall during an incident.
   Threads are hidden by default (`H` shows them), so the list reflects processes
   rather than every kernel task. Tag several with `Space` to signal, renice or
   pin them at once, and `f` keeps one process at the top of the table however the
   rest churns. The column set can be fixed in the config instead of fitting the
   terminal width.
-- **Process control** — signal menu, renice and CPU affinity. Signals take a
-  two-step confirmation, and all three refuse to act if the PID was recycled
-  while the prompt was open.
+- **Process control** — signal menu, renice, CPU affinity and IO priority.
+  CPU priority does nothing for a process that is saturating a disk, which is
+  the one anybody actually wants to turn down, so `I` sets the IO scheduling
+  class and level the way `ionice` spells them — `be 4`, `idle`, `rt 0`.
+  Signals take a two-step confirmation, and all four refuse to act if the PID
+  was recycled while the prompt was open — or if the processes on screen are
+  not this machine's at all, which is what `--remote` and `--replay` put
+  there.
 - **Network** — per-interface rates and totals with an RX/TX history chart.
   Loopback, bridges, veth pairs and VPN tunnels are excluded from the aggregate
   by default so the same bytes are not counted twice.
+- **Per-container accounting** — each container's and unit's own cgroup is
+  read directly (`memory.current`, `memory.max`, `cpu.stat`, `cpu.max`)
+  rather than summed from its processes. A sum misses kernel memory, page
+  cache and anything charged to the group rather than a task, and it cannot
+  see the *limit* at all — so the grouped view carries a LIMIT column, and
+  `crabmon_cgroup_memory_bytes` and friends are exported.
 - **Per-container network** — the kernel accounts bytes to a network
   namespace rather than to a PID, and every process in a container shares one,
   so the grouped view carries each container's throughput and `--serve`
   exports it. Per-*process* bytes would need eBPF or packet capture, and so
   privileges crabmon does not ask for; this is the honest figure underneath
   the question people are usually asking.
-- **Disks** — one usage gauge per mount with live read/write throughput,
+- **Disks** — one usage gauge per mount with live read/write throughput, and
+  a **time to full** for any filesystem that is filling, because 95% of a
+  4 TB array is days of warning and 95% of a 20 GB root is twenty minutes,
   including LVM and LUKS volumes, and a warning when a filesystem is running
   out of inodes rather than bytes. Busy devices are labelled with their
   utilisation and mean request latency: an NVMe serving small random reads is
   pinned at a few MB/s, and a throughput figure draws that as very nearly idle.
+- **Kernel events** — OOM kills, segfaults, kernel oopses and block-IO
+  errors, read from `/dev/kmsg`. The dashboard shows memory *now*, and the
+  process the OOM killer chose is by definition no longer in the table, so
+  "what got killed, and when" was the one question nothing on screen could
+  answer. Opening the device replays the ring, so a kill from twenty minutes
+  ago is visible the moment crabmon starts. Where `kernel.dmesg_restrict=1`
+  makes the device root-only the panel says so rather than showing an
+  empty list, which would read as "nothing has gone wrong".
 - **Sensors** — temperatures grouped by driver, so a 22-core `coretemp` flood
   does not push the NVMe and chassis sensors off the panel.
 - **GPU** — utilisation, VRAM and temperature from `/sys/class/drm`, with
@@ -66,7 +98,9 @@ and it can print all of it as JSON or CSV for scripts.
   memory, swap, load, disk capacity or saturation, temperature, GPU, pressure
   stall, network throughput, file descriptors — or the number of processes
   matching a filter query, which with `below` is how you get paged when
-  something *stops*. `--serve --alerts` and `--stream --alerts` run the same
+  something *stops*, and `kind = "trend"` on growth rather than level — the
+  process leaking 200 MB every ten minutes, which no threshold catches until
+  it is too late to act on. `--serve --alerts` and `--stream --alerts` run the same
   rules with no terminal at all, exporting each one firing or not — which is
   what puts pressure stall, device saturation and descriptor exhaustion within
   reach of a pager.
@@ -94,7 +128,11 @@ and it can print all of it as JSON or CSV for scripts.
   load, disks, interfaces, sensors, pressure, power and GPU, plus the busiest
   processes (capped, and configurable), including per-device utilisation and
   request latency and, where `[procs] fds` is on, per-process descriptor counts
-  against their limits.
+  against their limits. A scrape carries every command line on the machine, so
+  `[serve] token` (or `CRABMON_SERVE_TOKEN`) can require an
+  `Authorization: Bearer` header before crabmon will answer with any of it;
+  `/healthz` stays open, because a liveness probe that needs a credential is a
+  liveness probe that gets switched off.
 - **Remote** — `--remote host` monitors another machine over SSH, with no
   daemon and no open port, over one long-lived session rather than a process
   per sample. `--remote web-1,web-2,db-1` opens a fleet table instead: one row
@@ -172,7 +210,7 @@ run of stuck workers.
 | Option | Meaning |
 | --- | --- |
 | `-r`, `--refresh <MS>` | Refresh interval, 200–10000 ms |
-| `-s`, `--sort <KEY>` | `pid`, `name`, `cpu`, `mem`, `virt`, `disk`, `time`, `user`, `state`, `threads`, `nice`, `fds` |
+| `-s`, `--sort <KEY>` | `pid`, `name`, `cpu`, `mem`, `virt`, `disk`, `time`, `user`, `state`, `threads`, `nice`, `fds`, `pss`, `growth` |
 | `-a`, `--ascending` | Sort ascending |
 | `-d`, `--descending` | Sort descending (the default) |
 | `-f`, `--filter <QUERY>` | Initial process filter |
@@ -191,7 +229,7 @@ run of stuck workers.
 | `--replay <PATH>` | Replay a recording instead of sampling this host |
 | `--remote <TARGET>` | Monitor TARGET over SSH; comma-separated for a fleet |
 | `--remote-command <C>` | Command to run on the remote host |
-| `--serve <ADDR>` | Serve Prometheus metrics on ADDR, headless (this host only) |
+| `--serve <ADDR>` | Serve Prometheus metrics on ADDR (`:9100` or `unix:/path.sock`), headless; with `--remote`, a whole fleet |
 | `--stream` | Print one JSON snapshot per line forever (this host only) |
 | `--alerts` | With `--serve`/`--stream`: evaluate alert rules headlessly |
 | `--diff <A> [B]` | Compare two snapshots, or one recording end to end |
@@ -217,6 +255,7 @@ run of stuck workers.
 | `s` | Reverse the sort order |
 | click a header | Sort by that column |
 | `T` | Toggle the process tree |
+| `o`, `O` | Fold / unfold a subtree (tree view) |
 | `H` | Show or hide individual threads |
 | `G` | Group by service, container or user |
 | `W` | Show the fleet table (several `--remote` hosts) |
@@ -238,8 +277,10 @@ run of stuck workers.
 | `t` | Signal menu *(Unix)* |
 | `r` | Renice *(Unix)* |
 | `A` | CPU affinity *(Linux)* |
+| `I` | IO priority (ionice) *(Linux)* |
 | `P` | Export a snapshot |
 | `!` | Active alerts and the rules behind them |
+| `Ctrl-R` | Reload the config file, keeping the session |
 | `?`, `F1` | Show all key bindings |
 | mouse wheel | Scroll the process list |
 | mouse click | Select a process |
@@ -251,10 +292,28 @@ Pressing the key of the column you are already sorting by reverses the order.
 the filter, `Esc` clears it. A malformed query is shown in red rather than
 silently matching nothing.
 
+**IO priority** (`I`) takes what `ionice(1)` takes: a class — `none`, `rt`,
+`be` or `idle` — and, for `rt` and `be`, a level from 0 (highest) to 7. `be`
+on its own means the middle of its range. A level on `idle` or `none` is
+refused rather than quietly ignored. `rt` needs `CAP_SYS_ADMIN`.
+
 **Signal menu** (`t`) offers SIGTERM, SIGKILL, SIGINT, SIGHUP, SIGQUIT, SIGSTOP,
 SIGCONT, SIGUSR1 and SIGUSR2. A confirmation prompt asks `y`/`n` before anything
 is sent, and the signal is refused if the PID was recycled while the prompt was
 open.
+
+**Folding** (`o`) hides the subtree under the cursor and marks the row with
+how many rows it is standing in for — `+40 chrome`. A browser or a build with
+two hundred children otherwise buries everything else, which is the opposite
+of what the tree view is for. `O` unfolds everything. Folds are kept by PID,
+so they survive a refresh and vanish with the process.
+
+**Reload** (`Ctrl-R`) re-reads the config file and applies it without
+restarting: thresholds, colours, panels, columns and — the reason it exists —
+`[[alert]]` rules. The filter you typed, what is tagged, pinned and selected,
+the layout and the sort are session state and are kept. A file that does not
+parse changes nothing and says so in the status line. Editing a config
+mid-incident is exactly when restarting costs the most.
 
 **Saved filters** (`1`–`9`) come from `[[filter_preset]]`. A fresh config ships
 five: `busy` (`cpu>5`), `hungry` (`mem>500M`), `mine` (`user:$USER`), `io`
@@ -305,10 +364,25 @@ argv truncated to 200 characters, which is roughly 55 KiB a frame — about
 240 MiB for an hour at the default interval. `[record]` controls all three
 limits.
 
+`--record-rotate DIR` is the version meant to be left on. It keeps
+`[record] rotate_keep` segments of `rotate_frames` frames each in `DIR`,
+deleting the oldest as it goes, so a replay of the last hour or two is always
+available — without having predicted the incident, and without an alert rule
+having described it first. Segments are named `crabmon-<unix>.jsonl` and
+replay like any other recording; rotation only ever deletes files of its own
+naming, so pointing it at a directory with other things in it is safe.
+
+```sh
+crabmon --record-rotate /var/log/crabmon    # ...and later:
+crabmon --replay /var/log/crabmon/crabmon-1788297407.jsonl
+```
+
 `--replay` opens a recording and drives every panel from it. Sampling is paused
 by default while scrubbing: `[` and `]` step a frame, `{` and `}` step ten, and
-`z` plays on. The whole recording is parsed into memory up front, so an
-hours-long capture wants a machine with room for it.
+`z` plays on. A recording over 8 MiB is *indexed* rather than loaded: crabmon
+scans it once for line offsets, which touches no JSON at all, and parses one
+frame at a time as you scrub. Smaller ones are read whole, where holding them
+costs less than indexing them.
 
 ## The flight recorder
 
@@ -329,6 +403,13 @@ like any other recording. Frames are trimmed by the same `[record]` limits on
 the way *into* the ring, so the window costs what a recording of it would, not
 what an untrimmed one would. A rule that flaps extends the dump in progress
 instead of leaving a file per refresh.
+
+Beside it crabmon writes `crabmon-<rule>-<unix>.md`: what fired and by how
+much, the machine at that moment, what the kernel said, the busiest processes,
+and what had changed over the minutes before it — the same comparison `--diff`
+makes. A JSONL dump is evidence nobody can read without crabmon in front of
+it; the summary is what makes "send me a recording of the slowdown" land as a
+ticket somebody opens.
 
 ## Comparing snapshots
 
@@ -423,6 +504,59 @@ device's utilisation, how close a process is to *its own* descriptor limit —
 reachable from a pager. A rule that is not firing still gets a series, because
 a gauge that only appears once something is wrong cannot be alerted on.
 
+`--serve` also takes `--remote`, which turns crabmon into an agentless
+monitoring tier: one process scrapes several machines over SSH and exports all
+of them, every series carrying `host="..."`.
+
+```sh
+crabmon --serve :9100 --remote web-1,web-2,db-1 --alerts
+```
+
+```text
+crabmon_cpu_usage_percent{host="web-1"} 12.5
+crabmon_cpu_usage_percent{host="db-1"} 94.0
+crabmon_alert_active{host="db-1",rule="cpu-saturated",kind="cpu"} 1
+```
+
+Each host gets its own alert engine, because a rule is about *a* machine: one
+engine fed three hosts' snapshots in turn would share a single "already
+fired" flag between them and page about whichever host sampled last. Flight
+dumps are named `crabmon-<host>-<rule>-<unix>.jsonl` for the same reason, and
+hooks and notes say which machine they are about. A host that is down costs a
+scrape nothing but its own missing series.
+
+Binding the exporter off loopback publishes the argv of every process on the
+machine. `[serve] token = "…"`, or `CRABMON_SERVE_TOKEN` in the environment,
+makes a scrape present it first:
+
+```sh
+CRABMON_SERVE_TOKEN=$(cat /etc/crabmon.token) crabmon --serve :9100
+```
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: crabmon
+    bearer_token_file: /etc/crabmon.token
+    static_configs: [{ targets: ['host:9100'] }]
+```
+
+Anything without the header gets `401` and no metrics at all. The token is
+compared in constant time, and `/healthz` is exempt.
+
+Or skip the network entirely: `--serve unix:/run/crabmon.sock` binds a Unix
+socket, where the filesystem does the access control and nothing is listening
+on a port at all. The socket is created mode `0660` rather than at the mercy
+of the umask, and a stale socket left by a killed exporter is replaced on the
+next start — but one that something is still listening on is never stolen.
+
+```yaml
+scrape_configs:
+  - job_name: crabmon
+    static_configs: [{ targets: ['crabmon'] }]
+    # with a scraper that can dial a socket, or socat in front of it
+```
+
 ## Streaming
 
 `--stream` prints one JSON snapshot per line, forever, trimmed by `[record]`
@@ -444,7 +578,7 @@ are clamped rather than rejected.
 
 ```toml
 refresh_ms = 800            # clamped to 200..=10000
-sort_by = "cpu"             # pid|name|cpu|mem|virt|disk|time|user|state|threads|nice|fds
+sort_by = "cpu"             # pid|name|cpu|mem|virt|disk|time|user|state|threads|nice|fds|pss|growth
 sort_desc = true
 filter = ""                 # initial filter query
 tree = false
@@ -458,7 +592,8 @@ show_virtual_ifaces = false
 virtual_iface_prefixes = ["lo", "docker", "br-", "veth", "virbr", "tun", "tap",
                           "wg", "vmnet", "zt", "cni", "flannel", "kube", "utun"]
 history_len = 240           # samples kept per chart, clamped to 16..=4096
-panel_order = ["net", "psi", "sensors", "disks", "power", "gpu", "cgroup"]
+panel_order = ["net", "psi", "kernel", "sensors", "disks", "power", "gpu",
+               "cgroup"]
 
 [thresholds]
 warn = 0.7                  # gauges turn yellow here
@@ -478,12 +613,19 @@ gpu = true
 cgroup = true
 psi = true
 power = true
+kernel = true               # OOM kills, segfaults, oopses and block-IO
+                            # errors; drawn only when there is something to
+                            # report or a reason there is not
 
 [procs]
 # Fixed column order; empty means fit as many as the terminal is wide enough
-# for. Names: mark pid user state cpu trend mem virt thr ni fd disk time ports
-# name. COMMAND is always drawn last, and unknown names are ignored.
+# for. Names: mark pid user state cpu trend mem pss growth virt thr ni fd disk
+# time ports name. COMMAND is always drawn last, and unknown names are ignored.
 columns = []
+pss = false                 # read /proc/<pid>/smaps_rollup for proportional
+                            # and unique memory: adds the PSS column and the
+                            # pss> and uss> filters. One read per process per
+                            # sample, so it is opt-in like fds.
 ports = false               # add the PORTS column and look up ports for the
                             # rows on screen (one fd-table walk per visible row)
 fds = false                 # count every process's open descriptors and read
@@ -505,7 +647,7 @@ nvidia_smi = false          # shell out to nvidia-smi each refresh
 
 [export]
 dir = ""                    # empty means the working directory
-format = "json"             # json|csv
+format = "json"             # json|csv|text
 top_n = 0                   # 0 keeps every process
 
 [record]
@@ -517,8 +659,15 @@ flight = 0                  # flight recorder: frames of context held in memory
                             # At 800 ms, 750 frames is 10 minutes / ~40 MB.
 flight_after = 30           # ...and frames written after the alert
 flight_dir = ""             # empty means the working directory
+rotate_frames = 0           # rotating recording: frames per segment file.
+                            # 0 is off. At 800 ms, 1800 frames is ~24 min.
+rotate_keep = 4             # segments kept, including the one being written
+rotate_dir = ""             # empty means flight_dir, then the working dir
 
 [serve]
+token = ""                  # require `Authorization: Bearer <token>` on
+                            # /metrics. CRABMON_SERVE_TOKEN overrides this,
+                            # which keeps the secret out of a file in git.
 top_procs = 20              # per-process series exported by --serve, busiest
                             # first; 0 disables
 
@@ -543,13 +692,16 @@ crit = "#ff5555"
 
 [[alert]]
 name = "cpu-saturated"
-kind = "cpu"                # cpu|mem|swap|load|disk|temp|gpu|psi|io|net|fd|proc
+kind = "cpu"                # cpu mem swap load disk temp gpu psi io net fd proc trend fillin cgroup kernel
 threshold = 90.0            # % for most kinds; °C for temp, B/s for net,
-                            # a count for proc, absolute for load
+                            # a count for proc and kernel, absolute for load
 for_secs = 30               # must hold this long before firing
+over_secs = 0               # trend rules: the window growth is measured
+                            # over, in seconds. 0 means 300.
 below = false               # fire when strictly *under* the threshold instead
 target = ""                 # mount point, sensor prefix, GPU or interface
-                            # name, psi resource (cpu|mem|io[.full]), or a
+                            # name, psi resource (cpu|mem|io[.full]), a
+                            # kernel event (oom|segfault|io-error|oops), or a
                             # process name for fd rules
 query = ""                  # the filter query a proc rule counts matches of
 command = ""                # run once when the alert activates
@@ -573,13 +725,102 @@ command = "notify-send 'nginx is gone'"
 command_clear = "notify-send 'nginx is back'"
 ```
 
+`kind = "trend"` measures a *slope* rather than a level, which is the shape a
+threshold cannot express. Every other rule catches a machine that is already
+in trouble; this one catches the process whose RSS has gone up 200 MB every
+ten minutes since Tuesday and will take the box out on Friday:
+
+```toml
+[[alert]]
+name = "something-is-leaking"
+kind = "trend"
+query = "postgres"          # the processes measured; the worst one wins.
+                            # Omit it and target = "mem" or "swap" measures
+                            # the machine instead.
+threshold = 2.0e8           # bytes of growth — about 200 MiB
+over_secs = 600             # ...measured over ten minutes
+for_secs = 120              # ...and still true two minutes later
+```
+
+`over_secs` is the window the growth is measured over; `for_secs` is how long
+the answer has to hold before the rule fires, and a leak alert usually wants
+both. A series reports nothing until it actually spans half its window, so a
+rule cannot fire on two samples a second apart, and a recycled PID starts a
+new series rather than charting two programs as one. `below` with a negative
+threshold is the same rule pointed the other way — memory being *released* —
+which is a cache being dropped or a service restarting. From a shell:
+
+```sh
+crabmon --watch-rule 'trend:postgres>200M' --watch-timeout 3600 || page-oncall
+```
+
+Per-process series are only kept when a `trend` rule has a `query`, and at
+most a few thousand processes are tracked, so a machine that forks constantly
+cannot turn the leak detector into a leak.
+
+A `target` that names data rather than a fixed vocabulary — a mount, a
+container, a unit, a sensor prefix — is not checked against what exists now,
+because waiting for something to *appear* is a legitimate thing to ask for.
+A rule naming something that never appears measures nothing and so never
+fires, which with `--watch` is an exit 0 after the timeout.
+
+`kind = "cgroup"` measures a container or unit against *its own* limit, which
+the host's gauges cannot see: a container at 98% of a 512 MB limit is about to
+be OOM-killed on a machine reporting 30% memory used. `target` names a
+container id or a unit, and an empty target watches whichever group is closest
+to its limit.
+
+`kind = "fillin"` answers the disk question a percentage cannot ask. 95% of a
+4 TB array is 200 GB of headroom and days of warning; 95% of a 20 GB root is
+twenty minutes. Time to full is the same number on both:
+
+```toml
+[[alert]]
+name = "var-filling"
+kind = "fillin"
+target = "/var"             # empty means whichever mount fills first
+threshold = 10800           # three hours...
+below = true                # ...and *less* is the alarming direction
+```
+
+The same figure appears in the disks panel — `/var  18.1 GiB / 20.0 GiB  full
+in 02:41:00` — for any mount that will fill within a week, so it is there
+before anyone writes a rule. A filesystem that is not filling has no "when"
+and reports nothing rather than a very large number. From a shell:
+
+```sh
+crabmon --watch-rule 'fillin:/var<3h' --watch-timeout 0 && echo 'act now'
+```
+
+`kind = "kernel"` is the other rule nothing else could express. Every other
+kind measures a level, and "a process was OOM-killed twenty minutes ago"
+leaves no level behind to measure — memory is back to normal by the time anyone looks,
+which is exactly why the kill went unexplained:
+
+```toml
+[[alert]]
+name = "something-was-oom-killed"
+kind = "kernel"
+target = "oom"              # or segfault, io-error, oops; empty means any
+threshold = 1               # at least one in the kernel's recent events
+command = "page-oncall 'the OOM killer has been busy'"
+```
+
+On a host where `/dev/kmsg` needs root the rule reports *nothing* rather than
+zero, so it neither fires nor claims the machine is healthy.
+
 `!` lists the rules, which are firing, and a log of every transition — an alert
 that fires at 03:12 and clears at 03:14 says both.
 
 ## Platform notes
 
 - Sending signals and renice are **Unix-only**.
-- CPU affinity, per-disk IO rates and saturation (`/proc/diskstats`), GPU
+- Process control acts on a local PID, so it is refused outright under
+  `--remote` and `--replay`: the PIDs on screen belong to another machine or
+  another time, and a local process holding the same number is a different
+  program. The detail pane's sockets, open files and listening ports say
+  "not on this host" there for the same reason.
+- CPU affinity, IO priority (`ioprio_set`), per-disk IO rates and saturation (`/proc/diskstats`), GPU
   statistics (`/sys/class/drm`), cgroup limits and the file-descriptor count
   (`/proc/<pid>/fd`, `/proc/<pid>/limits`) are **Linux-only**. Those panels and
   columns are simply absent elsewhere, and `fd>` filters and `kind = "fd"`
@@ -595,6 +836,9 @@ that fires at 03:12 and clears at 03:14 says both.
   rather than the interval rates the Linux path derives. That path is
   compile-checked in CI and unit-tested against captured output, but has not
   been run on real FreeBSD hardware.
+- `--serve --remote` exports a fleet with a `host` label on every series;
+  `--once`, `--stream` and `--watch` still sample the host they run on and
+  refuse `--remote` rather than quietly reporting the wrong machine.
 - `--remote` needs crabmon installed on the far end and non-interactive SSH
   (`BatchMode=yes`). It holds one session open and reads a stream of frames,
   falling back to a process per sample if the far end predates `--stream`; a
@@ -603,8 +847,10 @@ that fires at 03:12 and clears at 03:14 says both.
   the host they run on and refuse to be combined with `--remote` or `--replay`.
 - Temperature sensors depend on the OS exposing them; if none are available the
   panel says so.
-- Alerts, and so the flight recorder, run only in the TUI. `--once`, `--serve`,
-  `--stream` and `--watch` do not evaluate rules and never write a dump.
+- Alert rules are evaluated in the TUI and, with `--alerts`, under `--serve`
+  and `--stream` as well; `--watch` is a rule by construction. `--once` and
+  `--diff` take a single sample, so a hold time has nothing to hold against
+  and they never fire one.
 
 ## Development
 

@@ -108,6 +108,16 @@ impl CgroupPaths {
     }
 
     /// Drop entries for processes that no longer exist.
+    /// The cached path for a pid, without reading anything.
+    ///
+    /// The cgroup sweep runs after the process list has been built, by which
+    /// point every live pid is already cached; re-reading `/proc` for each
+    /// of them would double the cost of a feature whose whole point is to
+    /// stop summing per-process figures.
+    pub fn peek(&self, pid: u32) -> Option<&str> {
+        self.cache.get(&pid).map(|(_, p)| p.as_str())
+    }
+
     pub fn retain_live(&mut self, live: &dyn Fn(u32) -> bool) {
         self.cache.retain(|pid, _| live(*pid));
     }

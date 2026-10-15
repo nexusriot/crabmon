@@ -144,9 +144,20 @@ pub fn affinity(f: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
+pub fn ioprio(f: &mut Frame<'_>, area: Rect, app: &App) {
+    input_popup(
+        f,
+        area,
+        app,
+        format!(" IO priority {} ", app.prompt_subject()),
+        "class and level, e.g. be 4, idle, rt 0:",
+        "[Enter] apply   [Esc] cancel",
+    );
+}
+
 /// Fixed rows the detail pane draws before the socket list. `App` needs the
 /// count to know how far the pane can scroll.
-pub const DETAIL_FIELDS: usize = 21;
+pub const DETAIL_FIELDS: usize = 25;
 
 /// The "Open files" summary line: how many descriptors, and how many of them
 /// are real paths rather than pipes and anonymous inodes.
@@ -154,6 +165,24 @@ pub const DETAIL_FIELDS: usize = 21;
 /// `None` is not zero. A process whose fd table belongs to another user is not
 /// a process holding nothing, and saying "0" there would be a lie the rest of
 /// the pane does not tell.
+/// The "Environment" line: how many variables, and how many were withheld.
+fn env_summary(env: Option<&[crate::metrics::procdetail::EnvVar]>) -> String {
+    match env {
+        // Not zero: another user's process is not a process with no
+        // environment, the same distinction the open-files line draws.
+        None => "not readable".into(),
+        Some([]) => "-".into(),
+        Some(vars) => {
+            let hidden = vars.iter().filter(|v| v.hidden).count();
+            let capped = if vars.len() >= crate::metrics::procdetail::MAX_ENV { "+" } else { "" };
+            match hidden {
+                0 => format!("{}{capped} variables", vars.len()),
+                n => format!("{}{capped} variables, {n} withheld", vars.len()),
+            }
+        }
+    }
+}
+
 fn open_files_summary(files: Option<&[crate::metrics::fds::OpenFile]>) -> String {
     match files {
         None => "not readable".into(),
@@ -196,7 +225,10 @@ pub fn detail(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     let Some(p) = app.selected_row().cloned() else { return };
     let p = &p;
     let files = app.detail_files.clone();
-    let total = DETAIL_FIELDS + app.detail_sockets.len() + files.as_ref().map_or(0, Vec::len);
+    let total = DETAIL_FIELDS
+        + app.detail_sockets.len()
+        + files.as_ref().map_or(0, Vec::len)
+        + app.detail_env.as_ref().map_or(0, Vec::len);
     let title = format!(" {} (pid {}) ", truncate_fit(&p.name, 32), p.pid);
     let inner = scroll_frame(f, area, app, &title, total, (72, 70));
 
@@ -206,6 +238,18 @@ pub fn detail(f: &mut Frame<'_>, area: Rect, app: &mut App) {
             Cell::from(Span::styled(k, Style::default().fg(app.theme.dim))),
             Cell::from(Span::styled(v, Style::default().fg(app.theme.text))),
         ])
+    };
+
+    // Sockets, open files and listening ports are read from the local /proc
+    // by PID, which says nothing about a host at the other end of an SSH
+    // connection or about a recording taken last Tuesday. Saying so beats a
+    // `-` that reads as "this process has none".
+    let off_host = !app.samples_this_host();
+    let elsewhere = |value: String| -> String {
+        match off_host {
+            true => "not on this host".to_string(),
+            false => value,
+        }
     };
 
     let listening: Vec<String> = app
@@ -232,20 +276,34 @@ pub fn detail(f: &mut Frame<'_>, area: Rect, app: &mut App) {
         field("Threads", p.threads.map(|t| t.to_string()).unwrap_or_else(|| "-".into())),
         field("Disk", format!("R {}  W {}", human_bps(p.read_bps), human_bps(p.write_bps))),
         field("Running", human_duration(p.run_time)),
-        field(
-            "Nice",
-            crate::metrics::sysinfo_source::get_priority(p.pid)
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "-".into()),
-        ),
+        // From the row the sampler produced, not from the local host: under
+        // `--remote` or `--replay` a local PID lookup described whatever
+        // program here happened to hold that number.
+        field("Nice", p.nice.map(|n| n.to_string()).unwrap_or_else(|| "-".into())),
         field("FDs", fd_field(p)),
+        // Why the kernel picked *that* process is the most common
+        // postmortem question a monitor is asked, and until now nothing on
+        // any panel could answer it.
+        field("OOM score", elsewhere(app.detail_oom.describe())),
+        field(
+            "IO prio",
+            elsewhere(app.detail_ioprio.map(|p| p.to_string()).unwrap_or_else(|| "-".into())),
+        ),
+        // The unit and container labels are derived from this and drop
+        // whatever they did not recognise; "which slice is it actually in"
+        // is the question when the answer is neither.
+        field("Cgroup", elsewhere(app.detail_cgroup.clone().unwrap_or_else(|| "-".into()))),
+        field("Env vars", elsewhere(env_summary(app.detail_env.as_deref()))),
         field("Service", p.service.clone().unwrap_or_else(|| "-".into())),
         field("Container", p.container.clone().unwrap_or_else(|| "-".into())),
         field("Exe", if p.exe.is_empty() { "-".into() } else { p.exe.clone() }),
         field("Cwd", if p.cwd.is_empty() { "-".into() } else { p.cwd.clone() }),
-        field("Listening", if listening.is_empty() { "-".into() } else { listening.join(", ") }),
-        field("Sockets", app.detail_sockets.len().to_string()),
-        field("Open files", open_files_summary(files.as_deref())),
+        field(
+            "Listening",
+            elsewhere(if listening.is_empty() { "-".into() } else { listening.join(", ") }),
+        ),
+        field("Sockets", elsewhere(app.detail_sockets.len().to_string())),
+        field("Open files", elsewhere(open_files_summary(files.as_deref()))),
     ];
 
     // What the process has been doing, not just what it is doing. "Is this
@@ -275,6 +333,21 @@ pub fn detail(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     // the answer meant leaving it for `lsof`, which loses the process.
     for file in files.as_deref().unwrap_or(&[]) {
         rows.push(field(&format!("fd {}", file.fd), file.target.clone()));
+    }
+
+    // Then the environment it was started with. Values that look like
+    // credentials are withheld: a monitor is a thing people screenshot into
+    // tickets and project onto a wall during an incident, and knowing a
+    // variable is *set* is usually the whole question anyway.
+    for var in app.detail_env.as_deref().unwrap_or(&[]) {
+        let value = match var.hidden {
+            true => "<hidden>",
+            false => var.value.as_str(),
+        };
+        // Name and value together in the wide cell: the key column is ten
+        // characters, which truncates `AWS_SECRET_ACCESS_KEY` to
+        // `AWS_SECRE` — and the name is the half worth reading here.
+        rows.push(field("env", format!("{}={}", var.name, value)));
     }
 
     // Open sockets follow the fields, and scroll with them.
@@ -328,7 +401,7 @@ fn fd_field(p: &crate::metrics::ProcRow) -> String {
 }
 
 /// Every binding, in one place, so the help and the README cannot drift.
-pub const KEYS: [(&str, &str); 39] = [
+pub const KEYS: [(&str, &str); 42] = [
     ("q / Ctrl-C", "quit"),
     ("↑ ↓ / k j", "move selection"),
     ("PgUp PgDn", "move a page"),
@@ -362,8 +435,11 @@ pub const KEYS: [(&str, &str); 39] = [
     ("t", "signal menu (Unix)"),
     ("r", "renice (Unix)"),
     ("A", "CPU affinity (Linux)"),
+    ("I", "IO priority / ionice (Linux)"),
     ("P", "export a snapshot"),
     ("!", "active alerts"),
+    ("o / O", "fold / unfold a subtree (tree view)"),
+    ("Ctrl-R", "reload the config file"),
     ("?", "this help"),
     ("mouse wheel", "scroll the process list"),
     ("mouse click", "select a process"),

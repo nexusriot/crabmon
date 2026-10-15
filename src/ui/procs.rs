@@ -51,11 +51,20 @@ const TIME: Col = col("time", SortBy::Time, "TIME", 9);
 /// list because it walks an fd table per row; add it via `[procs] columns`.
 const PORTS: Col =
     Col { id: "ports", key: SortBy::Pid, title: "PORTS", width: 11, sortable: false };
+/// Proportional set size. Off the automatic list like FD: without
+/// `[procs] pss` every row would read `-`.
+const PSS: Col = col("pss", SortBy::Pss, "PSS", 7);
+/// Resident-memory growth over the window the detail pane charts. Off the
+/// automatic list because it is blank until a process has been watched long
+/// enough to have a history.
+const GROWTH: Col = col("growth", SortBy::Growth, "GROWTH", 8);
 const NAME: Col = col("name", SortBy::Name, "COMMAND", 0);
 
 /// Every column `[procs] columns` can name.
-pub const ALL_COLUMNS: [Col; 15] =
-    [MARK, PID, USER, STATE, CPU, SPARK, MEM, VIRT, THR, NI, FD, DISK, TIME, PORTS, NAME];
+pub const ALL_COLUMNS: [Col; 17] = [
+    MARK, PID, USER, STATE, CPU, SPARK, MEM, PSS, GROWTH, VIRT, THR, NI, FD, DISK, TIME, PORTS,
+    NAME,
+];
 
 pub fn column_by_name(name: &str) -> Option<Col> {
     let name = name.trim().to_ascii_lowercase();
@@ -65,18 +74,19 @@ pub fn column_by_name(name: &str) -> Option<Col> {
 /// Columns in display order, widest-first priority for what gets dropped.
 const OPTIONAL: [Col; 8] = [STATE, USER, DISK, TIME, NI, SPARK, VIRT, THR];
 /// Canonical left-to-right order, whichever subset is chosen.
-const ORDER: [Col; 14] =
-    [MARK, PID, USER, STATE, CPU, SPARK, MEM, VIRT, THR, NI, FD, DISK, TIME, PORTS];
+const ORDER: [Col; 16] =
+    [MARK, PID, USER, STATE, CPU, SPARK, MEM, PSS, GROWTH, VIRT, THR, NI, FD, DISK, TIME, PORTS];
 const MIN_NAME: u16 = 10;
 
 /// Choose the columns that fit in `width`, always keeping the marker, PID,
 /// CPU%, MEM and COMMAND.
 pub fn plan_columns(width: u16, with_ports: bool) -> Vec<Col> {
-    plan(width, with_ports, false)
+    plan(width, with_ports, false, false)
 }
 
-/// As `plan_columns`, but also told whether descriptors are being counted.
-pub fn plan(width: u16, with_ports: bool, with_fds: bool) -> Vec<Col> {
+/// As `plan_columns`, but also told whether descriptors are being counted and
+/// whether proportional memory is being read.
+pub fn plan(width: u16, with_ports: bool, with_fds: bool, with_pss: bool) -> Vec<Col> {
     let mut chosen = vec![MARK, PID, CPU, MEM];
     let cost = |cols: &[Col]| -> u16 {
         // One space of ratatui column spacing between every pair, plus the
@@ -99,6 +109,9 @@ pub fn plan(width: u16, with_ports: bool, with_fds: bool) -> Vec<Col> {
     if with_fds {
         optional.push(FD);
     }
+    if with_pss {
+        optional.push(PSS);
+    }
     optional.extend(OPTIONAL);
     for col in optional {
         let mut trial = chosen.clone();
@@ -118,9 +131,15 @@ pub fn plan(width: u16, with_ports: bool, with_fds: bool) -> Vec<Col> {
 /// An explicit list is honoured as written — someone who asked for a column has
 /// a reason — except that COMMAND is always appended if it was left out, since
 /// a table of numbers with no process names is not a process table.
-pub fn columns_for(width: u16, configured: &[String], ports: bool, fds: bool) -> Vec<Col> {
+pub fn columns_for(
+    width: u16,
+    configured: &[String],
+    ports: bool,
+    fds: bool,
+    pss: bool,
+) -> Vec<Col> {
     if configured.is_empty() {
-        return plan(width, ports, fds);
+        return plan(width, ports, fds, pss);
     }
     let mut out: Vec<Col> = Vec::new();
     for name in configured {
@@ -131,12 +150,93 @@ pub fn columns_for(width: u16, configured: &[String], ports: bool, fds: bool) ->
         }
     }
     if out.is_empty() {
-        return plan(width, ports, fds);
+        return plan(width, ports, fds, pss);
     }
     // COMMAND flexes, so it has to be last wherever it was asked for.
     out.retain(|c| c.id != NAME.id);
     out.push(NAME);
+    fit_to_width(out, width)
+}
+
+/// Drop configured columns, rightmost first, until COMMAND still has
+/// `MIN_NAME` to render in.
+///
+/// The automatic planner reserves `MIN_NAME` as it adds columns; an explicit
+/// `[procs] columns` list did not, so on a narrow terminal — a split pane, a
+/// phone-sized SSH window — `name_width` reached zero and *every process name
+/// rendered blank*, which reads as a rendering bug rather than as a terminal
+/// that is too narrow for the list the config asks for.
+///
+/// Rightmost first because the list is written in display order, so what goes
+/// is the far end of the table rather than something out of the middle of it.
+/// COMMAND itself is never dropped: a process table with no process names is
+/// not one.
+fn fit_to_width(mut cols: Vec<Col>, width: u16) -> Vec<Col> {
+    while cols.len() > 1 && fixed_width(&cols) + MIN_NAME > width {
+        // The last entry is COMMAND; the one before it is the rightmost
+        // fixed column.
+        cols.remove(cols.len() - 2);
+    }
+    cols
+}
+
+/// Lay the process table out as plain text, for `--format text`.
+///
+/// Reuses the column planner, so a text dump and the interface agree about
+/// which columns are worth showing at a given width and in what order. The
+/// columns that need the running app — the sparkline, listening ports,
+/// growth — are dropped rather than drawn blank: a dump has no history and
+/// no fd tables to walk.
+pub fn text_table(procs: &[ProcRow], width: u16) -> String {
+    text_table_with(procs, &[], width)
+}
+
+/// As `text_table`, honouring a configured `[procs] columns` list.
+pub fn text_table_with(procs: &[ProcRow], configured: &[String], width: u16) -> String {
+    let drawable = |c: &Col| !matches!(c.id, "mark" | "trend" | "ports" | "growth");
+    let with_pss = procs.iter().any(|p| p.pss.is_some());
+    let with_fds = procs.iter().any(|p| p.fds.is_some());
+    let cols: Vec<Col> = columns_for(width, configured, false, with_fds, with_pss)
+        .into_iter()
+        .filter(drawable)
+        .collect();
+    let name_width = width.saturating_sub(fixed_width(&cols)).max(MIN_NAME) as usize;
+
+    let mut out = String::new();
+    for (i, c) in cols.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        // COMMAND flexes and is last, so it is left-aligned; everything else
+        // is laid out to its own width.
+        match c.width {
+            0 => out.push_str(c.title),
+            w => out.push_str(&pad_left(c.title, w as usize)),
+        }
+    }
+    out.push('\n');
+
+    for p in procs {
+        for (i, c) in cols.iter().enumerate() {
+            if i > 0 {
+                out.push(' ');
+            }
+            let text = field_text(c.key, p, &p.name, name_width);
+            match c.width {
+                0 => out.push_str(text.trim_end()),
+                w => out.push_str(&pad_left(text.trim(), w as usize)),
+            }
+        }
+        out.push('\n');
+    }
     out
+}
+
+/// Right-align `text` in `width`, truncating anything that will not fit.
+fn pad_left(text: &str, width: usize) -> String {
+    let text = truncate_fit(text, width);
+    let pad = width.saturating_sub(text.chars().count());
+    format!("{}{text}", " ".repeat(pad))
 }
 
 /// Screen x-ranges of each header cell, so a click can be mapped to a sort key.
@@ -193,7 +293,7 @@ pub fn mark_char(pinned: bool, tagged: bool) -> char {
 fn cell_text(col: Col, p: &ProcRow, name: &str, name_width: usize) -> String {
     match col.id {
         "mark" => String::new(),
-        "trend" | "ports" => String::new(),
+        "trend" | "ports" | "growth" => String::new(),
         _ => field_text(col.key, p, name, name_width),
     }
 }
@@ -217,7 +317,37 @@ fn field_text(key: SortBy, p: &ProcRow, name: &str, name_width: usize) -> String
         SortBy::Time => human_duration(p.run_time),
         SortBy::Nice => p.nice.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
         SortBy::Fds => fd_text(p),
+        SortBy::Pss => pss_text(p),
+        // Drawn from the app's own history, which this does not have; the
+        // draw loop fills it in, as it does for TREND and PORTS.
+        SortBy::Growth => String::new(),
         SortBy::Name => truncate_fit(name, name_width),
+    }
+}
+
+/// Proportional memory, with the share that is *not* unique to this process
+/// implied by how far it sits below RSS.
+///
+/// `-` when it was not measured, which is not zero: a process whose maps
+/// cannot be read is not a process using no memory.
+fn pss_text(p: &ProcRow) -> String {
+    match p.pss {
+        Some(pss) => format!("{:>6}", compact_bytes(pss)),
+        None => "     -".into(),
+    }
+}
+
+/// Resident growth over the window, as a signed quantity.
+///
+/// Blank rather than `+0 B` for a process with no history yet: a row that
+/// has been watched for two samples has not been flat, it has not been
+/// measured.
+pub fn growth_text(delta: Option<i64>) -> String {
+    match delta {
+        None => "       -".to_string(),
+        Some(0) => "       ·".to_string(),
+        Some(d) if d < 0 => format!("{:>8}", format!("-{}", compact_bytes(d.unsigned_abs()))),
+        Some(d) => format!("{:>8}", format!("+{}", compact_bytes(d as u64))),
     }
 }
 
@@ -302,8 +432,13 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
 
-    let cols =
-        columns_for(inner.width, &app.cfg.procs.columns, app.cfg.procs.ports, app.cfg.procs.fds);
+    let cols = columns_for(
+        inner.width,
+        &app.cfg.procs.columns,
+        app.cfg.procs.ports,
+        app.cfg.procs.fds,
+        app.cfg.procs.pss,
+    );
     app.proc_area = area;
     app.header_cols = column_ranges(inner, &cols);
 
@@ -347,6 +482,15 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
         app.refresh_ports(&visible);
     }
     let ports = app.ports.clone();
+    // Growth comes from the per-process history the app already keeps for
+    // the TREND column and the detail pane, so the column costs a
+    // subtraction rather than any new sampling.
+    let growth: std::collections::HashMap<u32, Option<i64>> =
+        if cols.iter().any(|c| c.id == GROWTH.id) {
+            app.rows()[start..end].iter().map(|p| (p.pid, app.mem_growth(p.pid))).collect()
+        } else {
+            std::collections::HashMap::new()
+        };
 
     let rows: Vec<Row> = app.rows()[start..end]
         .iter()
@@ -354,9 +498,12 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
         .map(|(i, p)| {
             let display_name = if app.cfg.tree {
                 match tree_rows.get(start + i) {
-                    Some(t) => {
-                        format!("{}{}", crate::tree::indent(t.depth, t.last_sibling), p.name)
-                    }
+                    Some(t) => format!(
+                        "{}{}{}",
+                        crate::tree::indent(t.depth, t.last_sibling),
+                        crate::tree::fold_marker(t),
+                        p.name
+                    ),
                     None => p.name.clone(),
                 }
             } else {
@@ -373,6 +520,7 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
                 let text = match c.id {
                     "trend" => sparkline(spark.get(&p.pid).map(|v| v.as_slice()).unwrap_or(&[]), 8),
                     "ports" => ports_text(ports.get(&p.pid), PORTS.width as usize),
+                    "growth" => growth_text(growth.get(&p.pid).copied().flatten()),
                     "mark" => {
                         if app.cfg.procs.pin_marker {
                             mark_char(pinned, tagged).to_string()
@@ -439,14 +587,19 @@ fn draw_groups(f: &mut Frame<'_>, area: Rect, inner: Rect, app: &mut App) {
     // column when something in view actually has one, so a machine running no
     // containers is not given a column of dashes.
     let with_net = groups.iter().any(|g| g.net_bps.is_some());
-    let titles: &[&str] = if with_net {
-        &["GROUP", "PROCS", "CPU%", "MEM", "DISK", "NET"]
-    } else {
-        &["GROUP", "PROCS", "CPU%", "MEM", "DISK"]
+    // LIMIT earns its column the same way: only when something in view is
+    // actually limited. A machine with no quotas anywhere is not given a
+    // column of dashes.
+    let with_limit = groups.iter().any(|g| g.cgroup_mem_ratio.is_some());
+    let titles: &[&str] = match (with_net, with_limit) {
+        (true, true) => &["GROUP", "PROCS", "CPU%", "MEM", "DISK", "NET", "LIMIT"],
+        (true, false) => &["GROUP", "PROCS", "CPU%", "MEM", "DISK", "NET"],
+        (false, true) => &["GROUP", "PROCS", "CPU%", "MEM", "DISK", "LIMIT"],
+        (false, false) => &["GROUP", "PROCS", "CPU%", "MEM", "DISK"],
     };
     let header = Row::new(titles.to_vec())
         .style(Style::default().add_modifier(Modifier::BOLD).fg(app.theme.title));
-    let reserved = if with_net { 43 } else { 34 };
+    let reserved = 34 + if with_net { 9 } else { 0 } + if with_limit { 7 } else { 0 };
     let name_w = inner.width.saturating_sub(reserved) as usize;
 
     let start = app.group_scroll.min(groups.len());
@@ -477,6 +630,21 @@ fn draw_groups(f: &mut Frame<'_>, area: Rect, inner: Rect, app: &mut App) {
                 Some((rx, tx)) => format!("{:>8}", compact_bytes((rx + tx) as u64)),
             }));
         }
+        if with_limit {
+            // The group's memory against its own limit. `-` is a group with
+            // no limit, which is not the same as one with room to spare.
+            cells.push(match g.cgroup_mem_ratio {
+                None => Cell::from("     -".to_string()),
+                Some(r) => Cell::from(Span::styled(
+                    format!("{:>5.0}%", r * 100.0),
+                    Style::default().fg(app.theme.usage(
+                        r,
+                        app.cfg.thresholds.warn,
+                        app.cfg.thresholds.crit,
+                    )),
+                )),
+            });
+        }
         Row::new(cells)
     });
     let mut widths = vec![
@@ -489,6 +657,9 @@ fn draw_groups(f: &mut Frame<'_>, area: Rect, inner: Rect, app: &mut App) {
     if with_net {
         widths.push(Constraint::Length(9));
     }
+    if with_limit {
+        widths.push(Constraint::Length(7));
+    }
     let table = Table::new(rows, widths).header(header).highlight_style(app.theme.selection());
     let mut state = TableState::default();
     if !groups.is_empty() {
@@ -500,6 +671,139 @@ fn draw_groups(f: &mut Frame<'_>, area: Rect, inner: Rect, app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RSS double-counts shared pages; the column exists to say so, and it
+    /// has to be asked for because it costs a read per process.
+    #[test]
+    fn the_pss_column_appears_only_when_proportional_memory_is_read() {
+        assert!(!plan(200, false, false, false).iter().any(|c| c.id == "pss"));
+        assert!(plan(200, false, false, true).iter().any(|c| c.id == "pss"));
+    }
+
+    /// A process watched for two samples has not been flat, it has not been
+    /// measured, and a column full of noise is one people learn to ignore.
+    #[test]
+    fn growth_reads_as_a_signed_quantity_and_admits_when_it_knows_nothing() {
+        assert_eq!(growth_text(None).trim(), "-");
+        assert_eq!(growth_text(Some(0)).trim(), "·");
+        assert!(growth_text(Some(4 << 20)).trim().starts_with('+'));
+        assert!(growth_text(Some(-(4 << 20))).trim().starts_with('-'));
+        // Every rendering fits the column it is drawn in.
+        for d in [None, Some(0), Some(1 << 40), Some(-(1 << 40))] {
+            assert!(growth_text(d).chars().count() <= GROWTH.width as usize, "{d:?}");
+        }
+    }
+
+    /// The text dump and the interface should agree about what is worth
+    /// showing, which is what reusing the planner buys.
+    #[test]
+    fn the_text_table_lays_out_the_columns_the_planner_chose() {
+        let procs = vec![ProcRow {
+            pid: 42,
+            name: "postgres".into(),
+            cpu: 12.5,
+            mem: 4 << 20,
+            threads: Some(3),
+            ..Default::default()
+        }];
+        let table = text_table(&procs, 100);
+        let header = table.lines().next().unwrap();
+        assert!(header.contains("PID"), "{header}");
+        assert!(header.contains("COMMAND"), "{header}");
+        // The columns that need a running app have nothing to draw here.
+        assert!(!header.contains("TREND"), "{header}");
+        assert!(!header.contains("PORTS"), "{header}");
+        assert!(!header.contains("GROWTH"), "{header}");
+
+        let row = table.lines().nth(1).unwrap();
+        assert!(row.contains("42"), "{row}");
+        assert!(row.contains("postgres"), "{row}");
+        assert!(row.ends_with("postgres"), "COMMAND must be last and unpadded: {row:?}");
+    }
+
+    /// A `[procs] columns` list is a statement about which columns are
+    /// worth having; it would be odd for that to apply to the interface and
+    /// not to a dump of the same table.
+    #[test]
+    fn the_text_table_honours_a_configured_column_list() {
+        let procs = vec![ProcRow {
+            pid: 42,
+            name: "postgres".into(),
+            mem: 4 << 20,
+            threads: Some(1),
+            ..Default::default()
+        }];
+        let configured: Vec<String> =
+            ["pid", "mem", "name"].iter().map(|s| s.to_string()).collect();
+        let header = text_table_with(&procs, &configured, 100).lines().next().unwrap().to_string();
+        assert!(header.contains("PID") && header.contains("MEM"), "{header}");
+        assert!(!header.contains("CPU"), "an unlisted column was drawn: {header}");
+    }
+
+    /// GROWTH needs a running app's history, which a dump does not have.
+    #[test]
+    fn a_dump_drops_the_columns_it_cannot_fill() {
+        let procs =
+            vec![ProcRow { pid: 1, name: "init".into(), threads: Some(1), ..Default::default() }];
+        let configured: Vec<String> =
+            ["pid", "growth", "trend", "ports", "name"].iter().map(|s| s.to_string()).collect();
+        let header = text_table_with(&procs, &configured, 100).lines().next().unwrap().to_string();
+        assert!(!header.contains("GROWTH"), "{header}");
+        assert!(!header.contains("TREND"), "{header}");
+        assert!(!header.contains("PORTS"), "{header}");
+        assert!(header.contains("COMMAND"), "{header}");
+    }
+
+    #[test]
+    fn the_text_table_never_overflows_its_width() {
+        let procs = vec![ProcRow {
+            pid: 999_999,
+            name: "a-very-long-process-name-indeed-that-goes-on".into(),
+            user: Some("averylongusername".into()),
+            mem: 1 << 40,
+            threads: Some(1),
+            ..Default::default()
+        }];
+        for w in [40u16, 80, 100, 200] {
+            for line in text_table(&procs, w).lines() {
+                assert!(
+                    line.chars().count() <= w as usize + MIN_NAME as usize,
+                    "width {w}: {line}"
+                );
+            }
+        }
+    }
+
+    /// An explicit list was honoured as written at any width, so a narrow
+    /// terminal left `name_width` at zero and every process name blank.
+    #[test]
+    fn a_configured_column_list_still_leaves_room_for_the_command() {
+        let configured: Vec<String> =
+            ["pid", "user", "state", "cpu", "mem", "virt", "thr", "ni", "disk", "time"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        for w in 1..=200u16 {
+            let cols = columns_for(w, &configured, false, false, false);
+            assert_eq!(cols.last().map(|c| c.id), Some(NAME.id), "COMMAND was dropped at {w}");
+            if w >= MIN_NAME {
+                assert!(
+                    fixed_width(&cols) + MIN_NAME <= w,
+                    "names render blank at width {w}: {:?}",
+                    cols.iter().map(|c| c.id).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    /// ...and a list that does fit is still honoured as written.
+    #[test]
+    fn a_configured_list_that_fits_is_left_alone() {
+        let configured: Vec<String> = ["pid", "cpu", "mem"].iter().map(|s| s.to_string()).collect();
+        let cols = columns_for(200, &configured, false, false, false);
+        let ids: Vec<&str> = cols.iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec!["pid", "cpu", "mem", NAME.id]);
+    }
 
     #[test]
     fn essential_columns_survive_a_narrow_terminal() {
@@ -616,22 +920,30 @@ mod tests {
 
     #[test]
     fn an_explicit_column_list_is_honoured_and_typos_are_dropped() {
-        let cols =
-            columns_for(200, &["pid".into(), "ports".into(), "nonsense".into()], false, false);
+        let cols = columns_for(
+            200,
+            &["pid".into(), "ports".into(), "nonsense".into()],
+            false,
+            false,
+            false,
+        );
         let ids: Vec<&str> = cols.iter().map(|c| c.id).collect();
         assert_eq!(ids, vec!["pid", "ports", "name"], "COMMAND is appended, typos are not");
 
         // Asking for COMMAND in the middle still puts it last: it is the column
         // that flexes, so anything after it would have no width left.
-        let cols = columns_for(200, &["name".into(), "cpu".into()], false, false);
+        let cols = columns_for(200, &["name".into(), "cpu".into()], false, false, false);
         assert_eq!(cols.iter().map(|c| c.id).collect::<Vec<_>>(), vec!["cpu", "name"]);
 
         // An all-typo list falls back rather than drawing an empty table.
         assert_eq!(
-            columns_for(200, &["nope".into()], false, false).len(),
+            columns_for(200, &["nope".into()], false, false, false).len(),
             plan_columns(200, false).len()
         );
-        assert_eq!(columns_for(200, &[], false, false).len(), plan_columns(200, false).len());
+        assert_eq!(
+            columns_for(200, &[], false, false, false).len(),
+            plan_columns(200, false).len()
+        );
     }
 
     #[test]
@@ -648,7 +960,8 @@ mod tests {
         // Clicking PORTS has no ordering to apply; the old code would have
         // silently re-sorted by whatever key the column borrowed.
         let inner = Rect { x: 0, y: 0, width: 120, height: 20 };
-        let cols = columns_for(120, &["pid".into(), "ports".into(), "cpu".into()], false, false);
+        let cols =
+            columns_for(120, &["pid".into(), "ports".into(), "cpu".into()], false, false, false);
         let ranges = column_ranges(inner, &cols);
         assert_eq!(ranges.len(), 3, "mark and ports contribute no clickable range");
     }
@@ -689,7 +1002,7 @@ mod tests {
         assert!(on.iter().any(|c| c.id == PORTS.id), "[procs] ports did not add the column");
 
         // An explicit column list still wins over the switch either way.
-        let explicit = columns_for(200, &["pid".into(), "name".into()], true, false);
+        let explicit = columns_for(200, &["pid".into(), "name".into()], true, false, false);
         assert!(!explicit.iter().any(|c| c.id == PORTS.id), "an explicit list was overridden");
     }
 

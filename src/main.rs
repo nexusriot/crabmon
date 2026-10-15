@@ -40,7 +40,14 @@ fn main() -> Result<()> {
     };
 
     let path = config_path(&args);
-    let cfg = apply_args(config::load_from(&path), &args);
+    let (loaded, cfg_error) = config::load_checked(&path);
+    if let Some(e) = &cfg_error {
+        // Loud, and on stderr, because the alternative is a monitor running
+        // with none of the alert rules the file defines and no sign of it.
+        eprintln!("crabmon: {}: {e}", path.display());
+        eprintln!("crabmon: using built-in defaults; nothing from that file was applied");
+    }
+    let cfg = apply_args(loaded, &args);
 
     // The headless modes. `cli::parse` refuses to combine any of them with
     // `--remote` or `--replay`, so each one here samples this host.
@@ -48,18 +55,32 @@ fn main() -> Result<()> {
         return print_diff(a, b.as_deref(), &args);
     }
     if let Some(addr) = &args.serve {
-        return serve_metrics(addr, &cfg, args.alerts);
+        return serve_metrics(addr, &cfg, args.alerts, args.remote.as_deref());
     }
     if args.stream {
         return stream_frames(&cfg, args.alerts);
     }
     let hold = args.watch_for.unwrap_or(0);
     if let Some(query) = &args.watch {
-        return watch_for(crabmon::watch::process_rule(query, hold), &cfg, &args);
+        // Validated here rather than left to the engine: an unparseable query
+        // became a rule that measures nothing, which never fires, so a typo
+        // waited out the whole timeout and then exited 0 — "nothing went
+        // wrong" — instead of saying the query was wrong.
+        if let Err(e) = crabmon::filter::parse(query) {
+            fail_watch(&format!("bad watch query: {e}"));
+        }
+        return watch_for(crabmon::watch::process_rule(query, hold), &cfg, &args)
+            .or_else(|e| fail_watch(&e.to_string()));
     }
     if let Some(expr) = &args.watch_rule {
-        let rule = crabmon::watch::parse_rule(expr, hold).map_err(|e| anyhow::anyhow!("{e}"))?;
-        return watch_for(rule, &cfg, &args);
+        // Not `?`: returning an error from `main` exits 1, which is also what
+        // a *successful* watch exits with, so `--watch-rule 'psi:oi>20' ||
+        // page-oncall` paged on a typo rather than reporting it.
+        let rule = match crabmon::watch::parse_rule(expr, hold) {
+            Ok(rule) => rule,
+            Err(e) => fail_watch(&e),
+        };
+        return watch_for(rule, &cfg, &args).or_else(|e| fail_watch(&e.to_string()));
     }
     if args.once {
         let mut source = live_source(&cfg);
@@ -67,12 +88,13 @@ fn main() -> Result<()> {
     }
 
     let source = build_source(&cfg, &args)?;
-    run_tui(cfg, source, &args, path)
+    run_tui(cfg, source, &args, path, cfg_error.is_none())
 }
 
 fn live_source(cfg: &Config) -> SysinfoSource {
     SysinfoSource::new(cfg.virtual_iface_prefixes.clone(), cfg.gpu.enabled && cfg.gpu.nvidia_smi)
         .with_fds(cfg.procs.fds)
+        .with_pss(cfg.procs.pss)
 }
 
 /// Where snapshots come from: a recording, another host, or this one.
@@ -247,6 +269,12 @@ fn watch_for(rule: crabmon::alerts::AlertRule, cfg: &Config, args: &Args) -> Res
                         alert.name, alert.value, alert.threshold
                     )
                 }
+                export::ExportFormat::Text => {
+                    format!(
+                        "{}\n{} against a threshold of {}\n",
+                        alert.message, alert.value, alert.threshold
+                    )
+                }
             },
             (true, None) => String::new(),
         };
@@ -263,7 +291,10 @@ fn watch_for(rule: crabmon::alerts::AlertRule, cfg: &Config, args: &Args) -> Res
 /// Evaluating on the scrape rather than on a timer of its own is deliberate:
 /// it is the only moment a fresh sample exists, and a second sampler would
 /// double this process's cost to measure the same machine twice.
-fn serve_metrics(addr: &str, cfg: &Config, alerts: bool) -> Result<()> {
+fn serve_metrics(addr: &str, cfg: &Config, alerts: bool, remote: Option<&str>) -> Result<()> {
+    if let Some(spec) = remote {
+        return serve_fleet(addr, cfg, alerts, spec);
+    }
     let mut source = live_source(cfg);
     let interval = Duration::from_millis(cfg.refresh_ms);
     // Prime the counters so the first scrape carries real rates.
@@ -276,7 +307,7 @@ fn serve_metrics(addr: &str, cfg: &Config, alerts: bool) -> Result<()> {
     }
     // `serve` measures the gap between scrapes and hands it over; the rates are
     // deltas over that interval, not over the configured refresh.
-    crabmon::serve::serve_rendered(addr, move |elapsed| {
+    crabmon::serve::serve_rendered(addr, cfg.serve_token(), move |elapsed| {
         let snap = source.snapshot(elapsed);
         let states = match sup.as_mut() {
             None => Vec::new(),
@@ -286,6 +317,65 @@ fn serve_metrics(addr: &str, cfg: &Config, alerts: bool) -> Result<()> {
             }
         };
         crabmon::serve::render_with_alerts(&snap, top, &states)
+    })?;
+    Ok(())
+}
+
+/// Headless exporter for a fleet.
+///
+/// crabmon could already watch several hosts over SSH, and could already
+/// export what it measured; the two could not meet, so a fleet had a
+/// dashboard and no metrics. Every series carries `host="..."`, and each
+/// host gets its own alert engine — rules are about *a* machine, and one
+/// engine fed three hosts' snapshots in turn would hold one `fired` flag
+/// between them and page about whichever host sampled last.
+fn serve_fleet(addr: &str, cfg: &Config, alerts: bool, spec: &str) -> Result<()> {
+    let targets = crabmon::fleet::parse_targets(spec);
+    if targets.is_empty() {
+        return Err(anyhow::anyhow!("--remote names no hosts"));
+    }
+    let top = cfg.serve.top_procs;
+    eprintln!("crabmon: exporting {} hosts: {}", targets.len(), targets.join(", "));
+    if alerts {
+        eprintln!("crabmon: evaluating {} alert rules per host on every scrape", cfg.alerts.len());
+    }
+
+    // One source and one supervisor per host. The sources are threaded, so a
+    // host that is down costs a scrape nothing but its own missing series.
+    // `Send`, because the sampling closure runs on whichever connection
+    // thread is serving the scrape.
+    let mut hosts: Vec<(String, ThreadedSource, Option<supervisor::Supervisor>)> = targets
+        .iter()
+        .map(|target| {
+            let remote = match cfg.remote.stream {
+                true => RemoteSource::streaming(target, cfg.refresh_ms, Vec::new()),
+                false => RemoteSource::new(target, None, Vec::new()),
+            };
+            let source = ThreadedSource::new(Box::new(remote));
+            let sup = alerts.then(|| supervisor::Supervisor::new(cfg).for_host(target));
+            (target.clone(), source, sup)
+        })
+        .collect();
+
+    crabmon::serve::serve_rendered(addr, cfg.serve_token(), move |elapsed| {
+        let parts: Vec<(String, String)> = hosts
+            .iter_mut()
+            .map(|(name, source, sup)| {
+                let snap = source.snapshot(elapsed);
+                let states = match sup.as_mut() {
+                    None => Vec::new(),
+                    Some(sup) => {
+                        report(sup.observe(&snap));
+                        sup.alerts.states(&snap)
+                    }
+                };
+                // A host that cannot be reached is not up, whatever its
+                // last good frame still says.
+                let reachable = source.error().is_none();
+                (name.clone(), crabmon::serve::render_host(&snap, top, &states, reachable))
+            })
+            .collect();
+        crabmon::serve::merge_hosts(&parts)
     })?;
     Ok(())
 }
@@ -305,6 +395,12 @@ fn report(obs: crabmon::supervisor::Observation) {
     for err in supervisor::spawn_hooks(&obs.commands) {
         eprintln!("crabmon: {err}");
     }
+}
+
+/// Report a watch that could not be run, and exit with a code no match uses.
+fn fail_watch(message: &str) -> ! {
+    eprintln!("crabmon: {message}");
+    std::process::exit(crabmon::watch::FAILED)
 }
 
 fn config_path(args: &Args) -> std::path::PathBuf {
@@ -372,7 +468,19 @@ fn print_once(cfg: &Config, args: &Args, source: &mut SysinfoSource) -> Result<(
         .or_else(|| export::ExportFormat::parse(&cfg.export.format))
         .unwrap_or(export::ExportFormat::Json);
     let mut out = io::stdout().lock();
-    out.write_all(export::render(&snap, format).as_bytes())?;
+    // The text table is laid out for whoever is reading it: the terminal's
+    // width when there is a terminal, and a fixed width when the output is
+    // going into a file or a pipe, so a dump is not reflowed by the window
+    // that happened to produce it.
+    let text = match format {
+        export::ExportFormat::Text => export::to_text_with(
+            &snap,
+            &cfg.procs.columns,
+            crossterm::terminal::size().map(|(w, _)| w.max(60)).unwrap_or(export::TEXT_WIDTH),
+        ),
+        other => export::render(&snap, other),
+    };
+    out.write_all(text.as_bytes())?;
     out.flush()?;
     Ok(())
 }
@@ -382,6 +490,7 @@ fn run_tui(
     source: Box<dyn MetricSource>,
     args: &Args,
     config_path: std::path::PathBuf,
+    config_ok: bool,
 ) -> Result<()> {
     let mouse = !args.no_mouse;
     // What the file itself says about the filter, before `apply_args` folded a
@@ -405,7 +514,13 @@ fn run_tui(
     if !app.fleet().is_empty() && args.layout.is_none() {
         app.cfg.layout = crabmon::ui::Layout::Fleet;
     }
-    app.config_path = Some(config_path);
+    // A config file that could not be parsed is never written back over:
+    // saving would replace the user's file — typo and all the settings
+    // around it — with the defaults crabmon fell back to.
+    app.config_path = config_ok.then_some(config_path);
+    if !config_ok {
+        app.set_status("config could not be parsed; defaults in use and not saving");
+    }
     app.audit_path = audit_path(&app.cfg);
 
     let mut recorder = match &args.record {
@@ -434,7 +549,41 @@ fn run_tui(
         app.cfg.record.flight_after,
         app.cfg.record.limits(),
     );
-    let res = event_loop(&mut terminal, &mut app, &stop, recorder.as_mut(), flight.as_mut());
+    // A recording that never ends, for the incident nobody predicted and no
+    // rule described. The flag names the directory; the config says how much
+    // of it to keep.
+    let rotate_dir =
+        args.record_rotate.clone().unwrap_or_else(|| match app.cfg.record.rotate_dir.is_empty() {
+            false => app.cfg.record.rotate_dir.clone(),
+            true => match app.cfg.record.flight_dir.is_empty() {
+                false => app.cfg.record.flight_dir.clone(),
+                true => ".".to_string(),
+            },
+        });
+    // The flag turns rotation on by itself: someone who passed it meant it,
+    // even with nothing in the config.
+    let per_segment = match (args.record_rotate.is_some(), app.cfg.record.rotate_frames) {
+        (true, 0) => crabmon::record::DEFAULT_ROTATE_FRAMES,
+        (_, n) => n,
+    };
+    let mut rotating = Recorder::rotating(
+        std::path::Path::new(&rotate_dir),
+        per_segment,
+        app.cfg.record.rotate_keep,
+        app.cfg.record.limits(),
+    );
+    if rotating.is_some() {
+        eprintln!("crabmon: rotating recording in {rotate_dir}");
+    }
+
+    let res = event_loop(
+        &mut terminal,
+        &mut app,
+        &stop,
+        recorder.as_mut(),
+        flight.as_mut(),
+        rotating.as_mut(),
+    );
 
     // Always restore the terminal, even if the loop failed.
     restore(mouse);
@@ -474,6 +623,7 @@ fn event_loop(
     stop: &StopFlag,
     mut recorder: Option<&mut Recorder>,
     mut flight: Option<&mut FlightRecorder>,
+    mut rotating: Option<&mut crabmon::record::RotatingRecorder>,
 ) -> Result<()> {
     let mut last_tick = Instant::now();
     loop {
@@ -522,6 +672,11 @@ fn event_loop(
             if let Some(rec) = recorder.as_deref_mut() {
                 if let Err(e) = rec.write(&app.snap) {
                     app.set_status(format!("recording failed: {e}"));
+                }
+            }
+            if let Some(rec) = rotating.as_deref_mut() {
+                if let Err(e) = rec.write(&app.snap, app.snap.taken_at_unix) {
+                    app.set_status(format!("rotating recording failed: {e}"));
                 }
             }
             // Hooks and flight recordings. `App::tick` has already evaluated

@@ -80,7 +80,7 @@ fn headless_modes_refuse_to_silently_sample_the_wrong_host() {
     // `crabmon --once --remote prod-db > snap.json` used to print *this*
     // machine's snapshot with exit 0: plausible data about the wrong host,
     // and no way for a script to tell.
-    for mode in [vec!["--once"], vec!["--serve", ":19999"], vec!["--stream"]] {
+    for mode in [vec!["--once"], vec!["--stream"]] {
         let mut args = mode.clone();
         args.extend(["--remote", "somewhere.invalid"]);
         let out = crabmon(&args);
@@ -93,6 +93,11 @@ fn headless_modes_refuse_to_silently_sample_the_wrong_host() {
         let out = crabmon(&args);
         assert_eq!(out.status.code(), Some(2), "{args:?} was accepted");
     }
+
+    // `--serve` is the exception: it exports a fleet, labelling every series
+    // by host. A recording still has no "now" to scrape.
+    let out = crabmon(&["--serve", ":19999", "--replay", "run.jsonl"]);
+    assert_eq!(out.status.code(), Some(2), "a replay was accepted as a scrape source");
 }
 
 #[test]

@@ -625,13 +625,24 @@ one that publishes them.
   incrementally maintained. At ~2000 processes and an 800 ms interval this costs
   a low double-digit percentage of one core, which is in line with comparable
   monitors but is the obvious next thing to optimise.
-- A replay is parsed in full into memory before the first frame is drawn, so a
-  long capture costs roughly its JSON size several times over. Nothing indexes
-  the file by line offset. The flight recorder makes long captures routine, so
-  this is more pressing than it was.
+- A replay over 8 MiB is indexed by line offset and parsed one frame at a
+  time; smaller ones are still read whole, where holding them costs less than
+  indexing them. The index itself is one `(u64, u32)` per frame.
 - The flight recorder's ring is bounded in *frames*, not bytes. A machine with
   an unusually long process list and a large `[record] top_n` costs
   proportionally more per frame than the figures quoted in the docs.
+- `[procs] pss` adds one `smaps_rollup` read per *process* per sample
+  (threads are skipped, which on a 3300-task machine with 530 processes is
+  most of the saving). It is the same trade as `fds` and off for the same
+  reason.
+- Per-container cgroup accounting reads three or four small files per
+  container or unit per sample, capped at `cgroup::MAX_CGROUPS`. The paths
+  come from the process list that was just built, so nothing is enumerated
+  that is not running.
+- The GROWTH column and `mem_growth` read the history already kept for the
+  TREND column, so they cost a subtraction. The window they measure over is
+  `PROC_HIST_LEN` samples of whatever the refresh interval is, not a fixed
+  wall-clock span, so changing `refresh_ms` changes what "growth" covers.
 - `[procs] fds` adds a `getdents` sweep per process per sample. Measured on a
   2800-process machine at the default 800 ms refresh it roughly doubles
   crabmon's sampling cost, from about 10% of one core to about 20%. That is why
@@ -646,38 +657,40 @@ one that publishes them.
   for it — and resolved only for rows actually on screen. A process holding tens
   of thousands of descriptors is cut off at `MAX_FDS_SCANNED`, which bounds the
   walk itself rather than the list it returns.
-- Alerts are evaluated in `App::tick`, so they and the flight recorder run only
-  in the TUI. `--serve`, `--stream`, `--once` and `--watch` never fire a rule,
-  and a headless collector therefore cannot produce a dump.
+- `--once` and `--diff` never fire a rule: they take one sample, and a hold
+  time needs a sequence. `--serve --alerts`, `--stream --alerts` and
+  `--watch` all evaluate rules, through the same `Supervisor` the TUI uses.
 - Pins do not reorder the tree view. The ordering there is structural, and
   hoisting a child out of its parent would draw a tree that is not one.
 - `--diff` holds both snapshots in memory, so diffing two ends of a large
   recording costs what loading it costs.
 - The audit log grows without bound and `audit::tail` reads the whole file to
   show its last 200 lines.
-- `config::save_to` is a plain write rather than write-and-rename, so a crash
-  during the save that `+`/`-` triggers can truncate the config. It falls back
-  to defaults on the next start, which limits the damage to the settings.
+- `config::save_to` writes a sibling temp file and renames it over the target,
+  so a crash mid-save leaves either the old config or the new one. A config
+  that cannot be parsed is reported and never written back over.
 - The streaming `--remote` path is unit-tested against a controlled child and
   driven end to end through a stand-in `ssh`, but has not been run over a real
   SSH connection; the same caveat the FreeBSD `iostat` path carries.
 
+- Kernel events are matched on message text, because the kernel has no
+  structured form of "this is an OOM kill". The patterns are ones that have
+  been spelled the same way for many years, and anything unrecognised is
+  simply not an event rather than a guess. `/dev/kmsg` is root-only wherever
+  `kernel.dmesg_restrict=1`, which is most distributions.
+- A `trend` rule keeps about eight points per series across its window. That
+  is enough to measure a slope and to survive a missed sample; it is not a
+  regression, and a sawtooth that happens to start and end high reads as
+  growth. Per-process series are capped at 4096 processes.
+- `--serve --remote` samples every host on the scrape, so a scrape takes as
+  long as the slowest host's worker has been waiting. The sources are
+  threaded, so that is a frame's staleness rather than a scrape's delay.
+
 Open defects, found by review and not yet fixed:
 
-- `ThreadedSource::frame_id` counts frames *delivered*, not distinct samples,
-  and does not consult the source it wraps. Since `RemoteSource` re-hands its
-  last good frame when the far end stalls, an outage is charted as flat,
-  real-looking measurement rather than a gap, and `is_stale()` never raises the
-  `sampling…` notice. `ReplaySource` has the same shape from the other end: it
-  holds the final frame forever while reporting `frame_id() == None`, so a
-  finished replay keeps feeding copies into the history until the recorded
-  incident scrolls out of it.
-- An explicit `[procs] columns` list is never width-checked, so on a narrow
-  terminal `name_width` can reach zero and every process name renders blank.
-  The automatic planner reserves `MIN_NAME`; the configured path does not.
-- The detail popup reads the *local* host for the nice value and socket list
-  rather than the snapshot, so under `--replay` they are missing and under
-  `--remote` they belong to whatever local process holds that PID. The same
-  applies to the `ports` column.
-- `MATCHED = 1` is also the exit code a failed run returns, so a `--watch`
-  caller cannot distinguish a match from a typo in the query.
+- None outstanding. The four listed here previously — `frame_id` counting
+  deliveries rather than measurements, an explicit `[procs] columns` list
+  blanking process names on a narrow terminal, the detail pane reading the
+  local host under `--remote`/`--replay`, and `MATCHED` colliding with the
+  failure exit code — were fixed together with the process-control guard that
+  the third of them turned up.

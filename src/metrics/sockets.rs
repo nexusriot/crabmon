@@ -37,6 +37,12 @@ pub fn tcp_state(code: u8) -> &'static str {
 /// `/proc/net/*` encodes addresses as little-endian hex.
 pub fn parse_address(hex: &str) -> Option<String> {
     let (addr, port) = hex.split_once(':')?;
+    // Byte offsets are used below to split the v6 form into words, so a
+    // non-ASCII byte would slice through a character and panic rather than
+    // simply failing to parse.
+    if !addr.is_ascii() {
+        return None;
+    }
     let port = u16::from_str_radix(port, 16).ok()?;
     let ip = match addr.len() {
         8 => {

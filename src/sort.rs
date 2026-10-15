@@ -23,9 +23,14 @@ pub enum SortBy {
     Nice,
     /// Open file descriptors. Always `-` unless `[procs] fds` is on.
     Fds,
+    /// Proportional set size. Always `-` unless `[procs] pss` is on.
+    Pss,
+    /// Resident-memory growth over the trend window. Always `-` unless a
+    /// `trend` rule is keeping per-process series.
+    Growth,
 }
 
-pub const ALL_SORTS: [SortBy; 12] = [
+pub const ALL_SORTS: [SortBy; 14] = [
     SortBy::Pid,
     SortBy::Name,
     SortBy::Cpu,
@@ -38,6 +43,8 @@ pub const ALL_SORTS: [SortBy; 12] = [
     SortBy::Threads,
     SortBy::Nice,
     SortBy::Fds,
+    SortBy::Pss,
+    SortBy::Growth,
 ];
 
 impl SortBy {
@@ -55,6 +62,8 @@ impl SortBy {
             SortBy::Threads => "THR",
             SortBy::Nice => "NI",
             SortBy::Fds => "FD",
+            SortBy::Pss => "PSS",
+            SortBy::Growth => "GROWTH",
         }
     }
 
@@ -80,6 +89,8 @@ impl SortBy {
             SortBy::Threads => "threads",
             SortBy::Nice => "nice",
             SortBy::Fds => "fds",
+            SortBy::Pss => "pss",
+            SortBy::Growth => "growth",
         }
     }
 
@@ -112,6 +123,12 @@ pub fn compare(a: &ProcRow, b: &ProcRow, key: SortBy, desc: bool) -> Ordering {
         SortBy::Threads => a.threads.cmp(&b.threads),
         SortBy::Nice => a.nice.cmp(&b.nice),
         SortBy::Fds => a.fds.cmp(&b.fds),
+        SortBy::Pss => a.pss.cmp(&b.pss),
+        // Growth is not carried on the row — it is a property of the
+        // *series*, which only the app has — so sorting by it falls back to
+        // the memory the row does carry. `App::rebuild_view` sorts by the
+        // real figure before this is ever reached.
+        SortBy::Growth => a.mem_share().cmp(&b.mem_share()),
     };
     let primary = if desc { primary.reverse() } else { primary };
     primary.then_with(|| a.pid.cmp(&b.pid))

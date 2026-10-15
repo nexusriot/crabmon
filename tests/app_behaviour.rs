@@ -369,6 +369,7 @@ fn alerts_fire_once_their_hold_time_elapses() {
         kind: crabmon::alerts::AlertKind::Disk,
         threshold: 90.0,
         for_secs: 0,
+        over_secs: 0,
         below: false,
         query: String::new(),
         target: "/boot".into(),
@@ -605,6 +606,120 @@ fn grouping_puts_processes_without_a_group_under_a_placeholder() {
     let groups = a.groups();
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].name, "-");
+}
+
+/// Signals, renice and affinity act on a *local* PID. Under `--replay` or
+/// `--remote` the PIDs on screen belong to another machine or another time,
+/// and a local process holding the same number is a different program — so
+/// the prompts refuse to open at all rather than acting on it.
+#[test]
+fn process_control_is_refused_when_the_processes_are_not_on_this_machine() {
+    let source = crabmon::record::ReplaySource::from_frames(vec![snapshot()], "run.jsonl");
+    let mut a = crabmon::App::new(common::config(), Box::new(source));
+    assert!(!a.samples_this_host());
+    assert!(!a.rows().is_empty(), "the test needs a row to aim at");
+
+    for k in ['t', 'r', 'A'] {
+        a.on_key(key(k));
+        assert_eq!(a.mode, crabmon::app::Mode::Normal, "{k} opened a prompt on a replay");
+        assert!(
+            a.status_text().is_some_and(|s| s.contains("not on this machine")),
+            "{k}: {:?}",
+            a.status_text()
+        );
+    }
+}
+
+/// ...and the same keys still work on the machine crabmon is running on.
+#[test]
+fn process_control_still_opens_for_local_processes() {
+    let mut a = crabmon::App::new(common::config(), Box::new(FakeSource::single(snapshot())));
+    assert!(a.samples_this_host());
+    a.on_key(key('t'));
+    assert_eq!(a.mode, crabmon::app::Mode::SignalMenu);
+}
+
+/// The detail pane reads sockets and open files from the local /proc by PID,
+/// which describes a different program entirely when the rows are a replay's.
+#[test]
+fn the_detail_pane_says_so_rather_than_describing_a_local_process() {
+    let source = crabmon::record::ReplaySource::from_frames(vec![snapshot()], "run.jsonl");
+    let mut a = crabmon::App::new(common::config(), Box::new(source));
+    a.on_key(code(KeyCode::Enter));
+    assert_eq!(a.mode, crabmon::app::Mode::Detail);
+    assert!(a.detail_sockets.is_empty(), "local sockets were attributed to a replayed process");
+    assert!(a.detail_files.is_none());
+}
+
+/// The IO-priority prompt behaves like the other three process controls:
+/// it takes what `ionice(1)` takes, refuses nonsense in place rather than
+/// acting on it, and is bulk over tagged rows.
+#[test]
+fn the_io_priority_prompt_validates_before_it_acts() {
+    let mut a = crabmon::App::new(common::config(), Box::new(FakeSource::single(snapshot())));
+    a.on_key(key('I'));
+    assert_eq!(a.mode, Mode::IoPriority);
+
+    a.input.clear();
+    for c in "nonsense".chars() {
+        a.on_key(key(c));
+    }
+    a.on_key(code(KeyCode::Enter));
+    assert_eq!(a.mode, Mode::IoPriority, "a bad class closed the prompt anyway");
+    assert!(a.input_error.is_some(), "the prompt said nothing about it");
+
+    a.on_key(code(KeyCode::Esc));
+    assert_eq!(a.mode, Mode::Normal);
+}
+
+/// Editing a config mid-incident is exactly when restarting costs the most.
+#[test]
+fn reloading_the_config_keeps_the_session_and_takes_the_new_rules() {
+    let dir = std::env::temp_dir().join(format!("crabmon-reload-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.toml");
+    std::fs::write(&path, "refresh_ms = 1500\n").unwrap();
+
+    let mut a = crabmon::App::new(common::config(), Box::new(FakeSource::single(snapshot())));
+    a.config_path = Some(path.clone());
+    // Session state the reload must not touch.
+    a.cfg.sort_by = SortBy::Mem;
+    a.cfg.layout = crabmon::ui::Layout::Cpu;
+    a.on_key(key('/'));
+    for c in "firefox".chars() {
+        a.on_key(key(c));
+    }
+    a.on_key(code(KeyCode::Enter));
+
+    std::fs::write(
+        &path,
+        r#"refresh_ms = 2500
+[[alert]]
+name = "hot"
+kind = "cpu"
+threshold = 1.0
+"#,
+    )
+    .unwrap();
+    let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+    a.on_key(ctrl_r);
+
+    assert_eq!(a.cfg.refresh_ms, 2500, "the new file was not applied");
+    assert_eq!(a.alerts.rules.len(), 1, "the new rules were not picked up");
+    assert_eq!(a.cfg.sort_by, SortBy::Mem, "the sort is session state");
+    assert_eq!(a.cfg.layout, crabmon::ui::Layout::Cpu, "the layout is session state");
+    assert_eq!(a.filter_text, "firefox", "the filter is session state");
+    assert!(a.status_text().is_some_and(|s| s.contains("reloaded")), "{:?}", a.status_text());
+
+    // A broken file changes nothing at all and says so.
+    std::fs::write(&path, "refresh_ms = \n[[alert\n").unwrap();
+    a.on_key(ctrl_r);
+    assert_eq!(a.cfg.refresh_ms, 2500, "a broken file was applied anyway");
+    assert_eq!(a.alerts.rules.len(), 1, "a broken file dropped the rules");
+    assert!(a.status_text().is_some_and(|s| s.contains("unchanged")), "{:?}", a.status_text());
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

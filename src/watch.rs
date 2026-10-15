@@ -20,6 +20,16 @@ use crate::alerts::{AlertKind, AlertRule, ALL_ALERT_KINDS};
 /// Exit code when the watch condition was met. 0 means it never was.
 pub const MATCHED: i32 = 1;
 
+/// Exit code when the watch could not be run at all — a query that does not
+/// parse, a source that cannot sample, a write that fails.
+///
+/// Distinct from `MATCHED` because a caller spelling `--watch-rule` wrong
+/// otherwise got the same `1` as a successful match, so
+/// `crabmon --watch-rule 'psi:oi>20' || page-oncall` paged on a typo. It is
+/// the same `2` the argument parser already uses for a usage error, which is
+/// also what grep and friends reserve for "something went wrong".
+pub const FAILED: i32 = 2;
+
 /// How a watch ended.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
@@ -46,6 +56,7 @@ pub fn process_rule(query: &str, for_secs: u64) -> AlertRule {
         kind: AlertKind::Proc,
         threshold: 1.0,
         for_secs,
+        over_secs: 0,
         below: false,
         target: String::new(),
         query: query.to_string(),
@@ -109,13 +120,53 @@ pub fn parse_rule(expr: &str, for_secs: u64) -> Result<AlertRule, String> {
     // takes; everything else is a plain number — a percentage, a temperature,
     // a load average or a count.
     let threshold = match kind {
-        AlertKind::Net => crate::format::parse_size(value)
+        // Both are quantities of bytes, so both take the filter language's
+        // suffixes: `trend:rss>200M` reads the way it is meant.
+        // Seconds, with the filter language's suffixes: `fillin:/var<3h`
+        // reads the way it is meant.
+        AlertKind::FillIn => crate::format::parse_duration(value)
+            .map(|v| v as f64)
+            .ok_or_else(|| format!("bad duration: {value}"))?,
+        AlertKind::Net | AlertKind::Trend => crate::format::parse_size(value)
             .map(|v| v as f64)
             .ok_or_else(|| format!("bad size: {value}"))?,
         _ => value.parse::<f64>().map_err(|_| format!("bad number: {value}"))?,
     };
     if !threshold.is_finite() {
         return Err(format!("bad number: {value}"));
+    }
+
+    // A `psi` rule naming a resource the kernel has never heard of measures
+    // nothing, and a rule that measures nothing never fires: `psi:oi>20`
+    // waited out the whole timeout and then exited 0, which a shell reads as
+    // "the condition never happened" rather than "you spelled it wrong".
+    if kind == AlertKind::Psi && !crate::alerts::psi_target_is_known(target) {
+        return Err(format!(
+            "unknown pressure resource: {target}\nknown resources: {} (each also .some/.full)",
+            crate::alerts::PSI_RESOURCES.join(", ")
+        ));
+    }
+
+    // A `trend` rule's target is either a machine series or a process
+    // query, and one that is neither measures nothing for ever.
+    if kind == AlertKind::Trend {
+        match target {
+            "" | "mem" | "memory" | "rss" | "swap" => {}
+            query => {
+                crate::filter::parse(query).map_err(|e| format!("bad query: {e}"))?;
+            }
+        }
+    }
+
+    if kind == AlertKind::Kernel && !crate::alerts::kernel_target_is_known(target) {
+        return Err(format!(
+            "unknown kernel event: {target}\nknown events: {}",
+            crate::metrics::kmsg::ALL_EVENT_KINDS
+                .iter()
+                .map(|k| k.key_name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
 
     // A `proc` rule's target is the query it counts matches of, and it has to
@@ -132,12 +183,29 @@ pub fn parse_rule(expr: &str, for_secs: u64) -> Result<AlertRule, String> {
         kind,
         threshold,
         for_secs,
+        over_secs: 0,
         below,
-        target: if kind == AlertKind::Proc { String::new() } else { target.to_string() },
-        query: if kind == AlertKind::Proc { target.to_string() } else { String::new() },
+        // A `trend` target that is not one of the machine series is a
+        // process query, which belongs in `query` like a `proc` rule's.
+        target: match (kind, target) {
+            (AlertKind::Proc, _) => String::new(),
+            (AlertKind::Trend, q) if !is_machine_series(q) => String::new(),
+            (_, t) => t.to_string(),
+        },
+        query: match (kind, target) {
+            (AlertKind::Proc, q) => q.to_string(),
+            (AlertKind::Trend, q) if !is_machine_series(q) => q.to_string(),
+            _ => String::new(),
+        },
         command: String::new(),
         command_clear: String::new(),
     })
+}
+
+/// Whether a `trend` target names a machine-wide series rather than a
+/// process query.
+fn is_machine_series(target: &str) -> bool {
+    matches!(target, "" | "mem" | "memory" | "rss" | "swap")
 }
 
 /// The rightmost comparison operator and where it starts.
@@ -235,6 +303,56 @@ mod tests {
         assert!(!timed_out(base, 0, at(86_400)));
         assert!(!timed_out(base, 60, at(59)));
         assert!(timed_out(base, 60, at(60)));
+    }
+
+    /// The disk question, from a shell script.
+    #[test]
+    fn a_fillin_rule_takes_a_duration_and_a_mount() {
+        let r = parse_rule("fillin:/var<3h", 0).expect("a fill rule");
+        assert_eq!(r.kind, AlertKind::FillIn);
+        assert_eq!(r.threshold, 3.0 * 3600.0);
+        assert_eq!(r.target, "/var");
+        assert!(r.below, "the alarming direction is *less* time");
+
+        assert!(parse_rule("fillin:/var<nonsense", 0).is_err());
+        // An untargeted rule watches whichever mount fills first.
+        assert_eq!(parse_rule("fillin<30m", 0).unwrap().target, "");
+    }
+
+    /// The leak question, from a shell script.
+    #[test]
+    fn a_trend_rule_takes_sizes_and_sorts_its_target_from_its_query() {
+        let machine = parse_rule("trend:mem>1G", 0).expect("a machine trend rule");
+        assert_eq!(machine.kind, AlertKind::Trend);
+        assert_eq!(machine.threshold, (1u64 << 30) as f64);
+        assert_eq!(machine.target, "mem");
+        assert!(machine.query.is_empty());
+
+        let per_proc = parse_rule("trend:postgres>200M", 0).expect("a per-process trend rule");
+        assert_eq!(per_proc.query, "postgres");
+        assert!(per_proc.target.is_empty(), "a query must not be read as a series name");
+
+        // A size, not a bare number: 200M is the point.
+        assert!(parse_rule("trend:mem>nonsense", 0).is_err());
+        assert!(parse_rule("trend:re:[>1G", 0).is_err(), "a broken query must be refused");
+    }
+
+    /// A rule that cannot measure anything never fires, so a typo in the
+    /// target used to spend the whole timeout and then report success.
+    #[test]
+    fn a_misspelled_pressure_resource_is_rejected_rather_than_inert() {
+        assert!(parse_rule("psi:oi>20", 0).is_err());
+        assert!(parse_rule("psi:memory.ful>20", 0).is_err());
+        for ok in ["psi>20", "psi:io>20", "psi:mem.full>20", "psi:CPU.some>1"] {
+            assert!(parse_rule(ok, 0).is_ok(), "{ok} was refused");
+        }
+    }
+
+    #[test]
+    fn a_failure_is_distinguishable_from_a_match() {
+        // `1` is a match. A watch that could not run must not look like one.
+        assert_ne!(FAILED, MATCHED);
+        assert_ne!(FAILED, Outcome::TimedOut.exit_code());
     }
 
     #[test]

@@ -9,7 +9,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Every long flag the parser accepts. The docs tests check this against the
 /// README, the man page and the shell completions.
-pub const LONG_FLAGS: [&str; 31] = [
+pub const LONG_FLAGS: [&str; 32] = [
     "--refresh",
     "--sort",
     "--ascending",
@@ -27,6 +27,7 @@ pub const LONG_FLAGS: [&str; 31] = [
     "--config",
     "--group",
     "--record",
+    "--record-rotate",
     "--replay",
     "--remote",
     "--remote-command",
@@ -63,6 +64,9 @@ pub struct Args {
     pub config: Option<String>,
     /// Record every sampled snapshot to this file, replacing any file there.
     pub record: Option<String>,
+    /// Keep a rotating recording in this directory, so a replay of the last
+    /// hour is always available without having predicted the incident.
+    pub record_rotate: Option<String>,
     /// Drive the UI from a recording instead of the live host.
     pub replay: Option<String>,
     /// Serve Prometheus metrics on this address, headless.
@@ -106,7 +110,7 @@ USAGE:
 
 OPTIONS:
     -r, --refresh <MS>       Refresh interval, {min}-{max} ms
-    -s, --sort <KEY>         pid|name|cpu|mem|virt|disk|time|user|state|threads|nice|fds
+    -s, --sort <KEY>         pid|name|cpu|mem|virt|disk|time|user|state|threads|nice|fds|pss|growth
     -a, --ascending          Sort ascending
     -d, --descending         Sort descending (the default)
     -f, --filter <QUERY>     Initial process filter, e.g. 'user:root cpu>5'
@@ -117,15 +121,19 @@ OPTIONS:
         --no-color           Disable colour (same as --theme mono)
         --no-mouse           Do not capture mouse events
     -1, --once               Print a single snapshot and exit
-        --format <FMT>       Output format for --once: json|csv (default json)
+        --format <FMT>       Output format for --once: json|csv|text (default json)
     -n, --top <N>            Limit --once output to the top N processes
     -c, --config <PATH>      Use an alternate config file
     -g, --group <BY>         Group processes: none|service|container|user
         --record <PATH>      Record every sample to a JSONL file (replaces it)
+        --record-rotate <DIR>  Keep a rotating recording in DIR: the last
+                             [record] rotate_keep segments of rotate_frames
+                             frames each, oldest deleted
         --replay <PATH>      Replay a recording instead of sampling this host
         --remote <TARGET>    Monitor TARGET over SSH (needs crabmon installed there)
         --remote-command <C> Command to run on the remote host
-        --serve <ADDR>       Serve Prometheus metrics on ADDR, e.g. :9100
+        --serve <ADDR>       Serve Prometheus metrics on ADDR: :9100, or a
+                             socket path like unix:/run/crabmon.sock
         --stream             Print a JSON snapshot per line forever
         --alerts             With --serve/--stream: run alert rules headlessly
         --diff <A> [B]       Compare two snapshots, or one recording end to end
@@ -274,6 +282,9 @@ where
                 );
             }
             "--record" => out.record = Some(take_value(&mut i, &args, inline, &flag)?),
+            "--record-rotate" => {
+                out.record_rotate = Some(take_value(&mut i, &args, inline, &flag)?)
+            }
             "--replay" => out.replay = Some(take_value(&mut i, &args, inline, &flag)?),
             "--remote" => out.remote = Some(take_value(&mut i, &args, inline, &flag)?),
             "--remote-command" => {
@@ -333,13 +344,20 @@ where
     if out.replay.is_some() && out.record.is_some() {
         return Err("--record and --replay cannot be combined".into());
     }
+    // A replay has no "now" to scrape: a Prometheus series from a recording
+    // would be last Tuesday's numbers stamped with today's time.
+    if out.serve.is_some() && out.replay.is_some() {
+        return Err("--serve samples live hosts; it cannot be combined with --replay".into());
+    }
     // The headless modes all sample this host. Accepting `--remote` alongside
     // them used to print the *local* machine's snapshot with exit 0, which is a
     // worse failure than refusing: a script gets plausible data about the wrong
     // host and never finds out.
     for (name, on) in [
         ("--once", out.once),
-        ("--serve", out.serve.is_some()),
+        // `--serve` is no longer on this list: it can export a fleet, with
+        // every series labelled by host. The others still sample this host
+        // and nothing else.
         ("--stream", out.stream),
         // --watch calls live_source() exactly as the other three do; leaving it
         // out meant `--remote box --watch 'state:D'` paged on the *local*
@@ -567,14 +585,20 @@ mod tests {
     /// with `--remote` used to page on the wrong machine and never say so.
     #[test]
     fn every_mode_that_samples_this_host_refuses_remote_and_replay() {
-        for mode in
-            [vec!["--once"], vec!["--serve", "9100"], vec!["--stream"], vec!["--watch", "state:D"]]
-        {
+        for mode in [vec!["--once"], vec!["--stream"], vec!["--watch", "state:D"]] {
             for elsewhere in [vec!["--remote", "box"], vec!["--replay", "r.jsonl"]] {
                 let argv: Vec<&str> = mode.iter().chain(elsewhere.iter()).copied().collect();
                 assert!(parse(&argv).is_err(), "{argv:?} was accepted");
             }
         }
+    }
+
+    /// `--serve` is the exception: it can export a fleet, labelling every
+    /// series by host. A replay still has no "now" to scrape.
+    #[test]
+    fn serve_exports_a_fleet_but_refuses_a_recording() {
+        assert!(parse(["--serve", "9100", "--remote", "web-1,db-1"]).is_ok());
+        assert!(parse(["--serve", "9100", "--replay", "r.jsonl"]).is_err());
     }
 
     /// An unparseable filter used to degrade to the empty filter, which matches

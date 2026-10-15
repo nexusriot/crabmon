@@ -23,6 +23,8 @@ struct Update {
     /// it, and the fleet view needs the answer rather than a sentence with
     /// the answer somewhere inside it.
     error: Option<String>,
+    /// What the inner source calls this frame, when it has an opinion.
+    id: Option<u64>,
 }
 
 pub struct ThreadedSource {
@@ -35,7 +37,18 @@ pub struct ThreadedSource {
     pending: bool,
     /// Incremented for every frame that actually arrives, so the caller can
     /// tell a genuinely new sample from the same one handed out again.
+    ///
+    /// Only used for sources that have no opinion of their own. Counting
+    /// deliveries is not the same question as counting measurements: a
+    /// `RemoteSource` re-hands its last good frame whenever the far end
+    /// stalls, and an outage was charted as flat, real-looking measurement
+    /// because every one of those copies arrived as a new delivery.
     frames: u64,
+    /// The inner source's own frame id, when it keeps one.
+    inner_id: Option<u64>,
+    /// Whether the wrapped source describes this machine. Fixed for the life
+    /// of a source, so it is read once rather than carried per frame.
+    local: bool,
     /// The worker died; nothing more will ever arrive.
     finished: bool,
 }
@@ -47,6 +60,8 @@ impl ThreadedSource {
         let first = inner.snapshot(Duration::ZERO);
         let label = inner.label();
         let error = inner.error();
+        let inner_id = inner.frame_id();
+        let local = inner.is_local();
         let (req_tx, req_rx) = mpsc::channel::<()>();
         let (upd_tx, upd_rx) = mpsc::channel::<Update>();
 
@@ -59,7 +74,8 @@ impl ThreadedSource {
                 let snap = inner.snapshot(dt);
                 let label = inner.label();
                 let error = inner.error();
-                if upd_tx.send(Update { snap, label, error }).is_err() {
+                let id = inner.frame_id();
+                if upd_tx.send(Update { snap, label, error, id }).is_err() {
                     return;
                 }
             }
@@ -73,6 +89,8 @@ impl ThreadedSource {
             error,
             pending: false,
             frames: 1,
+            inner_id,
+            local,
             finished: false,
         }
     }
@@ -86,6 +104,7 @@ impl ThreadedSource {
                     self.latest = update.snap;
                     self.label = update.label;
                     self.error = update.error;
+                    self.inner_id = update.id;
                     self.frames += 1;
                     self.pending = false;
                 }
@@ -116,11 +135,30 @@ impl MetricSource for ThreadedSource {
     }
 
     fn frame_id(&self) -> Option<u64> {
-        Some(self.frames)
+        // The wrapped source's answer wins: it knows whether it measured
+        // anything, and this one only knows that a message arrived.
+        self.inner_id.or(Some(self.frames))
     }
 
     fn label(&self) -> Option<String> {
         self.label.clone()
+    }
+
+    fn is_local(&self) -> bool {
+        self.local
+    }
+
+    /// Why the wrapped source cannot sample, when it cannot.
+    ///
+    /// The worker has always collected this — it is the only thing that can
+    /// ask the inner source — and it was never handed back, so everything
+    /// downstream saw `None`: the fleet table's row explanation, its
+    /// "(N reachable)" count and `crabmon_up` under `--serve --remote` were
+    /// all blind to a host being down. The fleet's own tests used stub
+    /// sources that implement `error` directly, so none of them went through
+    /// this wrapper.
+    fn error(&self) -> Option<String> {
+        self.error.clone()
     }
 }
 
@@ -180,6 +218,46 @@ impl Pacer {
     pub fn wait(&mut self) -> Duration {
         std::thread::sleep(self.remaining(Instant::now()));
         self.mark(Instant::now())
+    }
+}
+
+#[cfg(test)]
+mod wrapper_tests {
+    use super::*;
+
+    /// A source that always fails, as an unreachable host does.
+    struct Broken;
+
+    impl MetricSource for Broken {
+        fn snapshot(&mut self, _dt: Duration) -> Snapshot {
+            Snapshot::default()
+        }
+        fn error(&self) -> Option<String> {
+            Some("host-a: UNREACHABLE".into())
+        }
+        fn label(&self) -> Option<String> {
+            Some("host-a".into())
+        }
+    }
+
+    /// Everything that tells a user a host is down asks the source it is
+    /// wrapped in, and this one used to answer `None` whatever the host was
+    /// doing.
+    #[test]
+    fn a_wrapped_sources_error_reaches_the_caller() {
+        let src = ThreadedSource::new(Box::new(Broken));
+        assert_eq!(src.error().as_deref(), Some("host-a: UNREACHABLE"));
+    }
+
+    #[test]
+    fn a_healthy_source_reports_no_error() {
+        struct Fine;
+        impl MetricSource for Fine {
+            fn snapshot(&mut self, _dt: Duration) -> Snapshot {
+                Snapshot { taken_at_unix: 1, ..Default::default() }
+            }
+        }
+        assert_eq!(ThreadedSource::new(Box::new(Fine)).error(), None);
     }
 }
 

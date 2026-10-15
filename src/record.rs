@@ -7,7 +7,7 @@
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -72,6 +72,17 @@ impl Recorder {
         self.frames
     }
 
+    /// A rotating recording in `dir`, or `None` when rotation is off. Named
+    /// here so a caller does not have to know which type does the rotating.
+    pub fn rotating(
+        dir: &Path,
+        per_segment: usize,
+        keep: usize,
+        limits: Limits,
+    ) -> Option<RotatingRecorder> {
+        RotatingRecorder::new(dir, per_segment, keep, limits)
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -89,6 +100,124 @@ impl Default for Limits {
     fn default() -> Self {
         Self { top_n: 100, omit_paths: false, max_cmd_len: 200 }
     }
+}
+
+/// A recording that never ends: segments on disk, oldest deleted.
+///
+/// `--record` only helps if you started it before the incident, and the
+/// flight recorder only helps if an alert rule happened to describe what went
+/// wrong. This is the third answer: keep the last hour on disk at all times,
+/// so `--replay` always has something to show, whatever happened and whether
+/// or not a rule saw it coming.
+///
+/// Segments rather than one growing file, because "keep the last hour" has to
+/// be able to *delete* the part that is older than an hour, and a JSONL file
+/// cannot be truncated from the front.
+pub struct RotatingRecorder {
+    dir: PathBuf,
+    /// Frames per segment file.
+    per_segment: usize,
+    /// Segments kept, including the one being written.
+    keep: usize,
+    limits: Limits,
+    current: Option<Recorder>,
+    written: usize,
+    /// Oldest-first, so the one to delete is the front.
+    segments: Vec<PathBuf>,
+}
+
+/// Frames per segment when `--record-rotate` is passed with nothing in the
+/// config to size it. At the default 800 ms refresh this is about 24 minutes
+/// a segment, so the default four segments is an hour and a half.
+pub const DEFAULT_ROTATE_FRAMES: usize = 1800;
+
+/// How a rotating recording's files are named, so `--replay` can be pointed
+/// at one and the set can be found again on the next run.
+pub fn segment_name(at_unix: u64) -> String {
+    format!("crabmon-{at_unix}.jsonl")
+}
+
+/// Whether a filename is one of ours, so rotation deletes its own files and
+/// nothing else in the directory.
+pub fn is_segment_name(name: &str) -> bool {
+    name.strip_prefix("crabmon-")
+        .and_then(|rest| rest.strip_suffix(".jsonl"))
+        .is_some_and(|stamp| !stamp.is_empty() && stamp.bytes().all(|b| b.is_ascii_digit()))
+}
+
+impl RotatingRecorder {
+    /// `per_segment == 0` or `keep == 0` switches rotation off entirely.
+    pub fn new(
+        dir: &Path,
+        per_segment: usize,
+        keep: usize,
+        limits: Limits,
+    ) -> Option<RotatingRecorder> {
+        (per_segment > 0 && keep > 0).then(|| RotatingRecorder {
+            dir: dir.to_path_buf(),
+            per_segment,
+            keep,
+            limits,
+            current: None,
+            written: 0,
+            // Segments left by previous runs count against the budget: the
+            // point is a bounded amount of disk, not a bounded amount per
+            // process.
+            segments: existing_segments(dir),
+        })
+    }
+
+    pub fn segments(&self) -> &[PathBuf] {
+        &self.segments
+    }
+
+    /// Write one frame, rotating and pruning as needed.
+    pub fn write(&mut self, snap: &Snapshot, at_unix: u64) -> std::io::Result<()> {
+        if self.current.is_none() || self.written >= self.per_segment {
+            self.rotate(at_unix)?;
+        }
+        let trimmed =
+            trim_frame(snap, self.limits.top_n, self.limits.omit_paths, self.limits.max_cmd_len);
+        if let Some(rec) = self.current.as_mut() {
+            rec.write_trimmed(&trimmed)?;
+            self.written += 1;
+        }
+        Ok(())
+    }
+
+    fn rotate(&mut self, at_unix: u64) -> std::io::Result<()> {
+        // A second segment inside the same second would otherwise reopen and
+        // truncate the one just written.
+        let mut stamp = at_unix;
+        while self.segments.iter().any(|p| p.file_name() == Some(segment_name(stamp).as_ref())) {
+            stamp += 1;
+        }
+        let path = self.dir.join(segment_name(stamp));
+        self.current = Some(Recorder::create(&path)?.with_limits(
+            self.limits.top_n,
+            self.limits.omit_paths,
+            self.limits.max_cmd_len,
+        ));
+        self.written = 0;
+        self.segments.push(path);
+        while self.segments.len() > self.keep {
+            let oldest = self.segments.remove(0);
+            let _ = std::fs::remove_file(oldest);
+        }
+        Ok(())
+    }
+}
+
+/// Our own segment files in `dir`, oldest first by the stamp in the name.
+fn existing_segments(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(is_segment_name))
+        .collect();
+    out.sort();
+    out
 }
 
 /// A rolling window of recent frames, written out when something goes wrong.
@@ -159,6 +288,35 @@ impl FlightRecorder {
     /// A trigger while a dump is already running extends that one instead of
     /// opening a second file. A flapping rule would otherwise leave a file per
     /// refresh, each one mostly the same frames.
+    /// As `trigger`, and also write the human-readable summary beside the
+    /// dump.
+    ///
+    /// A JSONL recording is evidence nobody can read without crabmon in
+    /// front of it. `alert` is what fired, which is the one thing the frames
+    /// themselves do not carry.
+    pub fn trigger_with_summary(
+        &mut self,
+        reason: &str,
+        at_unix: u64,
+        alert: Option<&crate::alerts::ActiveAlert>,
+        at: &Snapshot,
+    ) -> std::io::Result<Option<PathBuf>> {
+        let opened = self.trigger(reason, at_unix)?;
+        let (Some(path), Some(alert)) = (&opened, alert) else { return Ok(opened) };
+        let first = self.ring.front().cloned().unwrap_or_else(|| at.clone());
+        let dump_name = path.file_name().map(|n| n.to_string_lossy().to_string());
+        let body = crate::incident::summary(
+            alert,
+            &first,
+            at,
+            dump_name.as_deref().unwrap_or("recording.jsonl"),
+        );
+        // Best effort: the recording is the thing that matters, and a
+        // summary that could not be written must not lose it.
+        let _ = std::fs::write(crate::incident::path_for(path), body);
+        Ok(opened)
+    }
+
     pub fn trigger(&mut self, reason: &str, at_unix: u64) -> std::io::Result<Option<PathBuf>> {
         if let Some(dump) = &mut self.active {
             dump.remaining = dump.remaining.max(self.post);
@@ -207,12 +365,80 @@ pub fn dump_name(reason: &str, at_unix: u64) -> String {
 }
 
 /// Replays a recording as a `MetricSource`.
+/// Where a replay's frames live.
+///
+/// A recording used to be parsed in full into memory before the first frame
+/// was drawn, which costs roughly its JSON size several times over — and the
+/// flight recorder makes long captures routine. An indexed replay scans the
+/// file once for line offsets, which touches no JSON at all, and parses one
+/// frame at a time as it is asked for.
+// The two variants differ in size by design: an indexed replay carries a
+// file handle and an offset table, an in-memory one carries the frames.
+// Boxing the small one to even them up would add an allocation to the path
+// that exists because it is cheaper.
+#[allow(clippy::large_enum_variant)]
+enum Frames {
+    /// Already in memory: `from_frames`, and recordings small enough that
+    /// indexing them would cost more than holding them.
+    Memory(Vec<Snapshot>),
+    Indexed {
+        file: std::cell::RefCell<BufReader<File>>,
+        /// Byte offset and length of each frame's line.
+        lines: Vec<(u64, u32)>,
+        /// The last frame parsed, kept so that drawing a frame several times
+        /// — which the event loop does, several times a second — parses it
+        /// once.
+        cached: std::cell::RefCell<Option<(usize, Snapshot)>>,
+    },
+}
+
+impl Frames {
+    fn len(&self) -> usize {
+        match self {
+            Frames::Memory(f) => f.len(),
+            Frames::Indexed { lines, .. } => lines.len(),
+        }
+    }
+
+    fn get(&self, index: usize) -> Option<Snapshot> {
+        match self {
+            Frames::Memory(f) => f.get(index).cloned(),
+            Frames::Indexed { file, lines, cached } => {
+                if let Some((at, snap)) = cached.borrow().as_ref() {
+                    if *at == index {
+                        return Some(snap.clone());
+                    }
+                }
+                let (offset, len) = *lines.get(index)?;
+                let mut reader = file.borrow_mut();
+                reader.seek(SeekFrom::Start(offset)).ok()?;
+                let mut buf = vec![0u8; len as usize];
+                reader.read_exact(&mut buf).ok()?;
+                let snap = serde_json::from_slice::<Snapshot>(&buf).ok()?;
+                *cached.borrow_mut() = Some((index, snap.clone()));
+                Some(snap)
+            }
+        }
+    }
+}
+
+/// Recordings at or below this many bytes are read into memory whole: the
+/// indexing machinery only pays for itself on a capture big enough to care
+/// about, and holding a small one outright keeps scrubbing instant.
+pub const INDEX_ABOVE_BYTES: u64 = 8 * 1024 * 1024;
+
 pub struct ReplaySource {
-    frames: Vec<Snapshot>,
+    frames: Frames,
     position: usize,
     label: String,
     /// When false, `snapshot` holds position instead of advancing.
     pub advancing: bool,
+    /// Frames actually served, counting a position only once however many
+    /// times it is handed out. A finished replay holds its final frame
+    /// forever; without this the caller kept folding copies of it into the
+    /// history until the recorded incident had scrolled out of the charts.
+    served: u64,
+    last_served: Option<usize>,
 }
 
 /// Reduce a snapshot to what is worth keeping in a recording: the busiest
@@ -245,6 +471,40 @@ pub fn trim_frame(snap: &Snapshot, top_n: usize, omit_paths: bool, max_cmd_len: 
     out
 }
 
+/// Scan a JSONL file for the byte offset and length of every non-blank line.
+///
+/// No JSON is parsed here: that is the entire point. A gigabyte recording is
+/// a gigabyte of `read`, not a gigabyte of `serde_json` plus the `Snapshot`
+/// tree it builds.
+fn index_lines(mut reader: BufReader<File>) -> Result<Vec<(u64, u32)>, String> {
+    let mut lines = Vec::new();
+    let mut offset = 0u64;
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let read = reader.read_until(b'\n', &mut buf).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        // The newline itself is not part of the frame, and a trailing \r
+        // from a file that has been through Windows is not either.
+        let mut len = read;
+        while len > 0 && matches!(buf[len - 1], b'\n' | b'\r') {
+            len -= 1;
+        }
+        if buf[..len].iter().any(|b| !b.is_ascii_whitespace()) {
+            lines.push((offset, len as u32));
+        }
+        offset += read as u64;
+    }
+    if lines.is_empty() {
+        return Err("no frames in recording".into());
+    }
+    // A recording killed mid-write leaves a truncated final line, which
+    // `parse_jsonl` drops for the same reason.
+    Ok(lines)
+}
+
 /// Parse JSONL, skipping blank lines. A truncated final line (the recorder was
 /// killed mid-write) is dropped rather than failing the whole file.
 pub fn parse_jsonl(content: &str) -> Result<Vec<Snapshot>, String> {
@@ -273,32 +533,64 @@ pub fn parse_jsonl(content: &str) -> Result<Vec<Snapshot>, String> {
 impl ReplaySource {
     pub fn open(path: &Path) -> Result<ReplaySource, String> {
         let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let mut content = String::new();
-        let mut reader = BufReader::new(file);
-        let mut line = String::new();
-        while reader.read_line(&mut line).map_err(|e| e.to_string())? > 0 {
-            content.push_str(&line);
-            line.clear();
+        let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let label = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+
+        let frames = match size > INDEX_ABOVE_BYTES {
+            true => Frames::Indexed {
+                lines: index_lines(BufReader::new(
+                    File::open(path).map_err(|e| format!("{}: {e}", path.display()))?,
+                ))?,
+                file: std::cell::RefCell::new(BufReader::new(file)),
+                cached: std::cell::RefCell::new(None),
+            },
+            false => {
+                let mut content = String::new();
+                let mut reader = BufReader::new(file);
+                let mut line = String::new();
+                while reader.read_line(&mut line).map_err(|e| e.to_string())? > 0 {
+                    content.push_str(&line);
+                    line.clear();
+                }
+                Frames::Memory(parse_jsonl(&content)?)
+            }
+        };
+        if frames.len() == 0 {
+            return Err("no frames in recording".into());
         }
-        let frames = parse_jsonl(&content)?;
         Ok(ReplaySource {
             frames,
             position: 0,
-            label: path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+            label,
             advancing: true,
+            served: 0,
+            last_served: None,
         })
     }
 
     pub fn from_frames(frames: Vec<Snapshot>, label: impl Into<String>) -> ReplaySource {
-        ReplaySource { frames, position: 0, label: label.into(), advancing: true }
+        ReplaySource {
+            frames: Frames::Memory(frames),
+            position: 0,
+            label: label.into(),
+            advancing: true,
+            served: 0,
+            last_served: None,
+        }
     }
 
     pub fn len(&self) -> usize {
         self.frames.len()
     }
 
+    /// Whether this replay reads frames from disk as it goes rather than
+    /// holding the whole recording in memory.
+    pub fn is_indexed(&self) -> bool {
+        matches!(self.frames, Frames::Indexed { .. })
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.frames.is_empty()
+        self.frames.len() == 0
     }
 
     pub fn position(&self) -> usize {
@@ -314,7 +606,8 @@ impl ReplaySource {
 
     /// Wall-clock span of the recording, from the frames' own timestamps.
     pub fn duration_secs(&self) -> u64 {
-        match (self.frames.first(), self.frames.last()) {
+        let last = self.frames.len().saturating_sub(1);
+        match (self.frames.get(0), self.frames.get(last)) {
             (Some(a), Some(b)) => b.taken_at_unix.saturating_sub(a.taken_at_unix),
             _ => 0,
         }
@@ -324,22 +617,35 @@ impl ReplaySource {
         // `seek`/`step` already use saturating arithmetic; this did not, so an
         // empty frame list underflowed to usize::MAX and indexed out of bounds.
         // `from_frames` is public and accepts any Vec.
-        match self.frames.get(self.position.min(self.frames.len().saturating_sub(1))) {
-            Some(f) => f.clone(),
-            None => Snapshot::default(),
-        }
+        self.frames.get(self.position.min(self.frames.len().saturating_sub(1))).unwrap_or_default()
     }
 }
 
 impl MetricSource for ReplaySource {
     fn snapshot(&mut self, _dt: Duration) -> Snapshot {
         let snap = self.current();
+        // A position served twice is the same measurement twice, whether the
+        // replay has run out of frames or is paused on one.
+        if self.last_served != Some(self.position) {
+            self.served = self.served.wrapping_add(1);
+            self.last_served = Some(self.position);
+        }
         // Advance *after* reading, so the first call returns frame 0 and the
         // final frame is held rather than wrapping around.
         if self.advancing && self.position + 1 < self.frames.len() {
             self.position += 1;
         }
         snap
+    }
+
+    fn frame_id(&self) -> Option<u64> {
+        Some(self.served)
+    }
+
+    fn is_local(&self) -> bool {
+        // The PIDs in a recording belong to whatever was running when it was
+        // taken, which may be another machine and is certainly another time.
+        false
     }
 
     fn timeline(&self) -> Option<(usize, usize)> {
@@ -639,8 +945,9 @@ mod tests {
         let mut rec = Recorder::create(&path).unwrap();
         rec.write(&original).unwrap();
         let replay = ReplaySource::open(&path).unwrap();
-        let back = &replay.frames[0];
+        let back = replay.frames.get(0).expect("a frame");
 
+        let back = &back;
         assert_eq!(back.host.hostname, "testbox");
         assert_eq!(back.psi.io.unwrap().some.avg10, 2.55);
         assert_eq!(back.power.batteries[0].power_w, Some(-12.0));
@@ -724,6 +1031,150 @@ mod tests {
         assert_eq!(disk.await_ms, None);
         assert_eq!(frames[0].procs[0].fds, None);
         assert_eq!(frames[0].procs[0].fd_ratio(), None);
+    }
+
+    /// A finished replay holds its last frame forever. Reporting that as a
+    /// new sample every tick fed copies of it into the history until the
+    /// recorded incident had scrolled out of the charts.
+    #[test]
+    fn a_replay_that_has_run_out_of_frames_stops_claiming_new_samples() {
+        let mut src = ReplaySource::from_frames(vec![frame(1), frame(2)], "r");
+        let first = src.frame_id();
+        src.snapshot(Duration::ZERO);
+        let second = src.frame_id();
+        assert_ne!(first, second, "a fresh frame has to read as one");
+
+        src.snapshot(Duration::ZERO);
+        let at_end = src.frame_id();
+        for _ in 0..5 {
+            src.snapshot(Duration::ZERO);
+            assert_eq!(src.frame_id(), at_end, "the held final frame was served as new");
+        }
+    }
+
+    /// Scrubbing to another frame is new measurement; sitting on one is not.
+    #[test]
+    fn scrubbing_to_a_new_frame_reads_as_a_new_sample() {
+        let mut src = ReplaySource::from_frames(vec![frame(1), frame(2), frame(3)], "r");
+        src.advancing = false;
+        src.snapshot(Duration::ZERO);
+        let held = src.frame_id();
+        src.snapshot(Duration::ZERO);
+        assert_eq!(src.frame_id(), held, "a paused replay re-serves one frame");
+
+        src.seek(2);
+        src.snapshot(Duration::ZERO);
+        assert_ne!(src.frame_id(), held);
+    }
+
+    /// The third answer to "I did not start recording before it happened":
+    /// not a manual recording, not an alert-triggered dump, just the last
+    /// hour, always.
+    #[test]
+    fn a_rotating_recording_keeps_the_newest_segments_and_deletes_the_rest() {
+        let dir = std::env::temp_dir().join(format!("crabmon-rot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut rec = RotatingRecorder::new(&dir, 2, 3, Limits::default()).expect("rotation on");
+        for i in 0..12u64 {
+            rec.write(&frame(i as u32), 1_700_000_000 + i).unwrap();
+        }
+        assert_eq!(rec.segments().len(), 3, "the budget is segments, not frames");
+
+        let on_disk: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(on_disk.len(), 3, "old segments were left behind: {on_disk:?}");
+
+        // Every surviving segment is a replayable recording.
+        for seg in rec.segments() {
+            let replay = ReplaySource::open(seg).expect("a segment replays");
+            assert!(!replay.is_empty());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rotation must delete its own files and nothing else in the directory.
+    #[test]
+    fn rotation_leaves_other_files_alone() {
+        let dir = std::env::temp_dir().join(format!("crabmon-rot-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bystander = dir.join("important.jsonl");
+        std::fs::write(&bystander, "not ours\n").unwrap();
+
+        let mut rec = RotatingRecorder::new(&dir, 1, 1, Limits::default()).unwrap();
+        for i in 0..5u64 {
+            rec.write(&frame(i as u32), 1_700_000_000 + i).unwrap();
+        }
+        assert!(bystander.exists(), "rotation deleted a file that was not its own");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_our_own_segment_names_are_recognised() {
+        assert!(is_segment_name("crabmon-1700000000.jsonl"));
+        assert!(!is_segment_name("crabmon-hot-1700000000.jsonl"), "a flight dump is not a segment");
+        assert!(!is_segment_name("important.jsonl"));
+        assert!(!is_segment_name("crabmon-.jsonl"));
+        assert!(!is_segment_name("crabmon-1700000000.json"));
+    }
+
+    /// Two segments opened inside the same second must not be the same file.
+    #[test]
+    fn a_fast_rotation_does_not_overwrite_the_segment_it_just_wrote() {
+        let dir = std::env::temp_dir().join(format!("crabmon-rot-fast-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut rec = RotatingRecorder::new(&dir, 1, 4, Limits::default()).unwrap();
+        for i in 0..4u32 {
+            rec.write(&frame(i), 1_700_000_000).unwrap();
+        }
+        let names: std::collections::HashSet<_> =
+            rec.segments().iter().map(|p| p.file_name().unwrap().to_owned()).collect();
+        assert_eq!(names.len(), 4, "segments collided inside one second");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A long recording used to be parsed in full before the first frame was
+    /// drawn. The indexed path reads one frame at a time.
+    #[test]
+    fn a_large_recording_is_indexed_rather_than_loaded_whole() {
+        let path = std::env::temp_dir().join(format!("crabmon-big-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut rec = Recorder::create(&path).unwrap();
+        // Enough bytes to cross the indexing threshold.
+        let mut fat = frame(1);
+        fat.procs = (0..400)
+            .map(|i| crate::metrics::ProcRow {
+                pid: i,
+                name: format!("process-{i}"),
+                cmd: "x".repeat(200),
+                ..Default::default()
+            })
+            .collect();
+        let mut written = 0;
+        while std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) <= INDEX_ABOVE_BYTES {
+            fat.taken_at_unix = 1_700_000_000 + written;
+            rec.write(&fat).unwrap();
+            written += 1;
+            assert!(written < 10_000, "the fixture never got large enough");
+        }
+        drop(rec);
+
+        let mut replay = ReplaySource::open(&path).expect("a large recording opens");
+        assert!(replay.is_indexed(), "a large recording was loaded whole");
+        assert_eq!(replay.len() as u64, written);
+
+        // Frames come back in order, and seeking lands on the right one.
+        let first = replay.snapshot(Duration::ZERO);
+        assert_eq!(first.taken_at_unix, 1_700_000_000);
+        replay.seek(replay.len() - 1);
+        let last = replay.peek().unwrap();
+        assert_eq!(last.taken_at_unix, 1_700_000_000 + written - 1);
+        assert_eq!(replay.duration_secs(), written - 1);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

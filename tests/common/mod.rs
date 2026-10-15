@@ -57,6 +57,8 @@ pub fn proc_row(pid: u32, ppid: Option<u32>, name: &str, cpu: f32, mem: u64) -> 
         container: None,
         netns: None,
         cmd: format!("/usr/bin/{name} --flag"),
+        pss: None,
+        uss: None,
         exe: format!("/usr/bin/{name}"),
         cwd: "/home/vlad".into(),
     }
@@ -239,6 +241,11 @@ pub fn snapshot() -> Snapshot {
             ac_online: Some(false),
             rapl_watts: None,
         },
+        cgroups: Vec::new(),
+        // A healthy machine: the kernel log is readable and has nothing to
+        // report. Tests that want an event push one in.
+        kernel: Vec::new(),
+        kernel_unreadable: None,
         taken_at_unix: 1_788_297_407,
     }
 }

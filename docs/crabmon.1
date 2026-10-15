@@ -1,4 +1,4 @@
-.TH CRABMON 1 "2026-10-04" "crabmon 0.9.0" "User Commands"
+.TH CRABMON 1 "2026-10-15" "crabmon 0.10.0" "User Commands"
 .SH NAME
 crabmon \- terminal system monitor
 .SH SYNOPSIS
@@ -27,8 +27,8 @@ percentages to mean anything.
 .TP
 .BR \-s ", " \-\-sort " " \fIKEY\fR
 Initial sort column: \fBpid\fR, \fBname\fR, \fBcpu\fR, \fBmem\fR, \fBvirt\fR,
-\fBdisk\fR, \fBtime\fR, \fBuser\fR, \fBstate\fR, \fBthreads\fR, \fBnice\fR or
-\fBfds\fR.
+\fBdisk\fR, \fBtime\fR, \fBuser\fR, \fBstate\fR, \fBthreads\fR, \fBnice\fR,
+\fBfds\fR, \fBpss\fR or \fBgrowth\fR.
 .TP
 .BR \-a ", " \-\-ascending
 Sort ascending.
@@ -87,6 +87,14 @@ from the table. \fBname\fR is always drawn last.
 Record every sample to a JSON Lines file, replacing any file already at that
 path. See \fBRECORDINGS\fR.
 .TP
+.B \-\-record\-rotate " " \fIDIR\fR
+Keep a rotating recording in \fIDIR\fR: segments of \fB[record]\fR
+\fIrotate_frames\fR frames each, the oldest deleted once there are more than
+\fIrotate_keep\fR of them. Unlike \fB\-\-record\fR this is meant to be left
+on, so a replay of the last hour is always available without having predicted
+the incident \(em and unlike the flight recorder it does not depend on an
+alert rule having described what went wrong.
+.TP
 .B \-\-replay " " \fIPATH\fR
 Drive the interface from a recording instead of sampling this host.
 .TP
@@ -106,8 +114,15 @@ Command to run on the remote host. Defaults to
 .TP
 .B \-\-serve " " \fIADDR\fR
 Run headless and serve Prometheus metrics on \fIADDR\fR, e.g. \fB:9100\fR.
-Routes: \fB/\fR, \fB/metrics\fR, \fB/healthz\fR. Always samples this host;
-combining it with \fB\-\-remote\fR or \fB\-\-replay\fR is an error.
+\fIADDR\fR may instead be a Unix socket \(em \fBunix:/run/crabmon.sock\fR,
+or a bare path \(em in which case nothing listens on a port and the
+filesystem does the access control; the socket is created mode \fB0660\fR.
+A stale socket from a killed exporter is replaced, one still in use is not.
+Routes: \fB/\fR, \fB/metrics\fR, \fB/healthz\fR. With \fB\-\-remote\fR it
+exports a whole fleet instead, every series carrying \fBhost="..."\fR and each
+host evaluating the \fB[[alert]]\fR rules on its own; flight dumps are then
+named \fBcrabmon\-<host>\-<rule>\-<unix>.jsonl\fR. Combining it with
+\fB\-\-replay\fR is an error: a recording has no \(lqnow\(rq to scrape.
 .PP
 A bare port binds to loopback; \fB:\fIPORT\fR binds to every interface. The
 per-process series carry command lines, so the difference matters. Connections
@@ -209,7 +224,7 @@ Cycle grouping: none, systemd unit, container, user. The aggregate table has its
 own cursor; process actions are refused from it, since it shows no process rows.
 .TP
 .B Space
-Tag the selected process. Signals, renice and affinity then apply to every
+Tag the selected process. Signals, renice, affinity and IO priority then apply to every
 tagged process instead of just the cursor.
 .TP
 .B U
@@ -268,6 +283,30 @@ Change the selected process's nice value (Unix).
 .TP
 .B A
 Set the selected process's CPU affinity (Linux).
+.TP
+.B I
+Set the selected process's IO scheduling priority (Linux), the way
+.BR ionice (1)
+spells it: a class of
+.BR none ,
+.BR rt ,
+.B be
+or
+.BR idle ,
+and a level of 0\(en7 for the two classes that have one.
+.TP
+.B o ", " O
+Fold or unfold the subtree under the cursor in the tree view; a folded row is
+marked with the number of rows it hides, e.g. \fB+40 chrome\fR.
+.B O
+unfolds everything. Folds are kept by PID, so they survive a refresh and go
+when the process does.
+.TP
+.B Ctrl\-R
+Reload the config file: thresholds, colours, panels, columns and
+\fB[[alert]]\fR rules are re-read and applied without restarting. Session
+state \(em the filter, tags, pins, selection, layout and sort \(em is kept.
+A file that does not parse changes nothing.
 .TP
 .B P
 Write a snapshot to the export directory.
@@ -329,7 +368,7 @@ Refresh interval in milliseconds, clamped to 200\-10000. Default 800.
 .B sort_by
 Sort column: \fBpid\fR, \fBname\fR, \fBcpu\fR, \fBmem\fR, \fBvirt\fR,
 \fBdisk\fR, \fBtime\fR, \fBuser\fR, \fBstate\fR, \fBthreads\fR, \fBnice\fR,
-\fBfds\fR. Default \fBcpu\fR.
+\fBfds\fR, \fBpss\fR, \fBgrowth\fR. Default \fBcpu\fR.
 .TP
 .B sort_desc
 Sort descending. Default true.
@@ -423,14 +462,39 @@ is where dumps are written (empty means the working directory); each is named
 \fBcrabmon\-<rule>\-<unix>.jsonl\fR and replays like any other recording. At
 the default 800 ms refresh, \fBflight = 750\fR is ten minutes and roughly
 40 MB of live memory. A rule that flaps extends the dump in progress rather
-than opening a file per refresh.
+than opening a file per refresh. Beside each dump crabmon writes
+\fBcrabmon\-<rule>\-<unix>.md\fR: what fired and by how much, the machine at
+that moment, what the kernel had said, the busiest processes, and what changed
+over the frames before it \(em a JSONL recording is evidence nobody can read
+without crabmon in front of it.
+.PP
+.B rotate_frames
+and
+.B rotate_keep
+bound a rotating recording (\fB\-\-record\-rotate\fR): frames per segment
+file, and segments kept including the one being written. 0 frames switches
+rotation off, which is the default. At the default 800 ms refresh,
+\fBrotate_frames = 1800\fR with \fBrotate_keep = 4\fR is about ninety
+minutes on disk.
+.B rotate_dir
+is where segments go when the flag names no directory.
 .SS [procs]
 .B columns
 fixes the column order instead of fitting the terminal width. Names are
 \fBmark\fR, \fBpid\fR, \fBuser\fR, \fBstate\fR, \fBcpu\fR, \fBtrend\fR,
-\fBmem\fR, \fBvirt\fR, \fBthr\fR, \fBni\fR, \fBfd\fR, \fBdisk\fR,
-\fBtime\fR, \fBports\fR and \fBname\fR; COMMAND is always drawn last and
+\fBmem\fR, \fBpss\fR, \fBgrowth\fR, \fBvirt\fR, \fBthr\fR, \fBni\fR,
+\fBfd\fR, \fBdisk\fR, \fBtime\fR, \fBports\fR and \fBname\fR; COMMAND is always drawn last and
 unknown names are ignored. Empty (the default) fits as many as will go.
+.B pss
+reads \fB/proc/<pid>/smaps_rollup\fR for each process, which adds the
+\fBPSS\fR column and the \fBpss>\fR and \fBuss>\fR filters. RSS counts a
+page shared between eight processes eight times, so a tree's RSS can exceed
+the machine's memory; PSS divides each shared page among its holders and adds
+up to something real, and USS is what killing the process would actually free.
+Off by default: one more read per process per sample. Threads are skipped,
+since every thread of a process shares its address space and would report the
+process's own figures.
+.TP
 .B ports
 looks up listening ports for the rows on screen — one fd table per visible row,
 so it is off by default.
@@ -445,6 +509,14 @@ process per sample, falling back automatically when the far end predates
 .B top_procs
 per-process series are exported by \fB\-\-serve\fR, busiest first (default
 20; 0 disables them).
+.PP
+.B token
+requires every scrape of \fB/metrics\fR to present
+\fBAuthorization: Bearer <token>\fR; an empty token (the default) leaves the
+exporter open. The environment variable \fBCRABMON_SERVE_TOKEN\fR overrides
+it, which keeps the secret out of a config file. A scrape carries the argv of
+every process on the machine, which is why this exists. \fB/healthz\fR is
+exempt, and the comparison is constant-time.
 .SS [audit]
 .B enabled
 records every signal, renice and affinity change; \fBpath\fR overrides the
@@ -472,7 +544,28 @@ Each table defines one rule:
 .I kind
 is one of
 .IR cpu ", " mem ", " swap ", " load ", " disk ", " temp ", " gpu ", " psi ", "
-.IR io ", " net ", " fd " or " proc .
+.IR io ", " net ", " fd ", " proc ", " trend ", " fillin ", " cgroup " or "
+.IR kernel .
+.I cgroup
+is a container's or unit's memory against its own cgroup limit, which the
+host's gauges cannot see;
+.I target
+names one, and an empty target watches whichever is closest to its limit.
+.PP
+.I fillin
+is seconds until a filesystem is full at the rate it is filling, so it is
+written with
+.I below
+\(em less time is the alarming direction. An empty
+.I target
+watches whichever mount fills first. The same figure is drawn in the disks
+panel for any mount that will fill within a week.
+.PP
+.I trend
+measures growth rather than level: \fIover_secs\fR is the window (default
+300), \fIthreshold\fR is in bytes, and a \fIquery\fR selects the processes
+whose RSS is measured \(em the worst grower wins \(em while an empty query
+measures the machine's \fImem\fR or \fIswap\fR.
 A rule fires only once its condition has held for \fIfor_secs\fR seconds, and
 its \fIcommand\fR runs once per activation. \fIcommand_clear\fR runs once when
 it recovers, and the alert popup (\fB!\fR) logs every transition,

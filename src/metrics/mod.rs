@@ -6,12 +6,16 @@ pub mod diskstats;
 pub mod fds;
 pub mod gpu;
 pub mod identity;
+pub mod ioprio;
+pub mod kmsg;
 pub mod meminfo;
 pub mod netclass;
 pub mod netns;
 pub mod power;
+pub mod procdetail;
 pub mod procgroup;
 pub mod psi;
+pub mod smaps;
 pub mod sockets;
 pub mod sysinfo_source;
 
@@ -116,6 +120,17 @@ pub struct ProcRow {
     /// a process holding none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fds: Option<u32>,
+    /// Proportional set size: the process's private pages plus its share of
+    /// every page it shares with another. `None` unless `[procs] pss` is on.
+    ///
+    /// RSS double-counts — a page shared by eight Chromium processes is in
+    /// all eight figures — so adding up a tree's RSS can exceed the machine's
+    /// memory. PSS adds up to something real.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pss: Option<u64>,
+    /// Unique set size: what killing this process would actually free.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uss: Option<u64>,
     /// The process's own `RLIMIT_NOFILE` soft limit, which is what `fds` runs
     /// out against — the system-wide total is nowhere near it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -150,6 +165,25 @@ impl ProcRow {
     /// a limit of a million and fatal for a daemon left on the default 1024.
     /// `None` when either half is unknown, so an unreadable limit reads as no
     /// data rather than as headroom.
+    /// The memory figure worth adding up: PSS where it was measured, RSS
+    /// otherwise.
+    ///
+    /// Named rather than left to each caller so that "the total" means one
+    /// thing everywhere — a per-container sum built from RSS and a panel
+    /// built from PSS would disagree by a factor of the sharing.
+    pub fn mem_share(&self) -> u64 {
+        self.pss.unwrap_or(self.mem)
+    }
+
+    /// How much of this process's resident memory is shared with another,
+    /// 0..=1. `None` unless PSS was measured.
+    ///
+    /// The answer to "why does killing this free so much less than its RSS".
+    pub fn shared_ratio(&self) -> Option<f64> {
+        let uss = self.uss?;
+        (self.mem > 0).then(|| 1.0 - ratio(uss, self.mem))
+    }
+
     pub fn fd_ratio(&self) -> Option<f64> {
         match (self.fds, self.fd_limit) {
             (Some(n), Some(limit)) if limit > 0 => Some(ratio(n as u64, limit)),
@@ -319,10 +353,36 @@ pub struct Snapshot {
     /// Per-network-namespace throughput: one row per container, plus the
     /// host's own namespace, flagged.
     pub netns: Vec<NetNamespace>,
+    /// Per-container and per-unit accounting, read from each cgroup's own
+    /// files rather than summed from its processes — which is the only way
+    /// to know what a group is *allowed*.
+    pub cgroups: Vec<cgroup::CgroupStat>,
+    /// Kernel events worth waking someone for — OOM kills, crashes, IO
+    /// errors — newest last. Empty where `/dev/kmsg` cannot be read, which
+    /// `kernel_unreadable` tells apart from a quiet machine.
+    pub kernel: Vec<kmsg::KernelEvent>,
+    /// Why the kernel log is not being read, when it is not.
+    pub kernel_unreadable: Option<String>,
     pub taken_at_unix: u64,
 }
 
 impl Snapshot {
+    /// A group's own accounting, by container id or unit name.
+    pub fn cgroup_named(&self, name: &str) -> Option<&cgroup::CgroupStat> {
+        self.cgroups.iter().find(|c| c.name == name)
+    }
+
+    /// The newest kernel event of a kind, which is what a panel row and an
+    /// alert message both want.
+    pub fn newest_kernel_event(&self, kind: kmsg::EventKind) -> Option<&kmsg::KernelEvent> {
+        self.kernel.iter().rev().find(|e| e.kind == kind)
+    }
+
+    /// How many kernel events of a kind this sample carries.
+    pub fn kernel_count(&self, kind: kmsg::EventKind) -> usize {
+        self.kernel.iter().filter(|e| e.kind == kind).count()
+    }
+
     /// Aggregate network rate, optionally counting virtual interfaces.
     pub fn net_totals(&self, include_virtual: bool) -> (f64, f64) {
         self.nets
@@ -412,6 +472,19 @@ pub trait MetricSource {
     /// Which host `snapshot` is currently returning.
     fn selected_host(&self) -> usize {
         0
+    }
+
+    /// Whether the frames this source hands back describe *this* machine.
+    ///
+    /// Everything crabmon does beyond drawing — signalling, renicing, setting
+    /// affinity, reading a process's sockets, open files and listening ports —
+    /// acts on the local host by PID. Under `--remote` or `--replay` the PIDs
+    /// on screen belong to another machine, or to one as it was an hour ago,
+    /// and a local PID that happens to match is an unrelated process. The
+    /// answer has to come from the source, because nothing in a `Snapshot`
+    /// says where it was taken.
+    fn is_local(&self) -> bool {
+        true
     }
 
     /// Identifies the frame `snapshot` last returned, for sources that sample

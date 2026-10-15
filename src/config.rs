@@ -42,6 +42,8 @@ pub struct Panels {
     pub cgroup: bool,
     pub psi: bool,
     pub power: bool,
+    /// OOM kills, crashes and IO errors from `/dev/kmsg`.
+    pub kernel: bool,
 }
 
 impl Default for Panels {
@@ -58,6 +60,7 @@ impl Default for Panels {
             cgroup: true,
             psi: true,
             power: true,
+            kernel: true,
         }
     }
 }
@@ -123,6 +126,16 @@ pub struct RecordConfig {
     pub flight_after: usize,
     /// Where dumps are written. Empty means the working directory.
     pub flight_dir: String,
+    /// Frames per segment of a rotating recording. 0 switches rotation off,
+    /// which is the default: a monitor that writes files unasked is not what
+    /// anyone installed.
+    pub rotate_frames: usize,
+    /// Segments kept, including the one being written. At the default 800 ms
+    /// refresh, 4 segments of 1800 frames is about ninety minutes.
+    pub rotate_keep: usize,
+    /// Where segments are written. Empty means `flight_dir`, and failing
+    /// that the working directory.
+    pub rotate_dir: String,
 }
 
 impl Default for RecordConfig {
@@ -134,6 +147,9 @@ impl Default for RecordConfig {
             flight: 0,
             flight_after: 30,
             flight_dir: String::new(),
+            rotate_frames: 0,
+            rotate_keep: 4,
+            rotate_dir: String::new(),
         }
     }
 }
@@ -154,11 +170,21 @@ impl RecordConfig {
 pub struct ServeConfig {
     /// Per-process series to export. 0 disables them.
     pub top_procs: usize,
+    /// A bearer token every scrape must present, or empty for none.
+    ///
+    /// The exporter publishes every command line on the machine, which is
+    /// the argv of every process including the ones people put secrets in.
+    /// Binding it anywhere but loopback with nothing in front of it was one
+    /// flag away, and there was no way to ask for a password.
+    ///
+    /// `CRABMON_SERVE_TOKEN` overrides this, which is how to keep the secret
+    /// out of a config file that is in version control.
+    pub token: String,
 }
 
 impl Default for ServeConfig {
     fn default() -> Self {
-        Self { top_procs: 20 }
+        Self { top_procs: 20, token: String::new() }
     }
 }
 
@@ -178,6 +204,15 @@ pub struct ProcsConfig {
     /// process, not only the visible rows, because a filter that only saw the
     /// rows already on screen would be a filter over the wrong set.
     pub fds: bool,
+    /// Read each process's proportional and unique memory from
+    /// `/proc/<pid>/smaps_rollup`, which adds the PSS column and makes
+    /// `pss>` filters work. Off by default for the same reason `fds` is: one
+    /// more read per process per sample.
+    ///
+    /// Worth the cost when the question is "which program is using the
+    /// memory" on a machine that forks — a browser, a database with workers
+    /// — where RSS counts every shared page once per process holding it.
+    pub pss: bool,
     /// Rows to keep pinned across restarts is meaningless — PIDs are recycled —
     /// but the marker column can be switched off.
     pub pin_marker: bool,
@@ -185,7 +220,7 @@ pub struct ProcsConfig {
 
 impl Default for ProcsConfig {
     fn default() -> Self {
-        Self { columns: Vec::new(), ports: false, fds: false, pin_marker: true }
+        Self { columns: Vec::new(), ports: false, fds: false, pss: false, pin_marker: true }
     }
 }
 
@@ -308,8 +343,29 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn serve_token(&self) -> Option<String> {
+        // The environment wins: a token in a config file is a secret at rest
+        // in a file people commit.
+        std::env::var("CRABMON_SERVE_TOKEN")
+            .ok()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .or_else(|| Some(self.serve.token.trim().to_string()).filter(|t| !t.is_empty()))
+    }
+
     pub fn parse(s: &str) -> Config {
-        toml::from_str(s).unwrap_or_default()
+        Config::parse_checked(s).unwrap_or_default()
+    }
+
+    /// As `parse`, but says why a file was rejected.
+    ///
+    /// `parse` swallowing the error is how a single typo — a stray bracket, an
+    /// alert rule with a misspelled `kind` — silently discarded *every*
+    /// setting in the file, alert rules included, with nothing on screen to
+    /// say so. A monitor whose alerts have quietly stopped existing is the
+    /// worst possible failure mode for one.
+    pub fn parse_checked(s: &str) -> Result<Config, String> {
+        toml::from_str(s).map_err(|e| e.message().replace('\n', " "))
     }
 
     pub fn to_toml(&self) -> String {
@@ -358,6 +414,11 @@ impl Config {
         // between two copies of the same thing.
         let mut seen = std::collections::HashSet::new();
         self.panel_order.retain(|p| seen.insert(p.clone()));
+        // A rotating recording is bounded disk, and the bound has to be one
+        // somebody can reason about: four segments of a million frames is
+        // not a setting, it is a full filesystem.
+        self.record.rotate_frames = self.record.rotate_frames.min(1_000_000);
+        self.record.rotate_keep = self.record.rotate_keep.clamp(1, 64);
         // The flight recorder's ring is live memory, and it holds whole
         // frames. A hand-edited `flight = 100000000` would be an OOM in the
         // process that exists to make memory pressure visible.
@@ -383,23 +444,116 @@ pub fn config_path() -> PathBuf {
 }
 
 pub fn load_from(path: &PathBuf) -> Config {
+    load_checked(path).0
+}
+
+/// Load a config, and say what was wrong with it.
+///
+/// A missing file is not an error — that is simply a first run. A file that
+/// exists and cannot be parsed is: every setting in it has just been ignored,
+/// and the caller has to tell someone rather than carry on with defaults as
+/// though the file said nothing.
+pub fn load_checked(path: &PathBuf) -> (Config, Option<String>) {
     match fs::read_to_string(path) {
-        Ok(s) => Config::parse(&s).sanitize(),
-        Err(_) => Config::default(),
+        Ok(s) => match Config::parse_checked(&s) {
+            Ok(cfg) => (cfg.sanitize(), None),
+            Err(e) => (Config::default(), Some(e)),
+        },
+        Err(_) => (Config::default(), None),
     }
 }
 
 /// Best-effort save; a read-only config dir must never take the app down.
+///
+/// Written to a sibling temp file and renamed over the target, because
+/// `fs::write` truncates first: a crash, a full disk or a kill between the
+/// truncate and the write left the user with an empty config and every
+/// setting gone. A rename is atomic on the same filesystem, so the old file
+/// survives intact until the new one is complete.
 pub fn save_to(path: &PathBuf, cfg: &Config) {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let _ = fs::write(path, cfg.to_toml());
+    let body = cfg.to_toml();
+    // `to_toml` swallows its own errors into an empty string; writing that
+    // over a good config would lose it just as thoroughly as a truncation.
+    if body.trim().is_empty() {
+        return;
+    }
+    let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+    if fs::write(&tmp, &body).is_ok() && fs::rename(&tmp, path).is_ok() {
+        return;
+    }
+    let _ = fs::remove_file(&tmp);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The failure this is here to prevent: a file with one typo in it used
+    /// to be discarded whole, silently — every threshold, every column and
+    /// every alert rule gone, with the TUI then writing the defaults back
+    /// over the file on exit.
+    #[test]
+    fn an_unparseable_file_is_reported_rather_than_silently_discarded() {
+        let bad = "refresh_ms = 1500\n[[alert]\nname = \"hot\"\n";
+        assert!(Config::parse_checked(bad).is_err());
+
+        let path =
+            std::env::temp_dir().join(format!("crabmon-cfg-bad-{}.toml", std::process::id()));
+        std::fs::write(&path, bad).unwrap();
+        let (cfg, err) = load_checked(&path);
+        assert!(err.is_some(), "a broken file parsed clean");
+        assert_eq!(cfg, Config::default());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An alert rule naming a kind that does not exist is the same failure
+    /// wearing a different hat: it takes the whole file with it.
+    #[test]
+    fn a_bad_alert_kind_is_an_error_not_a_config_with_no_alerts() {
+        let out = Config::parse_checked(
+            "[[alert]]\nname = \"hot\"\nkind = \"cpu-ish\"\nthreshold = 90.0\n",
+        );
+        assert!(out.is_err(), "{out:?}");
+    }
+
+    #[test]
+    fn a_missing_file_is_a_first_run_not_an_error() {
+        let path =
+            std::env::temp_dir().join(format!("crabmon-cfg-absent-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let (cfg, err) = load_checked(&path);
+        assert_eq!(err, None);
+        assert_eq!(cfg, Config::default());
+    }
+
+    /// `fs::write` truncates before it writes; the save has to leave either
+    /// the old file or the new one, never half of either.
+    #[test]
+    fn saving_replaces_the_file_atomically_and_leaves_no_temporary_behind() {
+        let dir = std::env::temp_dir().join(format!("crabmon-cfg-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.toml");
+
+        let mut cfg = Config { refresh_ms: 1500, ..Default::default() };
+        save_to(&path, &cfg);
+        assert_eq!(load_checked(&path).0.refresh_ms, 1500);
+
+        cfg.refresh_ms = 2500;
+        save_to(&path, &cfg);
+        assert_eq!(load_checked(&path).0.refresh_ms, 2500);
+
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left behind: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_default_config_round_trips_through_toml() {

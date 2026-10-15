@@ -52,8 +52,24 @@ pub fn observe_with(
     snap: &Snapshot,
     now_secs: u64,
 ) -> Observation {
+    observe_with_label(engine, flight, snap, now_secs, "")
+}
+
+/// As `observe_with`, with a host name folded into the names of any flight
+/// dumps it opens.
+///
+/// A fleet runs one of these per host, and `cpu-saturated` firing on three
+/// machines in the same second would otherwise be three writers opening one
+/// file named after the rule.
+pub fn observe_with_label(
+    engine: &mut AlertEngine,
+    flight: Option<&mut FlightRecorder>,
+    snap: &Snapshot,
+    now_secs: u64,
+    label: &str,
+) -> Observation {
     let active = engine.evaluate(snap, now_secs);
-    let notes = drain(engine, flight, snap);
+    let notes = drain_named(engine, flight, snap, &active, label);
     let commands = engine.take_commands();
     Observation { active, commands, notes }
 }
@@ -71,6 +87,28 @@ pub fn drain(
     flight: Option<&mut FlightRecorder>,
     snap: &Snapshot,
 ) -> Vec<String> {
+    drain_with_alerts(engine, flight, snap, &[])
+}
+
+/// As `drain`, and told which rules are currently firing so the summary
+/// written beside a dump can say what tripped it and by how much.
+pub fn drain_with_alerts(
+    engine: &mut AlertEngine,
+    flight: Option<&mut FlightRecorder>,
+    snap: &Snapshot,
+    active: &[ActiveAlert],
+) -> Vec<String> {
+    drain_named(engine, flight, snap, active, "")
+}
+
+/// As `drain_with_alerts`, with a host name in the dump filenames.
+pub fn drain_named(
+    engine: &mut AlertEngine,
+    flight: Option<&mut FlightRecorder>,
+    snap: &Snapshot,
+    active: &[ActiveAlert],
+    label: &str,
+) -> Vec<String> {
     let mut notes = Vec::new();
     let Some(flight) = flight else {
         // Nothing is listening for them, and leaving them to accumulate would
@@ -82,13 +120,22 @@ pub fn drain(
         notes.push(format!("flight recording written to {}", path.display()));
     }
     for name in engine.take_fired() {
-        match flight.trigger(&name, snap.taken_at_unix) {
+        let alert = active.iter().find(|a| a.name == name);
+        let dump_name = match label.is_empty() {
+            true => name.clone(),
+            false => format!("{label}-{name}"),
+        };
+        match flight.trigger_with_summary(&dump_name, snap.taken_at_unix, alert, snap) {
             // `None` means a dump was already running and has been extended,
             // which needs no second announcement.
             Ok(Some(path)) => notes.push(format!(
-                "{name}: recording {} frames to {}",
+                "{name}: recording {} frames to {} (+ {})",
                 flight.buffered(),
-                path.display()
+                path.display(),
+                crate::incident::path_for(&path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default()
             )),
             Ok(None) => {}
             Err(e) => notes.push(format!("flight recording failed: {e}")),
@@ -103,6 +150,10 @@ pub struct Supervisor {
     pub alerts: AlertEngine,
     flight: Option<FlightRecorder>,
     started: Instant,
+    /// Prefixed to the names of this supervisor's flight dumps. A fleet runs
+    /// one supervisor per host, and `cpu-saturated` firing on three machines
+    /// at once would otherwise be three writers opening the same file.
+    label: String,
 }
 
 impl Supervisor {
@@ -126,6 +177,7 @@ impl Supervisor {
                 cfg.record.limits(),
             ),
             started: Instant::now(),
+            label: String::new(),
         }
     }
 
@@ -136,9 +188,33 @@ impl Supervisor {
         self.started.elapsed().as_secs()
     }
 
+    /// Name this supervisor's host, so its dumps and its notes say which
+    /// machine they are about.
+    pub fn for_host(mut self, host: &str) -> Supervisor {
+        self.label = host.to_string();
+        self
+    }
+
+    pub fn host(&self) -> &str {
+        &self.label
+    }
+
     pub fn observe(&mut self, snap: &Snapshot) -> Observation {
         let now = self.uptime();
-        observe_with(&mut self.alerts, self.flight.as_mut(), snap, now)
+        let mut obs =
+            observe_with_label(&mut self.alerts, self.flight.as_mut(), snap, now, &self.label);
+        if !self.label.is_empty() {
+            // Everything a fleet reports has to say which machine it is
+            // about, or three hosts' alerts read as one machine in a very
+            // bad way.
+            for line in obs.notes.iter_mut() {
+                *line = format!("{}: {line}", self.label);
+            }
+            for alert in obs.active.iter_mut() {
+                alert.message = format!("{}: {}", self.label, alert.message);
+            }
+        }
+        obs
     }
 
     pub fn is_dumping(&self) -> bool {
@@ -146,27 +222,61 @@ impl Supervisor {
     }
 }
 
+/// Hook children that have been started and not yet reaped.
+///
+/// A spawned child stays a zombie in the process table until somebody waits
+/// on it. Hooks are deliberately not waited on — an alert hook that blocks
+/// the sampler is worse than no hook at all — so without this every firing
+/// left a defunct `sh` behind, for the whole life of a process that is
+/// typically left running for weeks and whose own process table is on screen.
+/// A flapping rule made that unbounded.
+static PENDING_HOOKS: std::sync::OnceLock<std::sync::Mutex<Vec<std::process::Child>>> =
+    std::sync::OnceLock::new();
+
+fn pending_hooks() -> &'static std::sync::Mutex<Vec<std::process::Child>> {
+    PENDING_HOOKS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Reap any hook that has finished. Never blocks: a hook still running is
+/// kept and looked at again next time.
+pub fn reap_hooks() {
+    let Ok(mut pending) = pending_hooks().lock() else { return };
+    pending.retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_)) | Err(_)));
+}
+
+/// How many hook children are still unreaped, for tests.
+pub fn pending_hook_count() -> usize {
+    pending_hooks().lock().map(|p| p.len()).unwrap_or(0)
+}
+
 /// Spawn hook commands, detached. Returns the ones that could not be started.
 ///
 /// A hook is a user-configured shell command whose job is to page someone; it
 /// is not waited on, and its output goes nowhere, because an alert hook that
 /// blocks the sampler or scribbles on a full-screen interface is worse than no
-/// hook at all.
+/// hook at all. It is still *reaped*, lazily, so a finished hook does not stay
+/// in the process table as a zombie.
 pub fn spawn_hooks(commands: &[String]) -> Vec<String> {
-    commands
-        .iter()
-        .filter_map(|cmd| {
-            std::process::Command::new("sh")
-                .arg("-c")
-                .arg(cmd)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .err()
-                .map(|e| format!("alert command failed: {e}"))
-        })
-        .collect()
+    reap_hooks();
+    let mut errors = Vec::new();
+    for cmd in commands {
+        match std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => {
+                if let Ok(mut pending) = pending_hooks().lock() {
+                    pending.push(child);
+                }
+            }
+            Err(e) => errors.push(format!("alert command failed: {e}")),
+        }
+    }
+    errors
 }
 
 #[cfg(test)]
@@ -181,6 +291,7 @@ mod tests {
             kind: AlertKind::Cpu,
             threshold,
             for_secs,
+            over_secs: 0,
             below: false,
             target: String::new(),
             query: String::new(),
@@ -261,10 +372,54 @@ mod tests {
             fired.notes
         );
 
-        let dump = std::fs::read_dir(&dir).unwrap().flatten().next().expect("a dump").path();
+        // The summary sits beside it, so the recording has to be named
+        // rather than taken as whatever the directory lists first.
+        let dump = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|e| e == "jsonl"))
+            .expect("a dump");
         let frames = crate::record::parse_jsonl(&std::fs::read_to_string(&dump).unwrap()).unwrap();
         let peak = frames.last().expect("frames").cpu.per_core[0];
         assert_eq!(peak, 95.0, "the recording stops before the frame that caused it");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A JSONL dump is evidence nobody can read without crabmon in front of
+    /// it; "send me a recording" only lands as a bug report somebody opens
+    /// if it arrives with a page saying what fired.
+    #[test]
+    fn a_dump_comes_with_a_summary_anyone_can_read() {
+        let dir = std::env::temp_dir().join(format!("crabmon-sum-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut cfg = cfg_with(vec![rule("hot", 90.0, 0, "")]);
+        cfg.record.flight = 4;
+        cfg.record.flight_after = 0;
+        let mut sup = Supervisor::with_flight_dir(&cfg, &dir);
+
+        sup.observe(&cpu(1.0));
+        let fired = sup.observe(&cpu(95.0));
+        assert!(!fired.active.is_empty());
+
+        let summary = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|e| e == "md"))
+            .expect("a summary beside the dump");
+        let text = std::fs::read_to_string(&summary).unwrap();
+        assert!(text.contains("# hot"), "{text}");
+        assert!(text.contains("95"), "the measurement is the point: {text}");
+        assert!(text.contains("crabmon --replay"), "{text}");
+        assert!(
+            fired.notes.iter().any(|n| n.contains(".md")),
+            "the summary was never announced: {:?}",
+            fired.notes
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -278,6 +433,23 @@ mod tests {
         sup.observe(&cpu(1.0));
         sup.observe(&cpu(95.0));
         assert!(sup.alerts.take_fired().is_empty(), "the queue was never drained");
+    }
+
+    /// A hook that has exited must not stay in the process table. `crabmon`
+    /// is left running for weeks, and a flapping rule used to leave one
+    /// defunct `sh` per crossing behind it.
+    #[test]
+    fn finished_hooks_are_reaped_rather_than_left_as_zombies() {
+        assert!(spawn_hooks(&["true".to_string()]).is_empty());
+        // The child needs a moment to exit; `try_wait` never blocks.
+        for _ in 0..200 {
+            reap_hooks();
+            if pending_hook_count() == 0 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the hook was never reaped");
     }
 
     #[test]

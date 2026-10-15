@@ -3,6 +3,164 @@
 Notable changes to crabmon. Versions follow [semantic versioning](https://semver.org),
 with the usual 0.x caveat that minor releases may change behaviour.
 
+## 0.10.0 — unreleased
+
+The measurements that were wrong, and the questions no threshold could ask.
+RSS double-counts shared pages, so a process tree could claim more memory than
+the machine has; a percentage cannot say whether a disk fills in twenty
+minutes or next week; a sum of per-process figures cannot see a container's
+limit at all. Plus the four defects the previous release's own design notes
+listed as open, and the one they turned up: process control acting on a local
+PID while the screen showed another machine's.
+
+### Added
+
+- **PSS: the honest per-process memory figure.** Every memory number was RSS,
+  which counts a page shared by eight Chromium processes eight times — so
+  adding up a process tree could exceed the memory the machine has. `[procs]
+  pss` reads `/proc/<pid>/smaps_rollup` for proportional and unique set size,
+  adds the PSS column and the `pss>` and `uss>` filters, and exports both. On
+  one real machine the summed figures differ by nearly half: 15.0 GiB of RSS
+  against 8.1 GiB of PSS, on a host with 10.3 GiB in use. Opt-in like `fds`,
+  and threads are skipped since they share their process's address space.
+- **A GROWTH column.** The per-process history crabmon already keeps for the
+  TREND column and the detail pane, surfaced and sortable, so a leak is found
+  by pressing a key rather than by writing a rule and waiting for it.
+- **`kind = "fillin"`: time to full, not percent full.** 95% of a 4 TB array
+  is days of warning and 95% of a 20 GB root is twenty minutes; the same
+  threshold fires far too late on one and far too early on the other. The
+  disks panel shows `full in 02:41:00` for any mount that will fill within a
+  week, so the figure is there before anybody writes a rule.
+- **Per-container accounting from the kernel, not from sums.** Each
+  container's and unit's own cgroup is read directly — `memory.current`,
+  `memory.max`, `cpu.stat`, `cpu.max` — so the grouped view carries a LIMIT
+  column, `crabmon_cgroup_*` series are exported, and `kind = "cgroup"` can
+  say "this container is at 98% of what it is allowed", which a sum of
+  per-process figures cannot express at all.
+- **`--format text`.** A `top -b -n1`-shaped table for a person to read, laid
+  out by the same column planner the interface uses. Getting numbers out of
+  crabmon previously meant JSON, CSV, or a full-screen interface.
+- **`Ctrl-R` reloads the config.** Thresholds, colours, panels, columns and
+  `[[alert]]` rules are re-read and applied; the filter, tags, pins,
+  selection, layout and sort are session state and are kept. A file that does
+  not parse changes nothing. Editing a config mid-incident is exactly when
+  restarting costs the most.
+- **`o` folds a subtree in the tree view**, marking the row with how many
+  rows it stands in for (`+40 chrome`). A browser with two hundred children
+  otherwise buries everything else, which is the opposite of what the tree
+  view is for.
+- **`--serve unix:/run/crabmon.sock`.** The companion to the bearer token: no
+  port, no network, filesystem permissions do the work. Created mode `0660`
+  rather than at the mercy of the umask; a stale socket is replaced, a live
+  one is never stolen.
+- **`kind = "trend"`: alerts on growth, not level.** Every other rule compares
+  a measurement against a line, which catches a machine that is already in
+  trouble and never catches the process whose RSS has gone up 200 MB every ten
+  minutes since Tuesday. `over_secs` is the window, `threshold` is in bytes,
+  and a `query` picks the processes whose RSS is watched — the worst grower
+  wins and is named in the message. A recycled PID starts a new series, a
+  series reports nothing until it spans half its window, and per-process
+  series are only kept when a rule asks for them.
+- **Kernel events: OOM kills, segfaults, oopses and block-IO errors.** Read
+  from `/dev/kmsg` into a panel, exported as `crabmon_kernel_events`, and
+  alertable with `kind = "kernel"`. The dashboard shows memory *now* and the
+  process the OOM killer chose is no longer in the table, so "what got killed,
+  and when" was the one question nothing on screen could answer. Opening the
+  device replays the ring, so a kill from twenty minutes ago is visible the
+  moment crabmon starts; where `dmesg_restrict` makes it root-only the panel
+  says so rather than showing an empty list.
+- **`--serve --remote web-1,web-2,db-1`: a fleet exporter.** crabmon could
+  watch several hosts over SSH and could export what it measured; the two
+  could not meet. Every series now carries `host="..."`, each host evaluates
+  the rules on its own engine, and flight dumps are named per host.
+- **`I`: IO priority.** Signals, renice and affinity were three of the four
+  knobs; CPU priority does nothing for a process saturating a disk, which is
+  the one anybody actually wants to turn down. Takes what `ionice(1)` takes.
+- **The detail pane carries OOM score, IO priority, cgroup path and
+  environment.** Values of variables that look like credentials are withheld:
+  a monitor is a thing people screenshot into tickets and project onto a wall
+  during an incident.
+- **An incident summary beside every flight dump.** `crabmon-<rule>-<unix>.md`:
+  what fired and by how much, the machine at that moment, what the kernel
+  said, the busiest processes, and what changed over the frames before it. A
+  JSONL recording is evidence nobody can read without crabmon in front of it.
+- **`[serve] token`, and `CRABMON_SERVE_TOKEN`.** A scrape carries the argv of
+  every process on the machine, and binding the exporter off loopback was one
+  flag away with no way to ask for a password. `/healthz` stays exempt and the
+  comparison is constant-time.
+- **`--record-rotate DIR`: a recording that never ends.** `--record` only
+  helps if you started it before the incident, and the flight recorder only
+  helps if an alert rule happened to describe what went wrong. This keeps the
+  last `[record] rotate_keep` segments of `rotate_frames` frames on disk at
+  all times, oldest deleted, so a replay of the last hour or two always
+  exists. Rotation only deletes files of its own naming.
+
+### Fixed
+
+- **Process control acted on a *local* PID while showing another machine's
+  processes.** Under `--remote` or `--replay` the rows on screen belong to
+  another host or another time, and nothing stopped `t`, `r` or `A` from
+  signalling, renicing or pinning whatever local process happened to hold that
+  number. All three now refuse outright. The detail pane's sockets, open files
+  and listening ports came from the local `/proc` for the same reason and now
+  say "not on this host"; the nice value comes from the snapshot's own row.
+- **An outage was charted as flat, real-looking measurement.**
+  `ThreadedSource` counted frames *delivered* rather than measurements taken,
+  and `RemoteSource` re-hands its last good frame whenever the far end stalls,
+  so a dead host drew a steady line and the `sampling…` notice never appeared.
+  A replay had the same shape from the other end: it held its final frame for
+  ever while reporting no frame id at all, feeding copies into the history
+  until the recorded incident scrolled out of the charts. Each source now says
+  honestly when it has measured something new.
+- **An explicit `[procs] columns` list blanked every process name on a narrow
+  terminal.** The automatic planner reserves room for COMMAND as it adds
+  columns; the configured path did not, so `name_width` reached zero and the
+  table rendered as numbers with nothing beside them. Configured columns are
+  now dropped from the right until COMMAND fits.
+- **A `--watch` typo exited 1, which is also what a match exits.** So
+  `crabmon --watch-rule 'psi:oi>20' || page-oncall` paged on a misspelling.
+  Failures now exit 2, and a rule that names a pressure resource or a kernel
+  event that does not exist is refused rather than measuring nothing for ever
+  and then reporting a clean run.
+
+- **A config file with one typo in it silently threw away every setting, then
+  overwrote itself with the defaults.** A parse error was swallowed by
+  `unwrap_or_default()`, so a stray bracket or a misspelled `kind` left
+  crabmon running with none of the file's thresholds, columns or — worst of
+  all — `[[alert]]` rules, with nothing on screen or on stderr to say so. The
+  TUI then wrote the defaults back over the file on exit, so the user's
+  settings were gone for good. The error is now reported on stderr and in the
+  status line, and a file that could not be parsed is never written back over.
+  Saving is also done through a temporary file and a rename, so a crash or a
+  full disk can no longer leave a truncated config behind.
+- **A parent cycle emptied the whole tree view.** Every process in a cycle has
+  its parent inside the table, so none of them was a root, and the depth-first
+  walk started from roots alone — the cycle and everything under it simply
+  vanished from `T`. Processes a cycle leaves unreachable are now re-seeded as
+  roots. The test that was meant to cover this asserted `len() <= 2`, which an
+  empty table passes.
+- **A panicking scrape cost the exporter a connection slot permanently.**
+  `--serve` released a connection by decrementing a counter at the end of the
+  handler thread, which a panic skips. Sixteen panics and the exporter
+  answered `503` to everything for the rest of its life while still accepting
+  connections. The slot is now released on drop, which also covers a thread
+  that could not be spawned at all.
+- **Alert hooks were left in the process table as zombies.** A hook is
+  deliberately not waited on, so every firing left a defunct `sh` behind for
+  the life of a process that is typically left running for weeks — unbounded
+  with a flapping rule, in the one program whose own process table is on
+  screen. Finished hooks are now reaped, without ever blocking on one.
+- **A recycled PID inherited the previous process's history.** The per-process
+  CPU, memory and IO series were keyed by PID alone, so a process that exited
+  between two samples left its trend column and its detail-pane charts
+  attached to whatever took its number. The series now belongs to a start
+  time as well, and resets when the PID changes hands.
+- **An unreachable `--remote` host was retried on every refresh.** A stream
+  that dropped was reopened on the next tick, and an unreachable host fails in
+  milliseconds, so a host that was down cost an `ssh` process and two reader
+  threads several times a second for as long as it stayed down. Reconnects now
+  back off from one second to thirty, resetting as soon as a frame arrives.
+
 ## 0.9.0 — unreleased
 
 Everything crabmon measures, reachable from outside the full-screen interface:
