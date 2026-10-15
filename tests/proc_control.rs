@@ -41,16 +41,27 @@ impl Drop for Sacrifice {
 
 #[test]
 fn renice_changes_the_process_priority_for_real() {
+    // A child inherits its *parent's* nice value, which is 0 only if whoever
+    // started the test harness was at 0. GitHub's macOS runners are not: the
+    // test process sits at -10, so asserting a bare 0 here failed on a
+    // perfectly healthy machine.
+    let base = get_priority(std::process::id()).expect("our own nice value");
     let child = Sacrifice::spawn();
-    assert_eq!(get_priority(child.pid()), Some(0), "a fresh child starts at nice 0");
+    assert_eq!(
+        get_priority(child.pid()),
+        Some(base),
+        "a fresh child inherits its parent's nice value"
+    );
 
     // Raising the nice value is always permitted; lowering it needs privileges,
-    // so the test only goes in the direction an unprivileged user can.
-    set_priority(child.pid(), 7).expect("setpriority failed");
-    assert_eq!(get_priority(child.pid()), Some(7));
-
-    set_priority(child.pid(), 12).expect("setpriority failed");
-    assert_eq!(get_priority(child.pid()), Some(12));
+    // so the test only goes in the direction an unprivileged user can. The
+    // kernel clamps at 19, so the expectation is clamped the same way rather
+    // than assuming there is room above `base`.
+    for step in [7, 12] {
+        let want = (base + step).min(19);
+        set_priority(child.pid(), want).expect("setpriority failed");
+        assert_eq!(get_priority(child.pid()), Some(want), "nice {want} did not take");
+    }
 }
 
 #[test]

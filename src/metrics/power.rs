@@ -340,11 +340,19 @@ mod tests {
 
     /// Write one RAPL domain the way sysfs lays it out: a `name` file saying
     /// what the domain actually is, beside the counter.
+    /// RAPL fixtures, Linux-only: the directory names are the kernel's own
+    /// (`intel-rapl:0`, `intel-rapl:0:1`), and `:` is not a character a
+    /// Windows filename may contain — `create_dir_all` fails there with
+    /// "the directory name is invalid". Reproducing the real sysfs layout is
+    /// the whole point of these fixtures, so they run where that layout can
+    /// exist rather than being renamed into something the kernel never emits.
+    #[cfg(target_os = "linux")]
     fn rapl_domain(root: &Path, dir: &str, name: &str, uj: &str) {
         write(root.join(dir).join("name"), &format!("{name}\n"));
         write(root.join(dir).join("energy_uj"), &format!("{uj}\n"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn rapl_sums_packages_but_not_their_subdomains() {
         let root = tmpdir("rapl");
@@ -359,6 +367,7 @@ mod tests {
     /// The layout on the development machine: `intel-rapl:1` is `psys`, not a
     /// second socket. psys meters the whole platform and already includes
     /// package-0, so adding it reported roughly twice the real package draw.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_platform_domain_is_not_counted_as_another_package() {
         let root = tmpdir("rapl-psys");
@@ -375,6 +384,7 @@ mod tests {
         fs::remove_dir_all(&only).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn unreadable_rapl_counters_yield_none_rather_than_zero_watts() {
         // The real case on this machine: energy_uj is mode 0400, root-owned.
