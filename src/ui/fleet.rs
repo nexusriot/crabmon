@@ -1,11 +1,11 @@
 //! The fleet table: one row per host, so the machine in trouble is visible
 //! before anyone has picked it.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Cell, Row, Table, TableState};
-use ratatui::Frame;
 
 use crate::app::App;
 use crate::fleet::FleetHost;
@@ -71,7 +71,7 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
         Constraint::Length(6),
         Constraint::Min(10),
     ];
-    let table = Table::new(rows, widths).header(header).highlight_style(app.theme.selection());
+    let table = Table::new(rows, widths).header(header).row_highlight_style(app.theme.selection());
     let mut state = TableState::default();
     state.select(Some(app.fleet_selected.saturating_sub(start)));
     f.render_stateful_widget(table, inner, &mut state);

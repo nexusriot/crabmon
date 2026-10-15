@@ -106,11 +106,17 @@ mod tests {
 
     #[test]
     fn every_action_kind_formats() {
-        assert!(format_entry(0, &Action::Renice { nice: -5 }, 1, "x", Ok(())).contains("renice -5"));
-        assert!(format_entry(0, &Action::Affinity { cpus: "0-3".into() }, 1, "x", Ok(()))
-            .contains("affinity 0-3"));
-        assert!(format_entry(0, &Action::IoPriority { value: "idle".into() }, 1, "x", Ok(()))
-            .contains("ionice idle"));
+        assert!(
+            format_entry(0, &Action::Renice { nice: -5 }, 1, "x", Ok(())).contains("renice -5")
+        );
+        assert!(
+            format_entry(0, &Action::Affinity { cpus: "0-3".into() }, 1, "x", Ok(()))
+                .contains("affinity 0-3")
+        );
+        assert!(
+            format_entry(0, &Action::IoPriority { value: "idle".into() }, 1, "x", Ok(()))
+                .contains("ionice idle")
+        );
     }
 
     #[test]

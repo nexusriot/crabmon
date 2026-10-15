@@ -7,7 +7,10 @@
 use std::process::{Child, Command};
 use std::time::Duration;
 
-use crabmon::metrics::sysinfo_source::{get_priority, set_affinity, set_priority};
+use crabmon::metrics::sysinfo_source::{get_priority, set_priority};
+// Affinity is Linux-only, and so is the one test that sets it.
+#[cfg(target_os = "linux")]
+use crabmon::metrics::sysinfo_source::set_affinity;
 
 struct Sacrifice(Child);
 

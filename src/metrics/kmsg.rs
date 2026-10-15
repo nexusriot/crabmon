@@ -217,6 +217,11 @@ pub struct KmsgReader {
 
 /// Records read in one drain. Opening the device replays the whole ring, and
 /// a sample is not the place to spend an unbounded number of syscalls.
+///
+/// Linux-only, like the reading it bounds: on a platform with no `/dev/kmsg`
+/// an ungated constant is dead code, and CI builds every target with
+/// `-D warnings`.
+#[cfg(target_os = "linux")]
 const MAX_RECORDS_PER_DRAIN: usize = 8192;
 
 impl Default for KmsgReader {

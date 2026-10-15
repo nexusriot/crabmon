@@ -94,11 +94,7 @@ pub fn time_remaining(energy_wh: f64, power_w: f64) -> Option<u64> {
     }
     let hours = energy_wh / power_w;
     // A week of runtime means the rate is noise, not a real estimate.
-    if !hours.is_finite() || hours > 168.0 {
-        None
-    } else {
-        Some((hours * 3600.0) as u64)
-    }
+    if !hours.is_finite() || hours > 168.0 { None } else { Some((hours * 3600.0) as u64) }
 }
 
 fn read_battery(dir: &Path) -> Option<Battery> {

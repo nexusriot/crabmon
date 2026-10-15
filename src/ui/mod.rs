@@ -17,10 +17,10 @@ pub mod procs;
 pub mod psi;
 pub mod sensors;
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout as RLayout, Rect};
 use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders};
-use ratatui::Frame;
 use serde::{Deserialize, Serialize};
 
 use crate::app::{App, Mode};
@@ -98,7 +98,7 @@ fn rows(area: Rect, constraints: Vec<Constraint>) -> Vec<Rect> {
 }
 
 pub fn draw(f: &mut Frame<'_>, app: &mut App) {
-    let size = f.size();
+    let size = f.area();
     if size.width < 20 || size.height < 6 {
         // Too small for any panel; say so rather than panicking on a layout.
         f.render_widget(ratatui::widgets::Paragraph::new("terminal too small"), size);

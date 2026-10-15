@@ -1,10 +1,10 @@
 //! The host banner and the status line.
 
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::app::{App, Mode};
 use crate::format::{human_bytes, human_duration};
@@ -12,11 +12,7 @@ use crate::ui::block;
 
 /// Load average is only alarming relative to the core count.
 pub fn load_ratio(load1: f64, cores: usize) -> f64 {
-    if cores == 0 {
-        0.0
-    } else {
-        load1 / cores as f64
-    }
+    if cores == 0 { 0.0 } else { load1 / cores as f64 }
 }
 
 pub fn draw(f: &mut Frame<'_>, area: Rect, app: &App) {
@@ -132,11 +128,7 @@ pub fn draw_status(f: &mut Frame<'_>, area: Rect, app: &App) {
 /// Appended while the source is still working on a sample, so a dashboard that
 /// has stopped changing explains itself rather than looking broken.
 fn sampling_note(app: &App) -> &'static str {
-    if app.is_stale() {
-        " · sampling…"
-    } else {
-        ""
-    }
+    if app.is_stale() { " · sampling…" } else { "" }
 }
 
 /// Memory summary reused by the header of the memory panel.

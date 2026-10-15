@@ -1,10 +1,10 @@
 //! Per-mount usage gauges with live read/write throughput.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::Span;
 use ratatui::widgets::{Gauge, Paragraph};
-use ratatui::Frame;
 
 use crate::app::App;
 use crate::format::{human_bps, human_bytes, human_duration, truncate_fit};

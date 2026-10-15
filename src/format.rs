@@ -14,21 +14,13 @@ fn scale(mut v: f64, table: &'static [&'static str; 7]) -> (f64, &'static str) {
 
 pub fn human_bytes(x: u64) -> String {
     let (v, u) = scale(x as f64, &BYTE_UNITS);
-    if u == "B" {
-        format!("{v:.0} {u}")
-    } else {
-        format!("{v:.1} {u}")
-    }
+    if u == "B" { format!("{v:.0} {u}") } else { format!("{v:.1} {u}") }
 }
 
 pub fn human_bps(bps: f64) -> String {
     let bps = if bps.is_finite() { bps.max(0.0) } else { 0.0 };
     let (v, u) = scale(bps, &RATE_UNITS);
-    if u == "B/s" {
-        format!("{v:.0} {u}")
-    } else {
-        format!("{v:.1} {u}")
-    }
+    if u == "B/s" { format!("{v:.0} {u}") } else { format!("{v:.1} {u}") }
 }
 
 /// Compact byte count for narrow table columns: `1.2G`, `430M`, `12K`.
@@ -40,11 +32,7 @@ pub fn compact_bytes(x: u64) -> String {
         v /= 1024.0;
         u += 1;
     }
-    if u == 0 || v >= 100.0 {
-        format!("{v:.0}{}", SUF[u])
-    } else {
-        format!("{v:.1}{}", SUF[u])
-    }
+    if u == 0 || v >= 100.0 { format!("{v:.0}{}", SUF[u]) } else { format!("{v:.1}{}", SUF[u]) }
 }
 
 /// `3d 04:12:33`, `04:12:33`, `12:33`.
@@ -63,11 +51,7 @@ pub fn human_duration(secs: u64) -> String {
 }
 
 pub fn human_hz_mhz(mhz: u64) -> String {
-    if mhz >= 1000 {
-        format!("{:.2} GHz", mhz as f64 / 1000.0)
-    } else {
-        format!("{mhz} MHz")
-    }
+    if mhz >= 1000 { format!("{:.2} GHz", mhz as f64 / 1000.0) } else { format!("{mhz} MHz") }
 }
 
 /// Truncate to `max` *characters*, appending `…` when cut.

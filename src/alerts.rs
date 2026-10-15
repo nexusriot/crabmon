@@ -695,7 +695,7 @@ fn measure(
                 .filter(|s| rule.target.is_empty() || s.label.starts_with(&rule.target))
                 .map(|s| s.temp as f64)
                 .fold(None, |acc: Option<f64>, t| Some(acc.map_or(t, |a| a.max(t))))
-                .map(|t| (t, "°C"))
+                .map(|t| (t, "°C"));
         }
         AlertKind::Gpu => {
             return snap
@@ -704,7 +704,7 @@ fn measure(
                 .filter(|g| rule.target.is_empty() || g.name.contains(&rule.target))
                 .filter_map(|g| g.busy_percent)
                 .fold(None, |acc: Option<f64>, b| Some(acc.map_or(b as f64, |a| a.max(b as f64))))
-                .map(|b| (b, "%"))
+                .map(|b| (b, "%"));
         }
         AlertKind::Psi => return psi_value(&rule.target, snap).map(|v| (v, "%")),
         // A slope, in bytes, over the rule's own window. `None` until the
@@ -776,7 +776,7 @@ fn measure(
                     .filter_map(|d| d.util)
                     .fold(None, |acc: Option<f64>, u| Some(acc.map_or(u, |a| a.max(u)))),
             }
-            .map(|u| (u * 100.0, "%"))
+            .map(|u| (u * 100.0, "%"));
         }
         AlertKind::Net => {
             // An untargeted rule uses the same aggregate the chart draws, so a
@@ -798,7 +798,7 @@ fn measure(
                 .filter(|p| rule.target.is_empty() || p.name.contains(&rule.target))
                 .filter_map(|p| p.fd_ratio())
                 .fold(None, |acc: Option<f64>, r| Some(acc.map_or(r, |a| a.max(r))))
-                .map(|r| (r * 100.0, "%"))
+                .map(|r| (r * 100.0, "%"));
         }
         AlertKind::Proc => {
             // A query that did not parse leaves the rule inert. Counting zero
@@ -807,11 +807,7 @@ fn measure(
             return Some((snap.procs.iter().filter(|p| q.matches(p)).count() as f64, ""));
         }
     };
-    if v.is_nan() {
-        None
-    } else {
-        Some((v, "%"))
-    }
+    if v.is_nan() { None } else { Some((v, "%")) }
 }
 
 /// The PSI figure a rule's `target` names: `cpu`, `mem`/`memory` or `io`,
@@ -879,11 +875,7 @@ fn psi_value(target: &str, snap: &Snapshot) -> Option<f64> {
     // `full` is absent for CPU on most kernels — a single runnable task is
     // never "full" — so the rule reports nothing rather than falling back to
     // `some`, which measures something else entirely.
-    if full {
-        pressure.full.map(|l| l.avg10)
-    } else {
-        Some(pressure.some.avg10)
-    }
+    if full { pressure.full.map(|l| l.avg10) } else { Some(pressure.some.avg10) }
 }
 
 /// Default rules written into a fresh config file.

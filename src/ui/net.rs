@@ -1,12 +1,12 @@
 //! Network panels. The compact form lists interfaces with live rates; the
 //! detail form adds RX/TX history charts.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::symbols;
 use ratatui::text::Span;
 use ratatui::widgets::{Axis, Cell, Chart, Dataset, GraphType, Row, Table};
-use ratatui::Frame;
 
 use crate::app::App;
 use crate::format::{human_bps, human_bytes};

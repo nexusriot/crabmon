@@ -380,11 +380,13 @@ nvd0         0.0     1.2      0.0     64.0   0.0   0.3   0.0   0.3    0   0
     #[test]
     fn iostat_output_without_a_header_yields_nothing() {
         // Rather than misreading whatever columns happen to be there.
-        assert!(parse_iostat(
-            "ada0 1 2 3 4
+        assert!(
+            parse_iostat(
+                "ada0 1 2 3 4
 "
-        )
-        .is_empty());
+            )
+            .is_empty()
+        );
         assert!(parse_iostat("").is_empty());
     }
 

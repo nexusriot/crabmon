@@ -12,9 +12,9 @@ use super::diskstats::{self, DeviceRates, DiskCounters, DiskStats};
 use super::fds::LimitCache;
 use super::procgroup::CgroupPaths;
 use super::{
-    cgroup, fds, gpu, identity, kmsg, meminfo, netclass, netns, power, procgroup, psi, rate, smaps,
     CpuSample, DiskRow, GpuInfo, HostInfo, MemSample, MetricSource, NetIface, ProcRow, Sensor,
-    Snapshot,
+    Snapshot, cgroup, fds, gpu, identity, kmsg, meminfo, netclass, netns, power, procgroup, psi,
+    rate, smaps,
 };
 
 /// Device lists (mounted filesystems, interfaces, sensors) are rescanned on this
@@ -84,10 +84,16 @@ pub struct SysinfoSource {
 fn process_refresh_kind() -> ProcessRefreshKind {
     // `OnlyIfNotSet` keeps the per-tick cost near the old cpu+memory-only refresh
     // while still populating the columns the detail pane needs for new processes.
-    ProcessRefreshKind::new()
+    ProcessRefreshKind::nothing()
         .with_cpu()
         .with_memory()
         .with_disk_usage()
+        // Refreshing the task list became opt-in in sysinfo 0.33; without it
+        // `Process::tasks()` goes stale, which is not just a wrong THR
+        // column — `threads_are_distinguishable` decides from it whether
+        // this platform can tell a thread from a process at all, and so
+        // whether `H` has anything to hide.
+        .with_tasks()
         .with_user(UpdateKind::OnlyIfNotSet)
         .with_cmd(UpdateKind::OnlyIfNotSet)
         .with_exe(UpdateKind::OnlyIfNotSet)
@@ -95,10 +101,26 @@ fn process_refresh_kind() -> ProcessRefreshKind {
 }
 
 fn refresh_kind() -> RefreshKind {
-    RefreshKind::new()
-        .with_cpu(CpuRefreshKind::new().with_cpu_usage().with_frequency())
-        .with_memory(MemoryRefreshKind::new().with_ram().with_swap())
+    RefreshKind::nothing()
+        .with_cpu(CpuRefreshKind::nothing().with_cpu_usage().with_frequency())
+        .with_memory(MemoryRefreshKind::nothing().with_ram().with_swap())
         .with_processes(process_refresh_kind())
+}
+
+/// The numeric user id, where the platform has one.
+///
+/// Unix identifies a user by a number; Windows identifies one by a SID, which
+/// is not a number and does not fit the column. `None` there is the honest
+/// answer — the user *name* is reported on both — rather than a fabricated 0,
+/// which on Unix would read as root.
+#[cfg(unix)]
+fn uid_of(p: &sysinfo::Process) -> Option<u32> {
+    p.user_id().map(|u| **u)
+}
+
+#[cfg(not(unix))]
+fn uid_of(_p: &sysinfo::Process) -> Option<u32> {
+    None
 }
 
 pub fn status_char(status: ProcessStatus) -> char {
@@ -163,10 +185,10 @@ impl SysinfoSource {
             hostname: System::host_name().unwrap_or_else(|| "unknown".into()),
             os: System::long_os_version().unwrap_or_else(|| System::name().unwrap_or_default()),
             kernel: System::kernel_version().unwrap_or_default(),
-            arch: System::cpu_arch().unwrap_or_default(),
+            arch: System::cpu_arch(),
             cpu_brand: sys.cpus().first().map(|c| c.brand().trim().to_string()).unwrap_or_default(),
             logical_cores: sys.cpus().len(),
-            physical_cores: sys.physical_core_count(),
+            physical_cores: System::physical_core_count(),
             uptime_secs: System::uptime(),
             boot_time_unix: System::boot_time(),
             load: [0.0; 3],
@@ -223,10 +245,10 @@ impl SysinfoSource {
         }
         self.last_relist = Instant::now();
         // Picks up hot-plugged disks, new veth/tun interfaces and new sensors.
-        self.networks.refresh_list();
-        self.disks.refresh_list();
-        self.components.refresh_list();
-        self.users.refresh_list();
+        self.networks.refresh(true);
+        self.disks.refresh(true);
+        self.components.refresh(true);
+        self.users.refresh();
         self.dev_key_cache.clear();
         // Picks up nice values changed by anything other than crabmon.
         self.nice_cache.clear();
@@ -305,8 +327,8 @@ impl SysinfoSource {
                 pid_u,
                 start_time,
                 identity::Identity {
-                    name: p.name().to_string(),
-                    cmd: p.cmd().join(" "),
+                    name: p.name().to_string_lossy().to_string(),
+                    cmd: p.cmd().iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" "),
                     exe: p.exe().map(|e| e.to_string_lossy().to_string()).unwrap_or_default(),
                     cwd: p.cwd().map(|c| c.to_string_lossy().to_string()).unwrap_or_default(),
                 },
@@ -322,11 +344,17 @@ impl SysinfoSource {
                 uss: rollup.map(|r| r.uss),
                 virt: p.virtual_memory(),
                 state: status_char(p.status()),
-                uid: p.user_id().map(|u| **u),
+                uid: uid_of(p),
                 user,
                 run_time: p.run_time(),
                 start_time_unix: p.start_time(),
-                threads: p.tasks().map(|t| t.len()),
+                // `+ 1` for the main thread: sysinfo's `tasks()` is the set
+                // of *sub*tasks, so a single-threaded process reports an
+                // empty set and every other one is short by itself. Without
+                // this the column reads 0 for a live process, which is not a
+                // number any process can have. (sysinfo 0.30 included the
+                // main task; 0.33 onwards does not.)
+                threads: p.tasks().map(|t| t.len() + 1),
                 read_bps,
                 write_bps,
                 nice: nice_of(&mut self.nice_cache, pid_u, start_time),
@@ -514,10 +542,14 @@ impl SysinfoSource {
         let mut out: Vec<Sensor> = self
             .components
             .iter()
-            .map(|c| Sensor {
-                label: c.label().to_string(),
-                temp: c.temperature(),
-                critical: c.critical().filter(|c| *c > 0.0),
+            .filter_map(|c| {
+                Some(Sensor {
+                    label: c.label().to_string(),
+                    // `None` is a sensor that could not be read, which is not
+                    // a sensor reading zero.
+                    temp: c.temperature()?,
+                    critical: c.critical().filter(|c| *c > 0.0),
+                })
             })
             .filter(|s| s.temp.is_finite() && s.temp > 0.0)
             .collect();
@@ -537,9 +569,9 @@ impl MetricSource for SysinfoSource {
         self.kmsg.drain();
 
         self.sys.refresh_specifics(refresh_kind());
-        self.networks.refresh();
-        self.disks.refresh();
-        self.components.refresh();
+        self.networks.refresh(false);
+        self.disks.refresh(false);
+        self.components.refresh(false);
 
         let load = System::load_average();
         let mut host = self.host.clone();
@@ -726,6 +758,41 @@ pub fn parse_cpu_list(s: &str, max_cpu: usize) -> Result<Vec<usize>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The thread count has to be the number of threads the process has.
+    ///
+    /// sysinfo's `tasks()` is the set of *sub*tasks and excludes the main
+    /// thread — 0.30 included it, 0.33 onwards does not — so the adapter
+    /// adds one. A silent off-by-one here reads as 0 threads for a live
+    /// process, and it is the sort of thing that only an upstream bump
+    /// introduces and only a live check catches.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_thread_count_matches_what_proc_says() {
+        use crate::metrics::MetricSource;
+
+        let mut source = SysinfoSource::new(Vec::new(), false);
+        let snap = source.snapshot(Duration::from_millis(1));
+
+        let mut checked = 0;
+        for row in &snap.procs {
+            // `None` is a thread, which has no thread count of its own.
+            let Some(reported) = row.threads else { continue };
+            let Ok(dir) = std::fs::read_dir(format!("/proc/{}/task", row.pid)) else {
+                continue; // exited between the sample and now
+            };
+            let actual = dir.count();
+            // Only processes that did not change shape in between.
+            if actual == 0 {
+                continue;
+            }
+            assert!(reported > 0, "{} (pid {}) reports no threads at all", row.name, row.pid);
+            if reported == actual {
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no process could be cross-checked against /proc");
+    }
 
     #[test]
     fn cpu_lists_accept_ranges_and_singletons() {

@@ -913,10 +913,10 @@ fn handle<S: Conn>(mut stream: S, token: Option<&str>, body: impl FnOnce() -> St
             if header.trim().is_empty() {
                 break;
             }
-            if let Some((name, value)) = header.split_once(':') {
-                if name.trim().eq_ignore_ascii_case("authorization") {
-                    auth = Some(value.trim().to_string());
-                }
+            if let Some((name, value)) = header.split_once(':')
+                && name.trim().eq_ignore_ascii_case("authorization")
+            {
+                auth = Some(value.trim().to_string());
             }
         }
     }
@@ -1482,10 +1482,12 @@ mod tests {
     #[test]
     fn kernel_events_are_exported_but_not_invented() {
         let mut snap = snap();
-        snap.kernel = vec![crate::metrics::kmsg::parse_record(
-            "4,1,1000000,-;Out of memory: Killed process 1 (init)",
-        )
-        .unwrap()];
+        snap.kernel = vec![
+            crate::metrics::kmsg::parse_record(
+                "4,1,1000000,-;Out of memory: Killed process 1 (init)",
+            )
+            .unwrap(),
+        ];
         let out = render(&snap, 10);
         assert!(out.contains("crabmon_kernel_events{kind=\"oom\"} 1"), "{out}");
         assert!(out.contains("crabmon_kernel_events{kind=\"segfault\"} 0"), "{out}");

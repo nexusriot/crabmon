@@ -280,10 +280,12 @@ mod tests {
     fn the_kernels_own_account_is_included_when_there_is_one() {
         let mut s = snap(10.0, 1 << 30, vec![]);
         s.host.uptime_secs = 2000;
-        s.kernel = vec![crate::metrics::kmsg::parse_record(
-            "4,1,1000000000,-;Out of memory: Killed process 991 (postgres)",
-        )
-        .unwrap()];
+        s.kernel = vec![
+            crate::metrics::kmsg::parse_record(
+                "4,1,1000000000,-;Out of memory: Killed process 991 (postgres)",
+            )
+            .unwrap(),
+        ];
         let out = summary(&alert(), &s, &s, "d.jsonl");
         assert!(out.contains("What the kernel said"), "{out}");
         assert!(out.contains("postgres (991)"), "{out}");

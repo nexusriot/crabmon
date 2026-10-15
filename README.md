@@ -155,7 +155,8 @@ make bin
 ./bin/crabmon
 ```
 
-Requires a recent stable Rust toolchain (edition 2021). `make` on its own lists
+Requires Rust 1.95 or newer (edition 2024; the floor is `sysinfo`'s, not the
+edition's). `make` on its own lists
 every target. To put the binary, the man page and the shell completions on the
 system:
 

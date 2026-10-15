@@ -171,11 +171,7 @@ impl Theme {
     }
 
     pub fn series_at(&self, i: usize) -> Color {
-        if self.series.is_empty() {
-            Color::Reset
-        } else {
-            self.series[i % self.series.len()]
-        }
+        if self.series.is_empty() { Color::Reset } else { self.series[i % self.series.len()] }
     }
 
     /// Green → yellow → red as a 0..1 ratio climbs past `warn`/`crit`.

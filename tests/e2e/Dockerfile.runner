@@ -16,8 +16,8 @@
 # machine. That is the usual arrangement for a build agent, and it is why this
 # is opt-in rather than what `make e2e` does when cargo is right there.
 
-# rust:1.90-slim-bookworm
-FROM rust@sha256:64232e656c058f4468e8d024e990acff04f0fd5a5c0a88a574dc37773d7325c9
+# rust:1.95-slim-bookworm
+FROM rust@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082
 
 # docker:27-cli — just the client; the daemon is the host's.
 COPY --from=docker@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c \

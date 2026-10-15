@@ -1,10 +1,10 @@
 //! Memory, swap and cgroup gauges.
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::Span;
 use ratatui::widgets::{Gauge, Paragraph};
-use ratatui::Frame;
 
 use crate::app::App;
 use crate::format::human_bytes;

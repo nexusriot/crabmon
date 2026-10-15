@@ -1,11 +1,11 @@
 //! Temperature sensors, grouped by driver so 22 `coretemp Core N` rows do not
 //! push the NVMe and chassis sensors off the panel.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Cell, Paragraph, Row, Table};
-use ratatui::Frame;
 
 use crate::app::App;
 use crate::format::truncate_fit;

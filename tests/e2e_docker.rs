@@ -641,14 +641,25 @@ fn alerts_fire_their_hooks_and_write_recordings_with_no_terminal() {
     // A rule that is true of any running machine, so the test does not have
     // to manufacture an incident, with a hook that leaves a file behind.
     //
+    // The loop waits for the evidence rather than sleeping a fixed three
+    // seconds: a hook is spawned and not waited on, so on a loaded machine
+    // the `kill` could arrive before `sh` had run `touch` — which failed as
+    // "the alert hook never ran" when the hook was simply not finished yet.
+    //
     // `printf` rather than a heredoc: the script is one line by the time it
     // reaches `sh`, and a heredoc terminator has to start a line of its own.
     let out = sh(&format!(
         "{}; mkdir -p /work/dumps; \
          crabmon --stream --alerts --config /work/c.toml > /dev/null 2>/work/err & \
-         s=$!; sleep 3; kill $s; \
+         s=$!; \
+         for _ in $(seq 1 60); do \
+           [ -f /work/hook-ran ] && [ -n \"$(ls /work/dumps 2>/dev/null)\" ] && break; \
+           sleep 0.25; \
+         done; \
+         kill $s; \
          echo \"hook=$([ -f /work/hook-ran ] && echo yes || echo no)\"; \
-         echo \"dumps=$(ls /work/dumps | wc -l)\"; \
+         echo \"recordings=$(ls /work/dumps/*.jsonl 2>/dev/null | wc -l)\"; \
+         echo \"summaries=$(ls /work/dumps/*.md 2>/dev/null | wc -l)\"; \
          cat /work/err",
         write_config(&[
             "refresh_ms = 300",
@@ -667,7 +678,10 @@ fn alerts_fire_their_hooks_and_write_recordings_with_no_terminal() {
     let text = ok(&out, "--stream --alerts");
 
     assert!(text.contains("hook=yes"), "the alert hook never ran:\n{text}");
-    assert!(text.contains("dumps=1"), "no flight recording was written:\n{text}");
+    assert!(text.contains("recordings=1"), "no flight recording was written:\n{text}");
+    // Every dump comes with the human-readable summary beside it; a JSONL
+    // recording on its own is evidence nobody can read without crabmon.
+    assert!(text.contains("summaries=1"), "the dump came without its summary:\n{text}");
     // The notices go to stderr so `--stream`'s stdout stays one frame a line.
     assert!(text.contains("always"), "the firing rule was never announced:\n{text}");
 }

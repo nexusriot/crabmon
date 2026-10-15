@@ -4,10 +4,10 @@
 
 mod common;
 
-use ratatui::backend::TestBackend;
 use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 
-use common::{app, snapshot, FakeSource};
+use common::{FakeSource, app, snapshot};
 use crabmon::app::Mode;
 use crabmon::ui::Layout;
 
@@ -19,7 +19,10 @@ fn render(app: &mut crabmon::App, w: u16, h: u16) -> Vec<String> {
     (0..buf.area.height)
         .map(|y| {
             (0..buf.area.width)
-                .map(|x| buf.get(x, y).symbol().to_string())
+                // `cell` rather than the deprecated `get`: it returns an
+                // Option instead of panicking, and a blank is the honest
+                // reading of a cell the backend never wrote.
+                .map(|x| buf.cell((x, y)).map_or(" ".to_string(), |c| c.symbol().to_string()))
                 .collect::<String>()
                 .trim_end()
                 .to_string()
@@ -714,10 +717,12 @@ fn the_detail_pane_lists_the_files_the_process_has_open() {
 fn the_kernel_panel_names_what_was_killed_and_when() {
     let mut app = common::app();
     app.snap.host.uptime_secs = 2_000;
-    app.snap.kernel = vec![crabmon::metrics::kmsg::parse_record(
-        "4,1,1234567890,-;Out of memory: Killed process 4242 (postgres)",
-    )
-    .unwrap()];
+    app.snap.kernel = vec![
+        crabmon::metrics::kmsg::parse_record(
+            "4,1,1234567890,-;Out of memory: Killed process 4242 (postgres)",
+        )
+        .unwrap(),
+    ];
 
     let screen = screen(&mut app, 120, 50);
     assert!(screen.contains("Kernel"), "{screen}");

@@ -130,15 +130,16 @@ impl ExecCache {
             self.seen.remove(&pid);
             return was;
         }
-        if let Some(e) = self.seen.get(&pid) {
-            if e.start_time == start_time && e.comm == comm {
-                return Identity {
-                    name: e.comm.clone(),
-                    cmd: e.cmd.clone(),
-                    exe: e.exe.clone(),
-                    cwd: e.cwd.clone(),
-                };
-            }
+        if let Some(e) = self.seen.get(&pid)
+            && e.start_time == start_time
+            && e.comm == comm
+        {
+            return Identity {
+                name: e.comm.clone(),
+                cmd: e.cmd.clone(),
+                exe: e.exe.clone(),
+                cwd: e.cwd.clone(),
+            };
         }
         let fresh = Identity {
             cmd: cmdline(pid).unwrap_or(was.cmd),
@@ -173,11 +174,13 @@ impl ExecCache {
     }
 }
 
-#[cfg(test)]
+// Every test here reads `/proc`, so the whole module is Linux-only. Gating
+// each test individually left `use super::*` unused everywhere else, and CI
+// builds every target with `-D warnings`.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn this_process_can_read_its_own_identity() {
         let me = std::process::id();
@@ -196,7 +199,6 @@ mod tests {
         assert!(cwd(me).is_some());
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn a_process_that_is_not_there_reports_nothing_rather_than_an_empty_name() {
         // An empty string would be a name, and would overwrite a real one.
@@ -209,7 +211,6 @@ mod tests {
 
     /// A kernel thread has an empty `cmdline`. Reading that as "the command
     /// line is now blank" would wipe the one the sampler had.
-    #[cfg(target_os = "linux")]
     #[test]
     fn an_empty_command_line_is_absent_rather_than_blank() {
         // pid 2 is kthreadd on Linux; skip where it is not readable as one.
@@ -221,7 +222,6 @@ mod tests {
     /// A process whose name the sampler already has right costs one read and
     /// nothing else — which is what makes checking every process every tick
     /// affordable in the first place.
-    #[cfg(target_os = "linux")]
     #[test]
     fn a_process_that_has_not_changed_is_left_exactly_as_the_sampler_had_it() {
         let me = std::process::id();
@@ -247,7 +247,6 @@ mod tests {
     /// The sampler's name never catches up, so the disagreement is permanent.
     /// Re-reading three files per tick for the rest of the process's life is
     /// what the cache exists to avoid.
-    #[cfg(target_os = "linux")]
     #[test]
     fn a_changed_process_is_re_read_once_and_then_remembered() {
         let me = std::process::id();
@@ -273,7 +272,6 @@ mod tests {
 
     /// PIDs are recycled. A cached identity surviving onto an unrelated
     /// process would describe a program that is not running.
-    #[cfg(target_os = "linux")]
     #[test]
     fn a_recycled_pid_does_not_inherit_the_previous_process_identity() {
         let me = std::process::id();

@@ -13,6 +13,37 @@ limit at all. Plus the four defects the previous release's own design notes
 listed as open, and the one they turned up: process control acting on a local
 PID while the screen showed another machine's.
 
+### Changed
+
+- **Rust edition 2024, and the dependencies brought up to date.** `sysinfo`
+  0.30 → 0.39, `ratatui` 0.26 → 0.30, `crossterm` 0.27 → 0.29, `toml` 0.8 →
+  1.1, `dirs` 5 → 7, `nix` 0.29 → 0.31, `signal-hook` 0.3 → 0.4. `rust-version
+  = "1.85"` is now declared, so an older toolchain is refused with a sentence
+  rather than a parse error. Every `if let` that existed only to be nested
+  inside another is now a let-chain.
+- **The cfg gates actually hold on every target CI builds.** `-D warnings`
+  makes a platform-specific constant that nothing uses on that platform a
+  build failure, and three had crept in: `MAX_RECORDS_PER_DRAIN` and the
+  `identity` test module (Linux-only), `SHUTDOWN_GRACE` (Unix-only). The
+  numeric `uid` is now `None` on Windows, where a user is a SID rather than a
+  number, instead of failing to compile. `libc` is pinned to 0.2.189 for the
+  transitive copy: 0.2.190 dropped FreeBSD's `NOTE_PCTRLMASK`, which the only
+  `mio` that `signal-hook-mio 0.2` permits still uses.
+- **`libc` moved to `=1.0.0-alpha.5`.** A pre-release, pinned exactly so a
+  routine `cargo update` cannot swap the definitions under this crate's
+  `unsafe` syscalls; `nix`, `mio`, `dirs-sys` and `signal-hook` still want
+  0.2, so both libc crates are in the tree. Every call through it was checked
+  against a live host rather than against the test suite: `ioprio_get` and
+  `ioprio_set` round-trip, `getpriority` agrees with `/proc/<pid>/stat` for
+  2569 processes including negative nice values (the case that needs
+  `__errno_location`), `statvfs` returns inode counts, and `/dev/kmsg` opens
+  non-blocking.
+- **The thread count was short by one on the new sysinfo.** `tasks()` is the
+  set of *sub*tasks and no longer includes the main thread, so THR read 0 for
+  a single-threaded process — a number no live process can have — and one
+  short for every other. Found by cross-checking a live sample against
+  `/proc/<pid>/task`, which is now a test.
+
 ### Added
 
 - **PSS: the honest per-process memory figure.** Every memory number was RSS,

@@ -1,10 +1,10 @@
 //! Battery, mains and package power.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Cell, Paragraph, Row, Table};
-use ratatui::Frame;
 
 use crate::app::App;
 use crate::format::human_duration;

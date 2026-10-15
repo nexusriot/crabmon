@@ -25,10 +25,10 @@ pub struct Recorder {
 
 impl Recorder {
     pub fn create(path: &Path) -> std::io::Result<Recorder> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         let file = OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
         Ok(Recorder {
@@ -404,10 +404,10 @@ impl Frames {
         match self {
             Frames::Memory(f) => f.get(index).cloned(),
             Frames::Indexed { file, lines, cached } => {
-                if let Some((at, snap)) = cached.borrow().as_ref() {
-                    if *at == index {
-                        return Some(snap.clone());
-                    }
+                if let Some((at, snap)) = cached.borrow().as_ref()
+                    && *at == index
+                {
+                    return Some(snap.clone());
                 }
                 let (offset, len) = *lines.get(index)?;
                 let mut reader = file.borrow_mut();

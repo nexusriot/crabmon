@@ -1,7 +1,12 @@
 [package]
 name = "crabmon"
 version = "0.10.0"
-edition = "2021"
+edition = "2024"
+# The floor is the highest any dependency asks for, not the edition's own
+# 1.85: sysinfo 0.39 wants 1.95. Declared so cargo refuses an older toolchain
+# with a sentence naming the package, which is how the e2e image's pinned
+# rust 1.90 announced itself rather than failing somewhere in a build log.
+rust-version = "1.95"
 description = "A fast, keyboard-driven terminal system monitor"
 repository = "https://github.com/nexusriot/crabmon"
 license = "MIT"
@@ -15,24 +20,34 @@ name = "crabmon"
 path = "src/main.rs"
 
 [dependencies]
-crossterm = "0.27"
-ratatui = { version = "0.26", default-features = false, features = ["crossterm"] }
-sysinfo = "0.30"
+crossterm = "0.29"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+sysinfo = "0.39"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
-dirs = "5"
+toml = "1"
+dirs = "7"
 regex = "1"
 
 # Unix-only: signals, priorities, affinity, graceful shutdown
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", default-features = false, features = ["signal", "sched"] }
-libc = "0.2"
-signal-hook = "0.3"
+nix = { version = "0.31", default-features = false, features = ["signal", "sched"] }
+# Pinned exactly, because it is a pre-release: a plain `"1.0.0-alpha.5"`
+# requirement also matches `alpha.6` and anything else before 1.0.0 final, so
+# a routine `cargo update` could swap the libc under this crate's `unsafe`
+# syscalls for one with different definitions. Every call here —
+# `setpriority`, `getpriority` with `__errno_location`, `SYS_ioprio_get`,
+# `SYS_ioprio_set`, `statvfs`, `O_NONBLOCK`, `_exit` — was checked against a
+# live host on alpha.5 specifically.
+#
+# Note this leaves two libc crates in the tree: nix, mio, dirs-sys and
+# signal-hook all still want 0.2, so both are compiled.
+libc = "=1.0.0-alpha.5"
+signal-hook = "0.4"
 
 [target.'cfg(unix)'.dev-dependencies]
-nix = { version = "0.29", default-features = false, features = ["signal", "sched"] }
+nix = { version = "0.31", default-features = false, features = ["signal", "sched"] }
 
 [package.metadata.deb]
 maintainer = "Vladislav Ananyev <nexus.riot@gmail.com>"

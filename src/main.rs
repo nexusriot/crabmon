@@ -7,17 +7,17 @@ use anyhow::Result;
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
 use crossterm::{
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 
 use crabmon::app::{Action, App};
 use crabmon::cli::{self, Args, Parsed};
 use crabmon::config::{self, Config};
 use crabmon::export;
 use crabmon::metrics::{MetricSource, SysinfoSource};
-use crabmon::record::{trim_frame, FlightRecorder, Recorder, ReplaySource};
+use crabmon::record::{FlightRecorder, Recorder, ReplaySource, trim_frame};
 use crabmon::remote::RemoteSource;
 use crabmon::sampler::{Pacer, ThreadedSource};
 use crabmon::supervisor;
@@ -669,15 +669,15 @@ fn event_loop(
         if app.due() {
             app.tick();
             last_tick = Instant::now();
-            if let Some(rec) = recorder.as_deref_mut() {
-                if let Err(e) = rec.write(&app.snap) {
-                    app.set_status(format!("recording failed: {e}"));
-                }
+            if let Some(rec) = recorder.as_deref_mut()
+                && let Err(e) = rec.write(&app.snap)
+            {
+                app.set_status(format!("recording failed: {e}"));
             }
-            if let Some(rec) = rotating.as_deref_mut() {
-                if let Err(e) = rec.write(&app.snap, app.snap.taken_at_unix) {
-                    app.set_status(format!("rotating recording failed: {e}"));
-                }
+            if let Some(rec) = rotating.as_deref_mut()
+                && let Err(e) = rec.write(&app.snap, app.snap.taken_at_unix)
+            {
+                app.set_status(format!("rotating recording failed: {e}"));
             }
             // Hooks and flight recordings. `App::tick` has already evaluated
             // the rules; this drains what that produced, through the same
@@ -720,6 +720,7 @@ impl StopFlag {
 
 /// How long the watchdog gives the event loop to notice the stop flag before
 /// killing the process outright.
+#[cfg(unix)]
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(750);
 
 /// SIGTERM exits through the normal path so the config is saved and the

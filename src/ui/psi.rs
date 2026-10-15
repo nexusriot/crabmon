@@ -4,11 +4,11 @@
 //! share where nothing ran at all. `full` is the number that explains a machine
 //! that feels frozen while the CPU graph looks idle.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Cell, Paragraph, Row, Table};
-use ratatui::Frame;
 
 use crate::app::App;
 use crate::metrics::psi::Pressure;

@@ -5,11 +5,11 @@
 //! incident — "what got killed, and when" — was the one nothing on screen
 //! could answer.
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Cell, Paragraph, Row, Table};
-use ratatui::Frame;
 
 use super::block;
 use crate::app::App;

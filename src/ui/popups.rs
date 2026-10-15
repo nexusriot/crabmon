@@ -1,13 +1,13 @@
 //! Overlays: signal menu, kill confirmation, renice, affinity, process detail,
 //! the key-binding help and the alert list.
 
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap,
 };
-use ratatui::Frame;
 
 use crate::app::{App, SIGNAL_NAMES};
 use crate::format::{compact_bytes, human_bps, human_bytes, human_duration, truncate_fit};

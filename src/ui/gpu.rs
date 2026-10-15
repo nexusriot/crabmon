@@ -1,11 +1,11 @@
 //! GPU rows: busy percentage where the driver reports it, clock ratio where it
 //! does not, plus VRAM and temperature.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Cell, Row, Table};
-use ratatui::Frame;
 
 use crate::app::App;
 use crate::format::{human_bytes, human_hz_mhz, truncate_fit};

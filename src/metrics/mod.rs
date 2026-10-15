@@ -500,11 +500,7 @@ pub trait MetricSource {
 }
 
 pub fn ratio(used: u64, total: u64) -> f64 {
-    if total == 0 {
-        0.0
-    } else {
-        (used as f64 / total as f64).clamp(0.0, 1.0)
-    }
+    if total == 0 { 0.0 } else { (used as f64 / total as f64).clamp(0.0, 1.0) }
 }
 
 /// Rate of a monotonic counter, guarding against counter resets and dt == 0.

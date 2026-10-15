@@ -398,7 +398,7 @@ mod tests {
     /// and two threads on every refresh.
     #[test]
     fn reconnect_backs_off_and_is_bounded() {
-        use super::{reconnect_delay, RECONNECT_MAX, RECONNECT_MIN};
+        use super::{RECONNECT_MAX, RECONNECT_MIN, reconnect_delay};
         assert_eq!(reconnect_delay(0), RECONNECT_MIN);
         assert!(reconnect_delay(1) > reconnect_delay(0));
         assert!(reconnect_delay(3) > reconnect_delay(2));

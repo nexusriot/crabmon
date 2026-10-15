@@ -17,7 +17,7 @@ use crate::export::{self, ExportFormat};
 use crate::filter::{self, Filter};
 use crate::history::History;
 use crate::metrics::procgroup::GroupBy;
-use crate::metrics::{fds, sockets, MetricSource, ProcRow, Snapshot};
+use crate::metrics::{MetricSource, ProcRow, Snapshot, fds, sockets};
 use crate::sort::{self, SortBy};
 use crate::theme::Theme;
 use crate::tree::{self, TreeRow};

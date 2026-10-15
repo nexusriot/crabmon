@@ -1,12 +1,12 @@
 //! CPU panels: the average history chart plus the per-core view that the
 //! project has been promising since the "one indicator per cpu" commit.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Axis, Chart, Dataset, GraphType, Paragraph};
-use ratatui::Frame;
 
 use crate::app::App;
 use crate::format::human_hz_mhz;
@@ -70,11 +70,13 @@ fn draw_avg_chart(f: &mut Frame<'_>, area: Rect, app: &App) {
     }
     // No `.name()`: a single series would otherwise draw a legend box over the
     // top-right of the chart.
-    let datasets = vec![Dataset::default()
-        .marker(symbols::Marker::Braille)
-        .graph_type(GraphType::Line)
-        .style(Style::default().fg(app.theme.accent))
-        .data(&data)];
+    let datasets = vec![
+        Dataset::default()
+            .marker(symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(app.theme.accent))
+            .data(&data),
+    ];
     let x_max = (data.len().saturating_sub(1)) as f64;
     let chart = Chart::new(datasets).x_axis(Axis::default().bounds([0.0, x_max.max(1.0)])).y_axis(
         Axis::default().bounds([0.0, 100.0]).labels(vec![

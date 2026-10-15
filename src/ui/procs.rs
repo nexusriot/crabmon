@@ -1,10 +1,10 @@
 //! The process table: adaptive columns, tree view, and click-to-sort headers.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Row, Table, TableState};
-use ratatui::Frame;
 
 use crate::app::{App, Mode};
 use crate::format::{compact_bytes, human_duration, truncate_fit};
@@ -143,10 +143,10 @@ pub fn columns_for(
     }
     let mut out: Vec<Col> = Vec::new();
     for name in configured {
-        if let Some(c) = column_by_name(name) {
-            if !out.contains(&c) {
-                out.push(c);
-            }
+        if let Some(c) = column_by_name(name)
+            && !out.contains(&c)
+        {
+            out.push(c);
         }
     }
     if out.is_empty() {
@@ -454,11 +454,7 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
             style = style.fg(app.theme.accent);
         }
         let marker = if c.key == app.cfg.sort_by {
-            if app.cfg.sort_desc {
-                "↓"
-            } else {
-                "↑"
-            }
+            if app.cfg.sort_desc { "↓" } else { "↑" }
         } else {
             ""
         };
@@ -560,7 +556,7 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
         .map(|c| if c.width == 0 { Constraint::Min(MIN_NAME) } else { Constraint::Length(c.width) })
         .collect();
 
-    let table = Table::new(rows, widths).header(header).highlight_style(app.theme.selection());
+    let table = Table::new(rows, widths).header(header).row_highlight_style(app.theme.selection());
 
     let mut state = TableState::default();
     if !app.rows().is_empty() {
@@ -660,7 +656,7 @@ fn draw_groups(f: &mut Frame<'_>, area: Rect, inner: Rect, app: &mut App) {
     if with_limit {
         widths.push(Constraint::Length(7));
     }
-    let table = Table::new(rows, widths).header(header).highlight_style(app.theme.selection());
+    let table = Table::new(rows, widths).header(header).row_highlight_style(app.theme.selection());
     let mut state = TableState::default();
     if !groups.is_empty() {
         state.select(Some(app.group_selected.saturating_sub(start)));

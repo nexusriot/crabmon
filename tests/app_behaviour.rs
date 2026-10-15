@@ -5,7 +5,7 @@ mod common;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
-use common::{app, proc_row, snapshot, FakeSource};
+use common::{FakeSource, app, proc_row, snapshot};
 use crabmon::app::{Action, Mode};
 use crabmon::sort::SortBy;
 

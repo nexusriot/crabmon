@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::metrics::ProcRow;
-use crate::sort::{compare, SortBy};
+use crate::sort::{SortBy, compare};
 
 /// A row in the flattened tree: index into the input slice plus its depth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -15,7 +15,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::alerts::{AlertKind, AlertRule, ALL_ALERT_KINDS};
+use crate::alerts::{ALL_ALERT_KINDS, AlertKind, AlertRule};
 
 /// Exit code when the watch condition was met. 0 means it never was.
 pub const MATCHED: i32 = 1;

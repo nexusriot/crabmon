@@ -106,11 +106,7 @@ pub fn read_card(card: &Path) -> Option<GpuInfo> {
         && info.vram_total.is_none()
         && info.temp_c.is_none()
         && info.freq_mhz.is_none();
-    if empty {
-        None
-    } else {
-        Some(info)
-    }
+    if empty { None } else { Some(info) }
 }
 
 /// hwmon temperatures are in millidegrees Celsius.

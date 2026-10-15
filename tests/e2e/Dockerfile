@@ -29,8 +29,8 @@
 # and a container with almost no processes in it is exactly the controlled
 # machine an end-to-end assertion wants: `pid:1` means one process, and a
 # workload started by the test is the only thing moving.
-# rust:1.90-slim-bookworm
-FROM rust@sha256:64232e656c058f4468e8d024e990acff04f0fd5a5c0a88a574dc37773d7325c9 AS build
+# rust:1.95-slim-bookworm
+FROM rust@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082 AS build
 WORKDIR /src
 # Only what the build reads. The test suite is not copied: these tests run the
 # binary from outside, and `cargo test` inside the image would be the unit

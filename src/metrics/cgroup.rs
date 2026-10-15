@@ -60,11 +60,7 @@ pub fn parse_mem_max(content: &str) -> Option<u64> {
     }
     let v = t.parse::<u64>().ok()?;
     // cgroup v1 signals "unlimited" with a huge sentinel rather than `max`.
-    if v >= u64::MAX / 4096 {
-        None
-    } else {
-        Some(v)
-    }
+    if v >= u64::MAX / 4096 { None } else { Some(v) }
 }
 
 /// `"150000 100000"` → 1.5 cores; `"max 100000"` → unlimited.
