@@ -21,7 +21,7 @@ PID while the screen showed another machine's.
   = "1.85"` is now declared, so an older toolchain is refused with a sentence
   rather than a parse error. Every `if let` that existed only to be nested
   inside another is now a let-chain.
-- **Two tests encoded assumptions that only hold on Linux.** The RAPL
+- **Three tests encoded assumptions that only hold on Linux.** The RAPL
   fixtures build directories named as the kernel names them — `intel-rapl:0`,
   `intel-rapl:0:1` — and `:` cannot appear in a Windows filename at all, so
   they are Linux-only now rather than renamed into a layout the kernel never
@@ -29,6 +29,10 @@ PID while the screen showed another machine's.
   fresh child starts at nice 0, which is true only when the parent is at 0:
   GitHub's macOS runners sit at -10, so it failed on a healthy machine. It
   now compares against the parent's own value, clamped at the kernel's 19.
+  `once_honours_the_filter_language` filtered on `pid:1` because init always
+  exists — on Linux. Windows has no PID 1, so the filter matched nothing; it
+  now filters on the test process's own PID, which exists everywhere and
+  checks the filter language rather than the platform.
 - **The cfg gates actually hold on every target CI builds.** `-D warnings`
   makes a platform-specific constant that nothing uses on that platform a
   build failure, and three had crept in: `MAX_RECORDS_PER_DRAIN` and the

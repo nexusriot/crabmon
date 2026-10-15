@@ -59,13 +59,18 @@ fn once_csv_has_a_header_and_one_line_per_process() {
 
 #[test]
 fn once_honours_the_filter_language() {
-    // PID 1 always exists on Linux and is the only match for `pid:1`.
-    let out = crabmon(&["--once", "--filter", "pid:1", "--refresh", "200"]);
+    // This test process: it is running by definition, so it is in the list,
+    // and a PID matches exactly one process on any platform. `pid:1` used to
+    // stand in for that — init always exists — but only on Linux: Windows
+    // has no PID 1, so the filter matched nothing and the run came back
+    // empty. The assertion was about the platform, not about the filter.
+    let me = std::process::id();
+    let out = crabmon(&["--once", "--filter", &format!("pid:{me}"), "--refresh", "200"]);
     assert!(out.status.success());
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let procs = v["procs"].as_array().unwrap();
-    assert_eq!(procs.len(), 1, "expected exactly one process");
-    assert_eq!(procs[0]["pid"], 1);
+    assert_eq!(procs.len(), 1, "expected exactly one process, the test itself");
+    assert_eq!(procs[0]["pid"], me);
 }
 
 #[test]
