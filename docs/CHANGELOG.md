@@ -21,6 +21,12 @@ PID while the screen showed another machine's.
   = "1.85"` is now declared, so an older toolchain is refused with a sentence
   rather than a parse error. Every `if let` that existed only to be nested
   inside another is now a let-chain.
+- **The documentation tests assumed LF line endings.** git checks out with
+  CRLF on Windows by default, and the helpers slice on `"\n\n"` and count
+  blank-line-separated blocks — so `.gitignore` read as a single section and
+  a `between()` marker spanning a line break stopped matching. Repository
+  files are now read LF-normalised: these tests are about what the
+  documentation says, not how a checkout spells a line break.
 - **Three tests encoded assumptions that only hold on Linux.** The RAPL
   fixtures build directories named as the kernel names them — `intel-rapl:0`,
   `intel-rapl:0:1` — and `:` cannot appear in a Windows filename at all, so

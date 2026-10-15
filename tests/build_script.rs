@@ -7,7 +7,10 @@
 use std::fs;
 
 fn read(path: &str) -> String {
-    fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    // LF-normalised for the same reason `tests/docs.rs` does it: a Windows
+    // checkout carries CRLF, and a stray `\r` on the end of a parsed target
+    // name is a mismatch nobody would guess from the failure.
+    fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}")).replace("\r\n", "\n")
 }
 
 /// The commands `scripts/build.sh` dispatches on, taken from the `cmd_*`

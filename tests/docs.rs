@@ -4,8 +4,16 @@
 
 use std::fs;
 
+/// A repository file, with its line endings normalised to LF.
+///
+/// git checks out with CRLF on Windows by default, and the helpers below
+/// slice on `"\n\n"` and count blank-line-separated blocks — so on a Windows
+/// checkout `.gitignore` read as a single section and every `between()` whose
+/// marker spans a line break stopped matching. These tests are about what the
+/// documentation *says*; how a checkout spells a line break is not their
+/// subject.
 fn read(path: &str) -> String {
-    fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}")).replace("\r\n", "\n")
 }
 
 /// The long flags the parser actually accepts, taken from the parser itself so
