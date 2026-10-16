@@ -36,7 +36,9 @@ and it can print all of it as JSON or CSV for scripts.
   credentials withheld, because a monitor is a thing people screenshot into
   tickets and project onto a wall during an incident.
   Threads are hidden by default (`H` shows them), so the list reflects processes
-  rather than every kernel task. Tag several with `Space` to signal, renice or
+  rather than every kernel task, and `o` folds a subtree away — a browser with
+  two hundred children otherwise buries everything else, which is the opposite
+  of what a tree view is for. Tag several with `Space` to signal, renice or
   pin them at once, and `f` keeps one process at the top of the table however the
   rest churns. The column set can be fixed in the config instead of fitting the
   terminal width.
@@ -108,8 +110,10 @@ and it can print all of it as JSON or CSV for scripts.
   against its own `RLIMIT_NOFILE`, plus `fd>` and `fd%>` filters and an alert
   kind. Descriptor exhaustion is to a process what inode exhaustion is to a
   filesystem: the resource that runs out while every other gauge looks fine.
-- **Export** — write a snapshot as JSON or CSV from the TUI, or run
-  `crabmon --once` headless.
+- **Export** — write a snapshot as JSON, CSV or a plain aligned table from the
+  TUI, or run `crabmon --once` headless. `--format text` is the `top -b -n1`
+  shape, laid out by the same column planner the interface uses, for when the
+  question is "what is this box doing" over SSH and `jq` is not the answer.
 - **Record & replay** — `--record` writes every sample to a JSONL file (trimmed
   to keep it a sane size) and `--replay` drives the whole UI from one, so "send
   me a recording of the slowdown" is a workable bug report.
@@ -132,7 +136,8 @@ and it can print all of it as JSON or CSV for scripts.
   `[serve] token` (or `CRABMON_SERVE_TOKEN`) can require an
   `Authorization: Bearer` header before crabmon will answer with any of it;
   `/healthz` stays open, because a liveness probe that needs a credential is a
-  liveness probe that gets switched off.
+  liveness probe that gets switched off. `--serve unix:/run/crabmon.sock`
+  skips the network altogether and lets filesystem permissions do the work.
 - **Remote** — `--remote host` monitors another machine over SSH, with no
   daemon and no open port, over one long-lived session rather than a process
   per sample. `--remote web-1,web-2,db-1` opens a fleet table instead: one row
@@ -141,6 +146,11 @@ and it can print all of it as JSON or CSV for scripts.
 - **Never blocks** — sampling runs on its own thread, so a slow `nvidia-smi`, a
   wedged NFS mount or a stalled SSH link leaves the interface responsive instead
   of freezing it.
+- **Live config reload** — `Ctrl-R` re-reads the config file and applies it
+  without restarting: thresholds, colours, panels, columns and `[[alert]]`
+  rules. The filter, tags, pins, selection, layout and sort are session state
+  and survive. Editing a config mid-incident is exactly when restarting costs
+  the most.
 - **Action log** — every signal, renice and affinity change is recorded to a
   local file, viewable in the TUI with `L`.
 - **Themes and layouts** — five colour themes, five layouts, and a config file

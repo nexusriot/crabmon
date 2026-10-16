@@ -60,6 +60,7 @@ src/
   supervisor.rs      alert rules and the flight recorder, outside the TUI
   fleet.rs           several hosts behind one metric source
   serve.rs           the Prometheus exporter
+  incident.rs        the readable summary written beside a flight dump
   audit.rs           the local log of actions taken
   clipboard.rs       OSC 52 copy
   metrics/
@@ -71,6 +72,10 @@ src/
     cgroup.rs        cgroup v1/v2 limits
     psi.rs           /proc/pressure stall information
     power.rs         batteries, mains and RAPL
+    smaps.rs         proportional and unique memory per process
+    kmsg.rs          OOM kills, crashes and IO errors from /dev/kmsg
+    ioprio.rs        IO scheduling class and level
+    procdetail.rs    OOM score, cgroup path and environment, per process
     meminfo.rs       the buffers/cache breakdown
     procgroup.rs     per-process cgroup paths, and what they mean
     sockets.rs       /proc/net joined against a process's fd table
@@ -84,6 +89,7 @@ src/
     mem.rs           memory, swap and cgroup gauges
     procs.rs         the process table and the grouped view
     psi.rs           pressure gauges
+    kernel.rs        what the kernel has complained about
     power.rs         battery and package power
     net.rs           interface table and RX/TX chart
     disks.rs         per-mount gauges
@@ -192,12 +198,18 @@ counters produces a gap rather than an absurd spike.
 
 ## Data sources & quirks
 
-- **Memory** — `sysinfo` 0.30 reports **bytes**, not KiB. Treating those bytes
+- **Memory** — `sysinfo` reports **bytes**, not KiB. Treating those bytes
   as KiB is what made a 16 GB machine display "15292.6 GiB"; `format::human_bytes`
   now does the scaling and a test pins the exact expected string.
-- **Device lists** — `Networks::refresh()` and friends only update entries
-  already in the list. `refresh_list()` is what discovers hot-plugged disks, new
+- **Device lists** — `Networks::refresh(false)` and friends only update entries
+  already in the list. `refresh(true)` is what discovers hot-plugged disks, new
   containers and fresh VPN interfaces, so the source re-lists every 5 seconds.
+  (Before sysinfo 0.33 these were `refresh()` and `refresh_list()`.)
+- **Task lists** — `Process::tasks()` is the set of *sub*tasks and excludes the
+  main thread, so the thread count is `len() + 1`. sysinfo 0.30 included the
+  main task; 0.33 onwards does not, and refreshing the list is opt-in
+  (`ProcessRefreshKind::with_tasks`). A live cross-check against
+  `/proc/<pid>/task` is what caught both.
 - **Disk IO** — `/proc/diskstats` is keyed by kernel device name, but a
   filesystem's device may be `/dev/mapper/root_crypt`. `diskstats::resolve_device_key`
   canonicalises the symlink (`→ /dev/dm-0`) and takes the basename, which is why
@@ -420,7 +432,7 @@ terminal or a runaway process:
 
 ## Testing
 
-Over 600 tests: the in-crate unit tests plus seven integration suites. All are
+Over 750 tests: the in-crate unit tests plus seven integration suites. All are
 offline and deterministic except `proc_control`, which deliberately touches the
 kernel, and `e2e_docker`, which builds and runs a container:
 
@@ -672,7 +684,6 @@ one that publishes them.
 - The streaming `--remote` path is unit-tested against a controlled child and
   driven end to end through a stand-in `ssh`, but has not been run over a real
   SSH connection; the same caveat the FreeBSD `iostat` path carries.
-
 - Kernel events are matched on message text, because the kernel has no
   structured form of "this is an OOM kill". The patterns are ones that have
   been spelled the same way for many years, and anything unrecognised is

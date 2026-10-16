@@ -158,6 +158,39 @@ fn the_man_page_version_matches_the_crate() {
 }
 
 #[test]
+fn the_design_notes_name_every_module_that_exists() {
+    // The crate layout is a map, and a map missing six of the rooms is worse
+    // than no map: `incident`, `smaps`, `kmsg`, `ioprio`, `procdetail` and
+    // the kernel panel were all added without an entry, and nothing noticed.
+    let design = read("docs/DESIGN.md");
+    let layout = between(&design, "## Crate layout", "## The metric boundary");
+
+    let mut missing: Vec<String> = Vec::new();
+    let mut stack = vec![std::path::PathBuf::from("src")];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("src is readable").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
+                continue;
+            };
+            if name.ends_with(".rs") && !layout.contains(&name) {
+                missing.push(name);
+            }
+        }
+    }
+    missing.sort();
+    assert!(
+        missing.is_empty(),
+        "docs/DESIGN.md's crate layout never mentions: {}",
+        missing.join(", ")
+    );
+}
+
+#[test]
 fn the_docs_name_every_test_suite_that_exists() {
     let design = read("docs/DESIGN.md");
     let mut suites: Vec<String> = fs::read_dir("tests")
