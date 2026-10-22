@@ -229,6 +229,54 @@ cmd_uninstall() {
     "$root/share/fish/vendor_completions.d/$NAME.fish"
 }
 
+# Redraw the interface snapshot the README carries.
+#
+# Through tmux rather than by rendering into a buffer: `capture-pane` hands
+# back what is actually on a pty, so the braille sparklines and the box drawing
+# come out as they are drawn rather than as something that approximates them.
+# From the release build, because a debug binary spends enough CPU to put
+# itself at the top of its own process table, which is both unflattering and
+# untrue.
+#
+# The capture is of whatever machine runs it, so re-running this replaces the
+# committed one with yours. That is the point — it is a demonstration of the
+# interface, not a fixture — and it is why the README's copy is replaced in
+# place between its markers rather than added to.
+SNAPSHOT_COLS=${SNAPSHOT_COLS:-100}
+SNAPSHOT_ROWS=${SNAPSHOT_ROWS:-30}
+SNAPSHOT_WAIT=${SNAPSHOT_WAIT:-6}
+
+cmd_snapshot() {
+  command -v tmux >/dev/null 2>&1 || {
+    echo "tmux is needed to capture a pty; install it, or edit README.md by hand" >&2
+    exit 1
+  }
+  command -v python3 >/dev/null 2>&1 || {
+    echo "python3 is needed to replace the block in README.md" >&2
+    exit 1
+  }
+  say "building the release binary the snapshot is taken from"
+  $CARGO build --release --quiet
+  session="crabmon-snapshot-$$"
+  capture=$(mktemp)
+  say "capturing ${SNAPSHOT_COLS}x${SNAPSHOT_ROWS} after ${SNAPSHOT_WAIT}s"
+  tmux new-session -d -s "$session" -x "$SNAPSHOT_COLS" -y "$SNAPSHOT_ROWS" \
+    "exec ./target/release/$NAME $*" 2>/dev/null
+  # Long enough for a second sample, so the charts have something in them.
+  sleep "$SNAPSHOT_WAIT"
+  tmux capture-pane -p -t "$session" | sed -e 's/[[:space:]]*$//' >"$capture"
+  tmux kill-session -t "$session" 2>/dev/null || true
+
+  if [ ! -s "$capture" ]; then
+    echo "the capture came back empty; can the binary start here?" >&2
+    rm -f "$capture"
+    exit 1
+  fi
+  SNAPSHOT_CAPTURE="$capture" python3 scripts/embed-snapshot.py
+  rm -f "$capture"
+  say "README.md updated"
+}
+
 cmd_clean() {
   say "cleaning"
   $CARGO clean
@@ -266,6 +314,7 @@ Usage: ./scripts/build.sh <command>       (or: make <command>)
   install      install under PREFIX=$PREFIX (honours DESTDIR)
   uninstall    remove what install put there
 
+  snapshot     redraw the interface snapshot in README.md (needs tmux)
   clean        cargo clean, plus $BIN_DIR and $DIST_DIR
   version      print the version from Cargo.toml
   help         this message

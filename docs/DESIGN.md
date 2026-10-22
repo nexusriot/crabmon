@@ -24,6 +24,7 @@ docs/
   crabmon.png        the screenshot the README embeds
 completions/         bash, zsh and fish
 scripts/build.sh     the build driver; build-deb.sh is an alias CI still uses
+scripts/embed-snapshot.py  puts a captured frame into README.md
 src/                 the library, plus a thin binary
 tests/               eight integration suites, including local and container E2E
 ```
@@ -662,6 +663,17 @@ front end to it — one line per target — rather than a second implementation,
 `make test` and `./scripts/build.sh test` cannot come to mean different things.
 A pair of tests in `tests/docs.rs` assert that the two lists agree and that the
 script's own help covers every command it accepts.
+
+`make snapshot` redraws the terminal capture the README carries. It drives a
+real pty through tmux and takes `capture-pane`'s output, so the braille
+sparklines and the box drawing are what the interface actually drew rather
+than an approximation of them; it builds release first, because a debug binary
+spends enough CPU to put itself at the top of its own process table. The
+capture is of whatever machine runs it, which is why the README's copy is
+replaced between markers rather than added to. `tests/docs.rs` compares its
+process-table header against `ui::procs::ALL_COLUMNS` as a token list, so a
+renamed column makes the snapshot a build failure rather than a quietly wrong
+picture.
 
 `make deb` (still reachable as `scripts/build-deb.sh`, the name CI uses) builds
 a release binary and runs `cargo-deb`, which installs the binary, the man page,

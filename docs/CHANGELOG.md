@@ -29,6 +29,19 @@ at all — both of which quietly cost a host its recording.
   an identical line per scrape for as long as it ran. Reported on the way
   into failure and on the way out of it now, the same shape as an alert.
 
+### Added
+
+- **The README carries a capture of the interface, and `make snapshot`
+  redraws it.** A screenshot is the one thing in these documents not derived
+  from the code, so it is the one thing that can rot silently. The capture is
+  taken through tmux — `capture-pane` returns what is on a real pty, so the
+  braille sparklines and the box drawing are as drawn — from a release build,
+  because a debug binary spends enough CPU to put itself at the top of its own
+  process table. `tests/docs.rs` compares the captured process-table header
+  against `ui::procs::ALL_COLUMNS` as a token list, not by substring: the
+  first version of that test passed against a snapshot it should have rejected,
+  because `contains("PID")` is satisfied by `OLDPID`.
+
 ### Changed
 
 - **The documentation and the ignore rules cover how a fleet's recordings are

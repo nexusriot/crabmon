@@ -893,3 +893,71 @@ fn every_hook_variable_is_documented_in_both_places() {
         }
     }
 }
+
+/// The README carries a captured terminal frame, which is the one thing in
+/// these documents that is not derived from the code and so the one thing that
+/// can rot silently. It is a picture of one machine at one moment, so most of
+/// what is in it cannot be asserted — but the interface it is a picture *of*
+/// can be, and a renamed column would make it a picture of a program that no
+/// longer exists.
+///
+/// The header is compared as a *token list* rather than by substring, for the
+/// reason the rest of this file is: `contains("PID")` is satisfied by the word
+/// `OLDPID`, which is exactly how a first attempt at this test passed against
+/// a snapshot it should have rejected.
+#[test]
+fn the_readme_snapshot_is_of_the_interface_this_code_draws() {
+    let readme = read("README.md");
+    let shot = between(&readme, "<!-- snapshot:begin -->", "<!-- snapshot:end -->");
+    assert!(shot.contains("```text"), "the snapshot is not in a fenced block");
+    assert!(shot.lines().count() > 10, "the snapshot looks truncated");
+    assert!(shot.contains('┌') && shot.contains('│'), "this is not a drawn interface");
+
+    // The process table's header row, found by the one column that is always
+    // last and always present.
+    let name = crabmon::ui::procs::column_by_name("name").expect("a name column").title;
+    let header = shot
+        .lines()
+        .find(|l| tokens(l).contains(&name.to_ascii_lowercase()))
+        .unwrap_or_else(|| panic!("the snapshot has no {name} column: the table was re-laid out"));
+    let cells = tokens(header);
+
+    // The columns `procs::plan` keeps at every width. `mark` is a space and
+    // has no title to find.
+    for col in ["pid", "cpu", "mem", "name"] {
+        let title = crabmon::ui::procs::column_by_name(col)
+            .unwrap_or_else(|| panic!("{col} is no longer a column"))
+            .title
+            .to_ascii_lowercase();
+        assert!(
+            cells.contains(&title),
+            "the snapshot's header is {cells:?}, which has no {title}: it predates this table"
+        );
+    }
+
+    // The panels the dashboard always draws, whatever the machine has. Which
+    // of the side panels appear is a property of the host that was captured —
+    // this VPS has no GPU and no sensors — so they cannot be asserted here.
+    for panel in ["CPU", "Memory", "Swap", "Processes"] {
+        assert!(
+            shot.contains(&format!("{panel} ")) || shot.contains(&format!("{panel}─")),
+            "the snapshot has no {panel} panel; the dashboard was rearranged"
+        );
+    }
+}
+
+/// ...and it can be regenerated, rather than being a paste nobody can refresh.
+#[test]
+fn the_readme_snapshot_can_be_regenerated() {
+    let make = read("Makefile");
+    assert!(make.contains("snapshot:"), "there is no `make snapshot`");
+    let script = read("scripts/build.sh");
+    assert!(script.contains("cmd_snapshot()"), "the build script cannot take one");
+    assert!(
+        fs::metadata("scripts/embed-snapshot.py").is_ok(),
+        "the helper that puts the capture into the README is missing"
+    );
+    // The markers the regeneration replaces between have to still be there.
+    let readme = read("README.md");
+    assert!(readme.contains("<!-- snapshot:begin -->") && readme.contains("<!-- snapshot:end -->"));
+}

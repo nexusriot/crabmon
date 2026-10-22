@@ -19,7 +19,7 @@ ARGS ?=
 .DEFAULT_GOAL := help
 
 .PHONY: help build release bin run test test-unit e2e e2e-local check fmt fmt-check \
-        lint ci deb dist install uninstall clean version
+        lint ci deb dist install uninstall snapshot clean version
 
 help:
 	@$(BUILD) help
@@ -74,6 +74,9 @@ install:
 
 uninstall:
 	@$(BUILD) uninstall
+
+snapshot:
+	@$(BUILD) snapshot
 
 clean:
 	@$(BUILD) clean

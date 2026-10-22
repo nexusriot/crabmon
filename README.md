@@ -11,6 +11,45 @@ and it can print all of it as JSON or CSV for scripts.
 
 ![crabmon screenshot](docs/crabmon.png)
 
+The same thing as text, captured from a one-core VPS with
+`make snapshot` — which drives a real pty through tmux, so this is the
+interface as drawn rather than a description of it:
+
+<!-- snapshot:begin -->
+```text
+┌ crabmon ─────────────────────────────────────────────────────────────────────────────────────────┐
+│vps3639009.trouble-free.net  Linux (Ubuntu 26.04)      1 cpu  load 0.92 1.16 1.07  up 31d 04:44:57│
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ CPU   5.0%  2.10 GHz  ───────────────────────────────────┐┌ Network [phys]  ↓ 1.0 KiB/s  ↑ 67 B/s┐
+│100│                                                      ││Iface     ↓ rate    ↑ rate   total    │
+│   │                                                      ││eth0      1.0 KiB/s 67 B/s   6.4 GiB  │
+│   │                                                      ││                                      │
+│   │                                                      ││                                      │
+│0  │⣀⣀⡠⠤⠤⠤⠤⠒⠒⠒⠒⠒⠒⠒⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⢄⣀⣀⣀⣀⣀⣀⣀⣀⡠⠤⠤⠤⠤││                                      │
+│                                                          │└──────────────────────────────────────┘
+└──────────────────────────────────────────────────────────┘┌ Pressure ────────────────────────────┐
+┌ Memory ──────────────────────────────────────────────────┐│     some    full    10s              │
+│ 43.2%  710.0 MiB / 1.6 GiB  (932.9 MiB avail, 976.1 MiB c││cpu    2.4%    0.0%  ░░░░░░░░░░░░░░░░ │
+└──────────────────────────────────────────────────────────┘│mem    0.1%    0.0%  ░░░░░░░░░░░░░░░░ │
+┌ Swap ────────────────────────────────────────────────────┐│io     2.4%    2.1%  ░░░░░░░░░░░░░░░░ │
+│██████████████ 75.9%  776.7 MiB / 1024.0 MiB              │└──────────────────────────────────────┘
+└──────────────────────────────────────────────────────────┘┌ Sensors (°C) ────────────────────────┐
+┌─ Processes ──────────────────────────────────────────────┐│no temperature sensors                │
+│  PID     USER      S CPU%↓  MEM     DISK      COMMAND    ││                                      │
+│  947116  root      S   2.5    7.6M          - crabmon    ││                                      │
+│  895846  -         S   1.2    139M          - uvicorn    ││                                      │
+│  1       root      S   0.0   10.6M          - systemd    ││                                      │
+│  2       root      S   0.0      0B          - kthreadd   │└──────────────────────────────────────┘
+│  3       root      S   0.0      0B          - pool_workq…│┌ Disks ───────────────────────────────┐
+│  4       root      I   0.0      0B          - kworker/R-…││████████/  23.1 GiB / 37.3 GiB        │
+│  5       root      I   0.0      0B          - kworker/R-…││█████/boot  245.2 MiB / 973.4 MiB     │
+│  6       root      I   0.0      0B          - kworker/R-…││██/var/lib/do…  23.1 GiB / 37.3 GiB   │
+│  7       root      I   0.0      0B          - kworker/R-…││██/var/lib/do…  23.1 GiB / 37.3 GiB   │
+└──────────────────────────────────────────────────────────┘└──────────────────────────────────────┘
+ 127 shown of 265 tasks · sort CPU%↓ · 800 ms · [?] help
+```
+<!-- snapshot:end -->
+
 ## Features
 
 - **CPU** — average-usage history chart plus a per-core strip, and a dedicated
