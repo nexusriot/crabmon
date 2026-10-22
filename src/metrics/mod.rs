@@ -2,6 +2,7 @@
 //! app can be driven from a fixture in tests instead of the live host.
 
 pub mod cgroup;
+pub mod control;
 pub mod diskstats;
 pub mod fds;
 pub mod gpu;
@@ -108,6 +109,9 @@ pub struct ProcRow {
     /// Seconds since the process started.
     pub run_time: u64,
     pub start_time_unix: u64,
+    /// Linux clock ticks since boot, distinguishing PID reuse within a second.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_time_ticks: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub threads: Option<usize>,
     pub read_bps: f64,

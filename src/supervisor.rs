@@ -14,12 +14,61 @@
 //! been run.
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::alerts::{ActiveAlert, AlertEngine};
 use crate::config::Config;
 use crate::metrics::Snapshot;
 use crate::record::FlightRecorder;
+
+/// Tracks actual frame arrivals, independently of how often clients scrape.
+pub struct RemoteFreshness {
+    last_id: Option<u64>,
+    received: Option<Instant>,
+    timeout: Duration,
+    interrupted: bool,
+}
+
+impl RemoteFreshness {
+    pub fn new(refresh: Duration) -> Self {
+        Self {
+            last_id: None,
+            received: None,
+            timeout: (refresh * 3).max(Duration::from_secs(5)),
+            interrupted: true,
+        }
+    }
+
+    /// (new measurement, currently available). Clock injection keeps outage
+    /// and fast-scrape regressions deterministic.
+    pub fn update(
+        &mut self,
+        snap: &Snapshot,
+        id: Option<u64>,
+        reachable: bool,
+        now: Instant,
+        engine: Option<&mut AlertEngine>,
+    ) -> (bool, bool) {
+        // Notice the gap *before* accepting a newly delivered frame, so a
+        // reconnect cannot silently complete a pre-outage hold timer.
+        let expired =
+            self.received.is_some_and(|at| now.saturating_duration_since(at) >= self.timeout);
+        let valid = reachable && snap.taken_at_unix != 0;
+        let fresh = valid && (self.received.is_none() || id.is_none() || id != self.last_id);
+        if !valid || expired || self.interrupted {
+            if let Some(engine) = engine {
+                engine.interrupt();
+            }
+            self.interrupted = true;
+        }
+        if fresh {
+            self.last_id = id;
+            self.received = Some(now);
+            self.interrupted = false;
+        }
+        (fresh, valid && !self.interrupted)
+    }
+}
 
 /// Everything one sample produced that the caller has to act on.
 #[derive(Debug, Default, PartialEq)]
@@ -465,5 +514,59 @@ mod tests {
         let mut sup = Supervisor::new(&cfg_with(Vec::new()));
         assert!(sup.observe(&cpu(100.0)).is_quiet());
         assert!(!sup.is_dumping());
+    }
+}
+
+#[cfg(test)]
+mod freshness_tests {
+    use super::*;
+    use crate::watch::parse_rule;
+
+    #[test]
+    fn blank_failed_and_duplicate_frames_cannot_fire_remote_rules() {
+        let mut rule = parse_rule("proc:nginx<1", 2).unwrap();
+        rule.command = "page".into();
+        let mut engine = AlertEngine::new(vec![rule]);
+        let mut gate = RemoteFreshness::new(Duration::from_millis(200));
+        let start = Instant::now();
+        let blank = Snapshot::default();
+        assert_eq!(gate.update(&blank, Some(0), true, start, Some(&mut engine)), (false, false));
+        assert!(engine.take_commands().is_empty());
+        let snap = Snapshot { taken_at_unix: 1000, ..Default::default() };
+        let (fresh, up) = gate.update(&snap, Some(1), true, start, Some(&mut engine));
+        assert!(fresh && up);
+        assert!(engine.evaluate(&snap, 0).is_empty());
+        for t in 1..5 {
+            assert_eq!(
+                gate.update(
+                    &snap,
+                    Some(1),
+                    true,
+                    start + Duration::from_secs(t),
+                    Some(&mut engine)
+                ),
+                (false, true)
+            );
+        }
+        assert!(engine.take_commands().is_empty());
+        // A timeout followed directly by a new frame must also reset the hold.
+        assert_eq!(
+            gate.update(&snap, Some(2), true, start + Duration::from_secs(6), Some(&mut engine)),
+            (true, true)
+        );
+        assert!(engine.evaluate(&snap, 6).is_empty());
+        assert_eq!(
+            gate.update(&snap, Some(2), false, start + Duration::from_secs(7), Some(&mut engine)),
+            (false, false)
+        );
+        assert_eq!(
+            gate.update(&snap, Some(2), true, start + Duration::from_secs(8), Some(&mut engine)),
+            (false, false)
+        );
+        gate.update(&snap, Some(3), true, start + Duration::from_secs(9), Some(&mut engine));
+        assert!(engine.evaluate(&snap, 9).is_empty());
+        gate.update(&snap, Some(4), true, start + Duration::from_secs(11), Some(&mut engine));
+        assert_eq!(engine.evaluate(&snap, 11).len(), 1);
+        assert_eq!(engine.take_commands(), vec!["page"]);
     }
 }

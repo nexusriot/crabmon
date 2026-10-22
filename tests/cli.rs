@@ -54,7 +54,18 @@ fn once_csv_has_a_header_and_one_line_per_process() {
     let text = String::from_utf8_lossy(&out.stdout);
     let mut lines = text.lines();
     assert!(lines.next().unwrap().starts_with("pid,ppid,name,cpu_percent"));
-    assert!(lines.count() <= 3);
+    // Quoted command fields may contain newlines. Count CSV records, not
+    // physical lines (a shell running a multiline script is a real example).
+    let (mut quoted, mut records) = (false, 0);
+    for ch in text.chars() {
+        if ch == '"' {
+            quoted = !quoted;
+        }
+        if ch == '\n' && !quoted {
+            records += 1;
+        }
+    }
+    assert!(records <= 4, "more than a header and three process records");
 }
 
 #[test]

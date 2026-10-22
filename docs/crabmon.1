@@ -129,8 +129,9 @@ per-process series carry command lines, so the difference matters. Connections
 are handled concurrently and capped; past the cap callers get 503.
 .TP
 .B \-\-stream
-Print one JSON snapshot per line, forever, trimmed by \fB[record]\fR exactly as
-a recording is. This is what \fB\-\-remote\fR runs on the far end, and it is
+Print one complete JSON snapshot per line, forever. Recording limits do not
+trim transport frames: remote filters and alerts need every process and its
+full command line. This is what \fB\-\-remote\fR runs on the far end, and it is
 usable on its own as a collector. Samples this host only.
 .TP
 .B \-\-alerts

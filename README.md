@@ -570,9 +570,10 @@ scrape_configs:
 
 ## Streaming
 
-`--stream` prints one JSON snapshot per line, forever, trimmed by `[record]`
-exactly as a recording is. It is what `--remote` runs on the far end, and it
-works on its own as a collector:
+`--stream` prints one complete JSON snapshot per line, forever. Recording
+limits do not trim transport frames: remote filters and alerts need every
+process and its full command line. It is what `--remote` runs on the far end,
+and it works on its own as a collector:
 
 ```sh
 crabmon --stream --refresh 5000 | while read -r frame; do ... ; done

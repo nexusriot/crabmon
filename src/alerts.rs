@@ -214,6 +214,16 @@ pub struct AlertEngine {
 }
 
 impl AlertEngine {
+    /// Missing observations cannot establish a continuous hold. Already
+    /// firing rules retain their state until a real recovery is observed.
+    pub fn interrupt(&mut self) {
+        for state in &mut self.state {
+            if !state.fired {
+                state.over_since = None;
+            }
+        }
+    }
+
     pub fn new(rules: Vec<AlertRule>) -> Self {
         let state = vec![Tracked::default(); rules.len()];
         let queries = rules

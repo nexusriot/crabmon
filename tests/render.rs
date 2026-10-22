@@ -176,8 +176,12 @@ fn every_popup_renders_its_own_content() {
         a.select(0);
         a.mode = mode.clone();
         if matches!(mode, Mode::SignalMenu | Mode::ConfirmKill | Mode::Renice | Mode::Affinity) {
-            a.target =
-                Some(crabmon::app::Target { pid: 1, name: "systemd".into(), start_time_unix: 0 });
+            a.target = Some(crabmon::app::Target {
+                pid: 1,
+                name: "systemd".into(),
+                start_time_unix: 0,
+                start_time_ticks: None,
+            });
         }
         let s = screen(&mut a, 120, 40);
         assert!(s.contains(needle), "{mode:?} popup missing {needle}:\n{s}");

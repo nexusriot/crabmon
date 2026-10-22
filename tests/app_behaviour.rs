@@ -1329,3 +1329,90 @@ fn the_fleet_table_is_live_for_hosts_that_are_not_selected() {
     assert_eq!(hosts[1].snapshot.cpu.avg(), 90.0);
     assert!(hosts.iter().all(|h| h.is_live()));
 }
+
+#[test]
+fn marks_do_not_transfer_to_a_pid_reused_between_samples() {
+    for same_second in [false, true] {
+        let mut first = snapshot();
+        first.procs[0].start_time_ticks = Some(100);
+        let mut second = first.clone();
+        second.procs[0].start_time_ticks = Some(101);
+        if !same_second {
+            second.procs[0].start_time_unix += 1;
+        }
+        let pid = first.procs[0].pid;
+        let mut a =
+            crabmon::App::new(common::config(), Box::new(FakeSource::new(vec![first, second])));
+        a.tagged.insert(pid);
+        a.pinned.insert(pid);
+        a.collapsed.insert(pid);
+        a.tick();
+        assert!(!a.tagged.contains(&pid));
+        assert!(!a.pinned.contains(&pid));
+        assert!(!a.collapsed.contains(&pid));
+    }
+}
+
+#[test]
+fn switching_fleet_hosts_keeps_alerts_and_trends_on_their_own_host() {
+    use crabmon::metrics::MetricSource;
+    let mut hot = snapshot();
+    hot.taken_at_unix = 1000;
+    hot.cpu.per_core = vec![99.];
+    let mut cold = hot.clone();
+    cold.cpu.per_core = vec![0.];
+    let sources: Vec<(String, Box<dyn MetricSource>)> = vec![
+        ("hot".into(), Box::new(FakeSource::single(hot))),
+        ("cold".into(), Box::new(FakeSource::single(cold))),
+    ];
+    let mut cfg = common::config();
+    cfg.layout = crabmon::ui::Layout::Fleet;
+    cfg.alerts = vec![crabmon::watch::parse_rule("cpu>=90", 0).unwrap()];
+    cfg.alerts[0].command_clear = "must-stay-on-hot".into();
+    let mut a = crabmon::App::new(cfg, Box::new(crabmon::fleet::FleetSource::new(sources)));
+    a.tick();
+    assert_eq!(a.active_alerts.len(), 1);
+    let mut later = a.snap.clone();
+    later.taken_at_unix += 150;
+    later.mem.used += 123;
+    a.alerts.evaluate(&later, 1);
+    assert_eq!(a.alerts.trends().machine_growth("mem", 300), Some((123, 150)));
+    a.alerts.take_fired();
+    a.fleet_selected = 1;
+    a.on_key(code(KeyCode::Enter));
+    assert!(a.active_alerts.is_empty());
+    a.tick();
+    assert!(a.alerts.take_commands().is_empty(), "cold cannot recover hot's alert");
+    assert_eq!(a.alerts.history_len(), 0);
+    assert_eq!(a.alerts.trends().machine_growth("mem", 300), None);
+    a.cfg.layout = crabmon::ui::Layout::Fleet;
+    a.fleet_selected = 0;
+    a.on_key(code(KeyCode::Enter));
+    assert_eq!(a.active_alerts.len(), 1);
+    assert_eq!(a.alerts.history_len(), 1);
+    assert_eq!(a.alerts.trends().machine_growth("mem", 300), Some((123, 150)));
+    a.tick();
+    assert!(a.alerts.take_fired().is_empty(), "returning must not refire hot");
+}
+
+#[test]
+fn replay_discards_hooks_and_does_not_feed_the_flight_recorder() {
+    let mut cfg = common::config();
+    cfg.alerts = vec![crabmon::watch::parse_rule("cpu>=0", 0).unwrap()];
+    cfg.alerts[0].command = "must-not-run".into();
+    let frames = vec![snapshot(), snapshot()];
+    let mut a = crabmon::App::new(
+        cfg,
+        Box::new(crabmon::record::ReplaySource::from_frames(frames, "incident")),
+    );
+    a.tick();
+    assert!(!a.active_alerts.is_empty(), "historical alert display still works");
+    let mut flight =
+        crabmon::record::FlightRecorder::new(&std::env::temp_dir(), 2, 1, Default::default())
+            .unwrap();
+    assert!(a.drain_alert_side_effects(Some(&mut flight)).is_empty());
+    assert!(a.alerts.take_commands().is_empty());
+    assert!(a.alerts.take_fired().is_empty());
+    assert_eq!(flight.buffered(), 0);
+    assert!(!flight.is_dumping());
+}

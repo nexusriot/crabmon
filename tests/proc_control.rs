@@ -200,3 +200,97 @@ fn a_process_that_execs_is_reported_as_what_it_became() {
     assert_eq!(name, "crabmon-execd", "the new program's name");
     assert!(cmd.contains("crabmon-execd"), "the command line still describes the wrapper: {cmd}");
 }
+
+#[cfg(target_os = "linux")]
+fn app_for_child(child: &Sacrifice) -> crabmon::App {
+    use crabmon::metrics::{MetricSource, SysinfoSource};
+    struct Frozen(crabmon::Snapshot);
+    impl MetricSource for Frozen {
+        fn snapshot(&mut self, _: Duration) -> crabmon::Snapshot {
+            self.0.clone()
+        }
+    }
+    let mut source = SysinfoSource::new(Vec::new(), false);
+    let mut snap = source.snapshot(Duration::ZERO);
+    snap.procs.retain(|p| p.pid == child.pid());
+    assert_eq!(snap.procs.len(), 1);
+    assert!(snap.procs[0].start_time_ticks.is_some());
+    crabmon::App::new(Default::default(), Box::new(Frozen(snap)))
+}
+
+#[cfg(target_os = "linux")]
+fn confirm_control(app: &mut crabmon::App, key: char) {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    app.on_key(press(KeyCode::Char(key)));
+    if key == 't' {
+        app.on_key(press(KeyCode::Enter));
+        app.on_key(press(KeyCode::Char('y')));
+    } else {
+        app.input = match key {
+            'r' => "19",
+            'A' => "0",
+            'I' => "idle",
+            _ => unreachable!(),
+        }
+        .into();
+        app.on_key(press(KeyCode::Enter));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn paused_controls_refuse_a_live_pid_with_the_wrong_incarnation() {
+    for key in ['t', 'r', 'A', 'I'] {
+        let mut child = Sacrifice::spawn();
+        let base = get_priority(child.pid());
+        let mut app = app_for_child(&child);
+        app.paused = true;
+        // Same PID and Unix second, a different precise identity. No tick
+        // updates the snapshot before the confirmation reaches the kernel.
+        app.snap.procs[0].start_time_ticks = app.snap.procs[0].start_time_ticks.map(|t| t + 1);
+        app.rebuild_view();
+        confirm_control(&mut app, key);
+        assert!(
+            app.status_text().unwrap_or_default().contains("gone"),
+            "{key}: {:?}",
+            app.status_text()
+        );
+        assert!(child.0.try_wait().unwrap().is_none(), "wrong incarnation was signalled");
+        assert_eq!(get_priority(child.pid()), base);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn controls_refuse_an_exited_process_even_with_a_frozen_snapshot() {
+    for key in ['t', 'r', 'A', 'I'] {
+        let mut child = Sacrifice::spawn();
+        let mut app = app_for_child(&child);
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        confirm_control(&mut app, key);
+        assert!(
+            app.status_text().unwrap_or_default().contains("gone"),
+            "{key}: {:?}",
+            app.status_text()
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn app_controls_deliver_to_a_verified_live_child() {
+    let mut child = Sacrifice::spawn();
+    let mut app = app_for_child(&child);
+    confirm_control(&mut app, 'r');
+    assert_eq!(get_priority(child.pid()), Some(19));
+    confirm_control(&mut app, 't');
+    for _ in 0..50 {
+        if child.0.try_wait().unwrap().is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("pidfd signal did not reach the verified child");
+}

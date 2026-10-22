@@ -79,6 +79,7 @@ pub struct SysinfoSource {
     /// reason the descriptor walk is: one more read per process per sample.
     read_pss: bool,
     host: HostInfo,
+    sample_ticks: HashMap<u32, u64>,
 }
 
 fn process_refresh_kind() -> ProcessRefreshKind {
@@ -220,6 +221,7 @@ impl SysinfoSource {
             count_fds: false,
             read_pss: false,
             host,
+            sample_ticks: HashMap::new(),
         }
     }
 
@@ -348,6 +350,14 @@ impl SysinfoSource {
                 user,
                 run_time: p.run_time(),
                 start_time_unix: p.start_time(),
+                // Only attach a precise identity if the incarnation survived
+                // the whole refresh. A replacement during collection must not
+                // acquire the old row's name and a new process's control token.
+                start_time_ticks: self
+                    .sample_ticks
+                    .get(&pid_u)
+                    .copied()
+                    .filter(|ticks| super::control::start_ticks(pid_u) == Some(*ticks)),
                 // `+ 1` for the main thread: sysinfo's `tasks()` is the set
                 // of *sub*tasks, so a single-threaded process reports an
                 // empty set and every other one is short by itself. Without
@@ -568,6 +578,14 @@ impl MetricSource for SysinfoSource {
         self.relist_if_due();
         self.kmsg.drain();
 
+        self.sample_ticks = self
+            .sys
+            .processes()
+            .keys()
+            .filter_map(|pid| {
+                super::control::start_ticks(pid.as_u32()).map(|ticks| (pid.as_u32(), ticks))
+            })
+            .collect();
         self.sys.refresh_specifics(refresh_kind());
         self.networks.refresh(false);
         self.disks.refresh(false);

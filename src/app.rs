@@ -93,11 +93,27 @@ pub struct Target {
     pub pid: u32,
     pub name: String,
     pub start_time_unix: u64,
+    pub start_time_ticks: Option<u64>,
 }
 
 impl From<&ProcRow> for Target {
     fn from(r: &ProcRow) -> Target {
-        Target { pid: r.pid, name: r.name.clone(), start_time_unix: r.start_time_unix }
+        Target {
+            pid: r.pid,
+            name: r.name.clone(),
+            start_time_unix: r.start_time_unix,
+            start_time_ticks: r.start_time_ticks,
+        }
+    }
+}
+
+impl Target {
+    fn live(&self) -> std::io::Result<crate::metrics::control::LiveProcess> {
+        crate::metrics::control::LiveProcess::open(
+            self.pid,
+            self.start_time_unix,
+            self.start_time_ticks,
+        )
     }
 }
 
@@ -144,6 +160,8 @@ pub struct App {
 
     pub alerts: AlertEngine,
     pub active_alerts: Vec<ActiveAlert>,
+    /// Alert state belongs to a host, even while another host is selected.
+    host_alerts: HashMap<String, (AlertEngine, Vec<ActiveAlert>)>,
     started: Instant,
 
     /// Set during draw so mouse clicks can be mapped back to rows and columns.
@@ -257,6 +275,7 @@ impl App {
             disk_r_hist: hist(),
             disk_w_hist: hist(),
             active_alerts: Vec::new(),
+            host_alerts: HashMap::new(),
             started: Instant::now(),
             proc_area: Rect::default(),
             header_cols: Vec::new(),
@@ -326,7 +345,25 @@ impl App {
 
     pub fn tick(&mut self) {
         let dt = self.last_refresh.elapsed();
-        self.snap = self.source.snapshot(dt);
+        let next = self.source.snapshot(dt);
+        // Compare against the preceding sample, not mere PID membership:
+        // the kernel may recycle a number without an empty intervening frame.
+        let identities: HashMap<_, _> = self
+            .snap
+            .procs
+            .iter()
+            .map(|p| (p.pid, (p.start_time_unix, p.start_time_ticks)))
+            .collect();
+        let same: HashSet<_> = next
+            .procs
+            .iter()
+            .filter(|p| identities.get(&p.pid) == Some(&(p.start_time_unix, p.start_time_ticks)))
+            .map(|p| p.pid)
+            .collect();
+        self.tagged.retain(|pid| same.contains(pid));
+        self.pinned.retain(|pid| same.contains(pid));
+        self.collapsed.retain(|pid| same.contains(pid));
+        self.snap = next;
         self.last_refresh = Instant::now();
         self.generation = self.generation.wrapping_add(1);
 
@@ -566,6 +603,19 @@ impl App {
         let hosts = self.fleet();
         let Some(host) = hosts.get(self.fleet_selected) else { return };
         let target = host.target.clone();
+        if self.source.selected_host() != self.fleet_selected {
+            if let Some(previous) = self.fleet_target() {
+                // An unobserved interval cannot count toward a hold time.
+                self.alerts.interrupt();
+                let old =
+                    std::mem::replace(&mut self.alerts, AlertEngine::new(self.cfg.alerts.clone()));
+                self.host_alerts.insert(previous, (old, std::mem::take(&mut self.active_alerts)));
+            }
+            if let Some((engine, active)) = self.host_alerts.remove(&target) {
+                self.alerts = engine;
+                self.active_alerts = active;
+            }
+        }
         self.source.select_host(self.fleet_selected);
         self.snap = self.source.peek().unwrap_or_else(|| host.snapshot.clone());
         self.reset_histories();
@@ -573,6 +623,7 @@ impl App {
         self.selected_pid = None;
         self.tagged.clear();
         self.pinned.clear();
+        self.collapsed.clear();
         self.cfg.layout = Layout::Dashboard;
         self.rebuild_view();
         self.set_status(format!("watching {target}"));
@@ -1309,7 +1360,11 @@ impl App {
     /// menu, renice or affinity prompt and confirming it would otherwise hit an
     /// unrelated process.
     fn target_matches(&self, t: &Target) -> bool {
-        self.snap.procs.iter().any(|p| p.pid == t.pid && p.start_time_unix == t.start_time_unix)
+        self.snap.procs.iter().any(|p| {
+            p.pid == t.pid
+                && p.start_time_unix == t.start_time_unix
+                && p.start_time_ticks == t.start_time_ticks
+        }) && t.live().is_ok()
     }
 
     /// A bulk action reports how many of its targets it actually reached; a
@@ -1339,6 +1394,12 @@ impl App {
                 let mut skipped = 0usize;
                 for t in &targets {
                     if !self.target_matches(t) {
+                        self.log_action(
+                            audit::Action::Signal { name: name.to_string() },
+                            t.pid,
+                            &t.name,
+                            Err("process is gone or its identity changed"),
+                        );
                         skipped += 1;
                         continue;
                     }
@@ -1359,7 +1420,7 @@ impl App {
     fn send_signal(&mut self, t: &Target, name: &str) -> bool {
         let Some(sig) = signal_by_name(name) else { return false };
         let action = audit::Action::Signal { name: name.to_string() };
-        match crate::metrics::sysinfo_source::send_signal(t.pid, sig) {
+        match t.live().and_then(|process| process.signal(sig)) {
             Ok(()) => {
                 self.set_status(format!("sent {name} to {} ({})", t.name, t.pid));
                 self.log_action(action, t.pid, &t.name, Ok(()));
@@ -1418,11 +1479,21 @@ impl App {
                         let (mut done, mut skipped) = (0usize, 0usize);
                         for target in &targets {
                             if !self.target_matches(target) {
+                                self.log_action(
+                                    audit::Action::Renice { nice },
+                                    target.pid,
+                                    &target.name,
+                                    Err("process is gone or its identity changed"),
+                                );
                                 skipped += 1;
                                 continue;
                             }
                             let action = audit::Action::Renice { nice };
-                            match crate::metrics::sysinfo_source::set_priority(target.pid, nice) {
+                            match target.live().and_then(|process| {
+                                process.apply(|| {
+                                    crate::metrics::sysinfo_source::set_priority(target.pid, nice)
+                                })
+                            }) {
                                 Ok(()) => {
                                     self.set_status(format!("{} niced to {nice}", target.name));
                                     self.log_action(action, target.pid, &target.name, Ok(()));
@@ -1485,11 +1556,21 @@ impl App {
                         let (mut done, mut skipped) = (0usize, 0usize);
                         for target in &targets {
                             if !self.target_matches(target) {
+                                self.log_action(
+                                    audit::Action::Affinity { cpus: list.clone() },
+                                    target.pid,
+                                    &target.name,
+                                    Err("process is gone or its identity changed"),
+                                );
                                 skipped += 1;
                                 continue;
                             }
                             let action = audit::Action::Affinity { cpus: list.clone() };
-                            match crate::metrics::sysinfo_source::set_affinity(target.pid, &cpus) {
+                            match target.live().and_then(|process| {
+                                process.apply(|| {
+                                    crate::metrics::sysinfo_source::set_affinity(target.pid, &cpus)
+                                })
+                            }) {
                                 Ok(()) => {
                                     self.set_status(format!("{} pinned to {list}", target.name));
                                     self.log_action(action, target.pid, &target.name, Ok(()));
@@ -1556,11 +1637,19 @@ impl App {
                         let (mut done, mut skipped) = (0usize, 0usize);
                         for target in &targets {
                             if !self.target_matches(target) {
+                                self.log_action(
+                                    audit::Action::IoPriority { value: prio.to_string() },
+                                    target.pid,
+                                    &target.name,
+                                    Err("process is gone or its identity changed"),
+                                );
                                 skipped += 1;
                                 continue;
                             }
                             let action = audit::Action::IoPriority { value: prio.to_string() };
-                            match crate::metrics::ioprio::set(target.pid, prio) {
+                            match target.live().and_then(|process| {
+                                process.apply(|| crate::metrics::ioprio::set(target.pid, prio))
+                            }) {
                                 Ok(()) => {
                                     self.set_status(format!("{} set to {prio}", target.name));
                                     self.log_action(action, target.pid, &target.name, Ok(()));
@@ -1662,6 +1751,13 @@ impl App {
         &mut self,
         flight: Option<&mut crate::record::FlightRecorder>,
     ) -> Vec<String> {
+        if self.source.timeline().is_some() {
+            // Replaying evidence must never execute today's hooks or open
+            // another flight recording. Keep alert display available.
+            self.alerts.take_commands();
+            self.alerts.take_fired();
+            return Vec::new();
+        }
         // The rules were evaluated in `tick`; passing what is firing along
         // lets the summary beside a dump say what tripped it, exactly as the
         // headless path does.
@@ -1717,6 +1813,7 @@ impl App {
         // this at all — and the engine's hold times and series start again
         // with them, since a rule that has been edited is a new rule.
         self.alerts = AlertEngine::new(self.cfg.alerts.clone());
+        self.host_alerts.clear();
         self.active_alerts.clear();
         if history_changed {
             self.reset_histories();

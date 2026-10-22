@@ -17,7 +17,7 @@ use crabmon::cli::{self, Args, Parsed};
 use crabmon::config::{self, Config};
 use crabmon::export;
 use crabmon::metrics::{MetricSource, SysinfoSource};
-use crabmon::record::{FlightRecorder, Recorder, ReplaySource, trim_frame};
+use crabmon::record::{FlightRecorder, Recorder, ReplaySource};
 use crabmon::remote::RemoteSource;
 use crabmon::sampler::{Pacer, ThreadedSource};
 use crabmon::supervisor;
@@ -135,8 +135,8 @@ fn build_source(cfg: &Config, args: &Args) -> Result<Box<dyn MetricSource>> {
 }
 
 /// `--stream`: one JSON snapshot per line, forever. This is what a streaming
-/// `--remote` runs on the far end, so frames are trimmed the same way a
-/// recording is — a full process list every second over SSH is unusable.
+/// `--remote` runs on the far end. Transport frames retain the complete
+/// inventory: trimming would turn a quiet service into a false absence alert.
 ///
 /// With `--alerts` the same rules the TUI evaluates run here too, so a host
 /// streaming to a collector also pages and writes flight recordings. Hook
@@ -156,9 +156,7 @@ fn stream_frames(cfg: &Config, alerts: bool) -> Result<()> {
         if let Some(sup) = sup.as_mut() {
             report(sup.observe(&snap));
         }
-        let frame =
-            trim_frame(&snap, cfg.record.top_n, cfg.record.omit_paths, cfg.record.max_cmd_len);
-        let line = serde_json::to_string(&frame)?;
+        let line = serde_json::to_string(&snap)?;
         // A broken pipe means the reader went away; that is a normal exit here,
         // not a crash to report.
         if out.write_all(line.as_bytes()).is_err() || out.write_all(b"\n").is_err() {
@@ -344,7 +342,12 @@ fn serve_fleet(addr: &str, cfg: &Config, alerts: bool, spec: &str) -> Result<()>
     // host that is down costs a scrape nothing but its own missing series.
     // `Send`, because the sampling closure runs on whichever connection
     // thread is serving the scrape.
-    let mut hosts: Vec<(String, ThreadedSource, Option<supervisor::Supervisor>)> = targets
+    let mut hosts: Vec<(
+        String,
+        ThreadedSource,
+        Option<supervisor::Supervisor>,
+        supervisor::RemoteFreshness,
+    )> = targets
         .iter()
         .map(|target| {
             let remote = match cfg.remote.stream {
@@ -353,25 +356,38 @@ fn serve_fleet(addr: &str, cfg: &Config, alerts: bool, spec: &str) -> Result<()>
             };
             let source = ThreadedSource::new(Box::new(remote));
             let sup = alerts.then(|| supervisor::Supervisor::new(cfg).for_host(target));
-            (target.clone(), source, sup)
+            (
+                target.clone(),
+                source,
+                sup,
+                supervisor::RemoteFreshness::new(Duration::from_millis(cfg.refresh_ms)),
+            )
         })
         .collect();
 
     crabmon::serve::serve_rendered(addr, cfg.serve_token(), move |elapsed| {
         let parts: Vec<(String, String)> = hosts
             .iter_mut()
-            .map(|(name, source, sup)| {
+            .map(|(name, source, sup, freshness)| {
                 let snap = source.snapshot(elapsed);
+                let (fresh, reachable) = freshness.update(
+                    &snap,
+                    source.frame_id(),
+                    source.error().is_none(),
+                    Instant::now(),
+                    sup.as_mut().map(|s| &mut s.alerts),
+                );
                 let states = match sup.as_mut() {
                     None => Vec::new(),
                     Some(sup) => {
-                        report(sup.observe(&snap));
-                        sup.alerts.states(&snap)
+                        if fresh {
+                            report(sup.observe(&snap));
+                        }
+                        if reachable { sup.alerts.states(&snap) } else { Vec::new() }
                     }
                 };
                 // A host that cannot be reached is not up, whatever its
                 // last good frame still says.
-                let reachable = source.error().is_none();
                 (name.clone(), crabmon::serve::render_host(&snap, top, &states, reachable))
             })
             .collect();

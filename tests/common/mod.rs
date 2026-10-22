@@ -47,6 +47,7 @@ pub fn proc_row(pid: u32, ppid: Option<u32>, name: &str, cpu: f32, mem: u64) -> 
         uid: Some(1000),
         run_time: 100 + pid as u64,
         start_time_unix: 1_700_000_000 + pid as u64,
+        start_time_ticks: None,
         threads: Some(1),
         read_bps: 0.0,
         write_bps: 0.0,

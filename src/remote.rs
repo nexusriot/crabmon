@@ -13,7 +13,7 @@ use std::time::Duration;
 use crate::metrics::{MetricSource, Snapshot};
 
 /// What the far end runs when it is only asked for a single frame.
-pub const ONE_SHOT_COMMAND: &str = "crabmon --once --refresh 200";
+pub const ONE_SHOT_COMMAND: &str = "crabmon --once --refresh 200 --format json --top 0 --filter=''";
 
 /// How long a one-shot fetch may take before it is killed.
 ///

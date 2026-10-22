@@ -25,7 +25,7 @@ docs/
 completions/         bash, zsh and fish
 scripts/build.sh     the build driver; build-deb.sh is an alias CI still uses
 src/                 the library, plus a thin binary
-tests/               seven integration suites, one of them in a container
+tests/               eight integration suites, including local and container E2E
 ```
 
 The prose lives under `docs/` with the man page it duplicates, so the three
@@ -81,6 +81,7 @@ src/
     sockets.rs       /proc/net joined against a process's fd table
     fds.rs           open descriptors, their limit, and what they point at
     identity.rs      what a process is *now*, after an exec renamed it
+    control.rs       live identity validation and Linux pidfd signal delivery
     netns.rs         per-network-namespace traffic, i.e. per container
   ui/
     mod.rs           layout selection and the draw entry point
@@ -168,7 +169,11 @@ Two details matter:
 Sending a signal is two-step by construction: `SignalMenu` → `ConfirmKill`.
 Every action that targets a process — signal, renice and affinity alike —
 re-checks that the PID still has the start time it had when the prompt opened,
-so a recycled PID is refused rather than acted on.
+so a recycled PID is refused rather than acted on. Linux samples also carry
+the kernel start tick, distinguishing reuse within one Unix second. Controls
+validate live identity immediately before the OS call; signals use a pidfd
+so delivery remains tied to that incarnation. The other Linux controls still
+use PID-based syscalls, with a live recheck immediately before each call.
 
 That check only works because the target set is **frozen when the prompt opens**,
 in `pending_targets`. Rebuilding it at confirm time from the current rows would
@@ -432,9 +437,9 @@ terminal or a runaway process:
 
 ## Testing
 
-Over 750 tests: the in-crate unit tests plus seven integration suites. All are
-offline and deterministic except `proc_control`, which deliberately touches the
-kernel, and `e2e_docker`, which builds and runs a container:
+Over 750 tests: the in-crate unit tests plus eight integration suites. All are
+offline and deterministic except `proc_control` and `e2e_local`, which exercise
+the running machine, and `e2e_docker`, which builds and runs a container:
 
 - **unit tests** (`src/**`) — formatting, filter parsing, sorting, tree
   flattening, diskstats/cgroup/PSI/meminfo/`iostat`/`nvidia-smi`/`limits`
@@ -463,6 +468,11 @@ kernel, and `e2e_docker`, which builds and runs a container:
 - **`tests/proc_control.rs`** — renice, CPU affinity and signals against a real
   spawned child, checked by reading the state back from the kernel. A unit test
   can only prove the arguments were well-formed, not that they were accepted.
+- **`tests/e2e_local.rs`** — the binary on the current Linux host: complete
+  streaming with over 100 real child processes, fleet exporter freshness over
+  a controlled SSH transport, and replay in a pseudo-terminal with hook and
+  flight-recording side effects forbidden. Workloads and files are isolated
+  and cleaned up by the tests; Docker is not required.
 - **`tests/build_script.rs`** — the build tooling against itself: that every
   `make` target has a command behind it, that every command is reachable through
   make and described in the script's own help, and that the script runs, reports
