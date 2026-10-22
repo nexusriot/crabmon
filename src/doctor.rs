@@ -53,15 +53,22 @@ pub struct Check {
     pub detail: String,
     /// What to do about it, when there is something to do.
     pub remedy: String,
+    /// Whether the active config requires this check to be available.
+    pub required: bool,
 }
 
 impl Check {
     fn new(id: &'static str, status: Status, detail: impl Into<String>) -> Check {
-        Check { id, status, detail: detail.into(), remedy: String::new() }
+        Check { id, status, detail: detail.into(), remedy: String::new(), required: false }
     }
 
     fn with_remedy(mut self, remedy: impl Into<String>) -> Check {
         self.remedy = remedy.into();
+        self
+    }
+
+    fn with_required(mut self, required: bool) -> Check {
+        self.required = required;
         self
     }
 }
@@ -80,7 +87,7 @@ impl Report {
     /// because the column, the filters and the rules built on it will all
     /// quietly measure nothing.
     pub fn has_problems(&self) -> bool {
-        self.checks.iter().any(|c| c.status == Status::Unavailable && !c.remedy.is_empty())
+        self.checks.iter().any(|c| c.status == Status::Unavailable && c.required)
     }
 
     pub fn to_text(&self) -> String {
@@ -147,11 +154,11 @@ pub fn run(cfg: &crate::config::Config, path: &Path) -> Report {
         package_power(),
         cgroups(),
         gpu(cfg),
-        descriptors(cfg),
+        descriptors(cfg).with_required(cfg.procs.fds),
         proportional_memory(cfg),
         process_io(),
-        config_file(cfg, path),
-        alert_rules(cfg),
+        config_file(cfg, path).with_required(true),
+        alert_rules(cfg).with_required(true),
     ];
     Report { checks }
 }
@@ -474,19 +481,38 @@ mod tests {
     /// A limitation nobody asked about is not a problem; one that makes a
     /// setting in the config do nothing is.
     #[test]
-    fn only_a_limitation_with_a_remedy_counts_as_a_problem() {
+    fn only_an_unavailable_requirement_counts_as_a_problem() {
         let quiet = Report {
-            checks: vec![Check::new("gpu", Status::Unavailable, "no GPU on this machine")],
+            checks: vec![
+                Check::new("gpu", Status::Unavailable, "no GPU on this machine"),
+                Check::new("kernel-events", Status::Unavailable, "/dev/kmsg is unreadable")
+                    .with_remedy("run as root"),
+                Check::new("pressure", Status::Unavailable, "no pressure stall")
+                    .with_remedy("enable CONFIG_PSI"),
+                Check::new("pss", Status::Limited, "only our own processes report PSS")
+                    .with_required(true),
+            ],
         };
         assert!(!quiet.has_problems());
+        let json: serde_json::Value = serde_json::from_str(&quiet.to_json()).unwrap();
+        assert_eq!(json["problems"], false);
+        assert!(quiet.to_text().contains("run as root"));
 
         let loud = Report {
             checks: vec![
                 Check::new("fds", Status::Unavailable, "asked for, cannot be read")
-                    .with_remedy("run as root"),
+                    .with_required(true),
             ],
         };
         assert!(loud.has_problems());
+        let json: serde_json::Value = serde_json::from_str(&loud.to_json()).unwrap();
+        assert_eq!(json["problems"], true);
+    }
+
+    #[test]
+    fn optional_host_limitations_do_not_fail_the_default_config() {
+        let report = run(&Config::default(), Path::new("/nonexistent/crabmon.toml"));
+        assert!(!report.has_problems(), "{}", report.to_text());
     }
 
     /// The one that matters most: a rule naming something this host cannot

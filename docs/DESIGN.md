@@ -741,11 +741,13 @@ them once and says so.
 
 It is a *check*, not only a report: it exits 1 when something the config
 actually asks for cannot work here, and 0 otherwise. That distinction is the
-whole design. A missing GPU is a `Status::Unavailable` with no remedy and
-costs nothing; a `kind = "fd"` rule on a host whose fd tables are unreadable
-is an `Unavailable` *with* one, because that rule will never fire and a rule
-that never fires reads as a quiet machine. `Report::has_problems` is exactly
-"an unavailable check that carries a remedy".
+whole design. Missing optional capabilities such as a GPU, pressure stall
+data or kernel events cost nothing, even when the report offers a remedy.
+Checks for the config file, enabled fd sampling and alert rules are marked
+as required. `Report::has_problems` means an unavailable required check;
+diagnostic advice alone does not cause a failure. An alert rule that cannot
+measure anything still fails the check, because a rule that never fires
+reads as a quiet machine.
 
 ## Known limitations
 
