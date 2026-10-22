@@ -159,9 +159,16 @@ fn a_process_that_execs_is_reported_as_what_it_became() {
     };
     std::fs::copy(sleep, &victim).expect("copy sleep");
 
+    // The wrapper waits on its own stdin rather than on a clock. A `sleep 1`
+    // here made the test a race against the first sample: taking it walks
+    // every process on the machine, which on a loaded box is well over a
+    // second, so the exec had already happened and the run failed on the
+    // *setup* assertion below. Blocking on `read` hands the test the
+    // starting pistol — nothing execs until the pipe is closed.
     let mut child = Command::new("sh")
         .arg("-c")
-        .arg(format!("sleep 1; exec {} 30", victim.display()))
+        .arg(format!("read -r _gate; exec '{}' 30", victim.display()))
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -178,6 +185,9 @@ fn a_process_that_execs_is_reported_as_what_it_became() {
     let first = source.snapshot(Duration::ZERO);
     let (before, _) = name_of(&first).expect("the wrapper should be in the first snapshot");
     assert_eq!(before, "sh", "the wrapper should still be a shell at this point");
+
+    // Now let it go: closing stdin ends the `read` and the shell execs.
+    drop(child.stdin.take());
 
     // Poll the *same* source — a fresh one would read the process for the
     // first time and get the right answer however stale the cache is.

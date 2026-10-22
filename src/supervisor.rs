@@ -16,7 +16,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::alerts::{ActiveAlert, AlertEngine};
+use crate::alerts::{ActiveAlert, AlertEngine, HookCall};
 use crate::config::Config;
 use crate::metrics::Snapshot;
 use crate::record::FlightRecorder;
@@ -76,9 +76,10 @@ pub struct Observation {
     /// Rules over threshold and past their hold time, for the status line or
     /// the exporter.
     pub active: Vec<ActiveAlert>,
-    /// Hook commands to run, in the order the rules fired. Returned rather
-    /// than spawned so that what a rule *would* do is assertable.
-    pub commands: Vec<String>,
+    /// Hooks to run, in the order the rules fired, each carrying what it
+    /// should be told. Returned rather than spawned so that what a rule
+    /// *would* do is assertable.
+    pub commands: Vec<HookCall>,
     /// Lines worth telling the user: a recording started, a recording
     /// finished, a recording that could not be written.
     pub notes: Vec<String>,
@@ -118,9 +119,44 @@ pub fn observe_with_label(
     label: &str,
 ) -> Observation {
     let active = engine.evaluate(snap, now_secs);
-    let notes = drain_named(engine, flight, snap, &active, label);
-    let commands = engine.take_commands();
-    Observation { active, commands, notes }
+    let drained = drain_named(engine, flight, snap, &active, label);
+    let mut commands = engine.take_commands();
+    attach_context(&mut commands, &drained.dumps, label, snap);
+    Observation { active, commands, notes: drained.notes }
+}
+
+/// Fill in the parts of a hook's context that the engine cannot know: which
+/// machine the rule was about, and which recording this pass opened for it.
+///
+/// Done here rather than in the engine because the engine evaluates rules and
+/// has never known where it is running or what the recorder did afterwards —
+/// the flight dump does not exist until `drain` has written it.
+pub fn attach_context(
+    commands: &mut [HookCall],
+    dumps: &[(String, PathBuf)],
+    label: &str,
+    snap: &Snapshot,
+) {
+    for call in commands.iter_mut() {
+        call.host = match label.is_empty() {
+            false => label.to_string(),
+            true => snap.host.hostname.clone(),
+        };
+        if let Some((_, path)) = dumps.iter().find(|(rule, _)| *rule == call.rule) {
+            call.dump = path.display().to_string();
+            call.summary = crate::incident::path_for(path).display().to_string();
+        }
+    }
+}
+
+/// What a drain produced.
+#[derive(Debug, Default, PartialEq)]
+pub struct Drained {
+    /// Lines worth telling the user.
+    pub notes: Vec<String>,
+    /// The recording each rule opened on this pass, so the hook about to run
+    /// can be told where the evidence is.
+    pub dumps: Vec<(String, PathBuf)>,
 }
 
 /// The side-effect half on its own: offer the frame to the recorder, then open
@@ -135,7 +171,7 @@ pub fn drain(
     engine: &mut AlertEngine,
     flight: Option<&mut FlightRecorder>,
     snap: &Snapshot,
-) -> Vec<String> {
+) -> Drained {
     drain_with_alerts(engine, flight, snap, &[])
 }
 
@@ -146,7 +182,7 @@ pub fn drain_with_alerts(
     flight: Option<&mut FlightRecorder>,
     snap: &Snapshot,
     active: &[ActiveAlert],
-) -> Vec<String> {
+) -> Drained {
     drain_named(engine, flight, snap, active, "")
 }
 
@@ -157,13 +193,14 @@ pub fn drain_named(
     snap: &Snapshot,
     active: &[ActiveAlert],
     label: &str,
-) -> Vec<String> {
-    let mut notes = Vec::new();
+) -> Drained {
+    let mut out = Drained::default();
+    let notes = &mut out.notes;
     let Some(flight) = flight else {
         // Nothing is listening for them, and leaving them to accumulate would
         // dump an hour of backlog into the first recorder that ever asks.
         engine.take_fired();
-        return notes;
+        return out;
     };
     if let Some(path) = flight.push(snap) {
         notes.push(format!("flight recording written to {}", path.display()));
@@ -177,20 +214,23 @@ pub fn drain_named(
         match flight.trigger_with_summary(&dump_name, snap.taken_at_unix, alert, snap) {
             // `None` means a dump was already running and has been extended,
             // which needs no second announcement.
-            Ok(Some(path)) => notes.push(format!(
-                "{name}: recording {} frames to {} (+ {})",
-                flight.buffered(),
-                path.display(),
-                crate::incident::path_for(&path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default()
-            )),
+            Ok(Some(path)) => {
+                notes.push(format!(
+                    "{name}: recording {} frames to {} (+ {})",
+                    flight.buffered(),
+                    path.display(),
+                    crate::incident::path_for(&path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                ));
+                out.dumps.push((name.clone(), path));
+            }
             Ok(None) => {}
             Err(e) => notes.push(format!("flight recording failed: {e}")),
         }
     }
-    notes
+    out
 }
 
 /// Alert rules plus a flight recorder, for the modes with no `App` to hang
@@ -262,6 +302,12 @@ impl Supervisor {
             for alert in obs.active.iter_mut() {
                 alert.message = format!("{}: {}", self.label, alert.message);
             }
+            // The same line the fleet view shows. `CRABMON_HOST` carries the
+            // machine on its own, but a hook that echoes `CRABMON_MESSAGE`
+            // into a chat channel should say what the screen says.
+            for call in obs.commands.iter_mut() {
+                call.message = format!("{}: {}", self.label, call.message);
+            }
         }
         obs
     }
@@ -305,13 +351,14 @@ pub fn pending_hook_count() -> usize {
 /// blocks the sampler or scribbles on a full-screen interface is worse than no
 /// hook at all. It is still *reaped*, lazily, so a finished hook does not stay
 /// in the process table as a zombie.
-pub fn spawn_hooks(commands: &[String]) -> Vec<String> {
+pub fn spawn_hooks(commands: &[HookCall]) -> Vec<String> {
     reap_hooks();
     let mut errors = Vec::new();
-    for cmd in commands {
+    for call in commands {
         match std::process::Command::new("sh")
             .arg("-c")
-            .arg(cmd)
+            .arg(&call.command)
+            .envs(call.env())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -332,6 +379,11 @@ pub fn spawn_hooks(commands: &[String]) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::alerts::{AlertKind, AlertRule};
+
+    /// The command lines an observation wants run.
+    fn ran(obs: &Observation) -> Vec<&str> {
+        obs.commands.iter().map(|c| c.command.as_str()).collect()
+    }
     use crate::metrics::CpuSample;
 
     fn rule(name: &str, threshold: f64, for_secs: u64, command: &str) -> AlertRule {
@@ -371,7 +423,7 @@ mod tests {
 
         let fired = sup.observe(&cpu(95.0));
         assert_eq!(fired.active.len(), 1);
-        assert_eq!(fired.commands, vec!["page-someone"]);
+        assert_eq!(ran(&fired), vec!["page-someone"]);
         assert!(fired.active[0].message.contains("hot"), "{:?}", fired.active[0]);
     }
 
@@ -380,7 +432,7 @@ mod tests {
         // A rule that held for an hour used to re-spawn its hook on every
         // refresh if its state was ever cleared from under it.
         let mut sup = Supervisor::new(&cfg_with(vec![rule("hot", 90.0, 0, "page")]));
-        assert_eq!(sup.observe(&cpu(95.0)).commands, vec!["page"]);
+        assert_eq!(ran(&sup.observe(&cpu(95.0))), vec!["page"]);
         for _ in 0..5 {
             assert!(sup.observe(&cpu(95.0)).commands.is_empty(), "the hook ran twice");
         }
@@ -392,9 +444,9 @@ mod tests {
         r.command_clear = "all-clear".into();
         let mut sup = Supervisor::new(&cfg_with(vec![r]));
 
-        assert_eq!(sup.observe(&cpu(95.0)).commands, vec!["page"]);
+        assert_eq!(ran(&sup.observe(&cpu(95.0))), vec!["page"]);
         let recovered = sup.observe(&cpu(1.0));
-        assert_eq!(recovered.commands, vec!["all-clear"]);
+        assert_eq!(ran(&recovered), vec!["all-clear"]);
         assert!(recovered.active.is_empty());
     }
 
@@ -489,7 +541,7 @@ mod tests {
     /// defunct `sh` per crossing behind it.
     #[test]
     fn finished_hooks_are_reaped_rather_than_left_as_zombies() {
-        assert!(spawn_hooks(&["true".to_string()]).is_empty());
+        assert!(spawn_hooks(&[HookCall::bare("true")]).is_empty());
         // The child needs a moment to exit; `try_wait` never blocks.
         for _ in 0..200 {
             reap_hooks();
@@ -501,11 +553,109 @@ mod tests {
         panic!("the hook was never reaped");
     }
 
+    /// The whole point of the context: one generic script, told what fired.
+    ///
+    /// The variables themselves are asserted here, on every platform, because
+    /// they are the contract. Actually spawning a shell to read them back is
+    /// the test below, which is Unix-only — a hook *is* `sh -c`, and a
+    /// Windows path handed to Git Bash loses its backslashes.
+    #[test]
+    fn a_hook_is_told_what_fired() {
+        let mut sup =
+            Supervisor::new(&cfg_with(vec![rule("hot", 90.0, 0, "page-oncall")])).for_host("web-1");
+        let fired = sup.observe(&cpu(95.0));
+        assert_eq!(fired.commands.len(), 1);
+
+        // Every variable is set, even the ones that do not apply here, so a
+        // hook written with `set -u` does not have to guess.
+        let env = fired.commands[0].env();
+        let names: Vec<&str> = env.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, crate::alerts::HOOK_VARS, "the documented set is the real one");
+        let value =
+            |name: &str| env.iter().find(|(n, _)| *n == name).map(|(_, v)| v.clone()).unwrap();
+        assert_eq!(value("CRABMON_RULE"), "hot");
+        assert_eq!(value("CRABMON_KIND"), "cpu");
+        assert_eq!(value("CRABMON_STATE"), "firing");
+        assert_eq!(value("CRABMON_HOST"), "web-1", "a page must say which machine");
+        assert!(value("CRABMON_MESSAGE").contains("web-1"), "{}", value("CRABMON_MESSAGE"));
+        assert_eq!(value("CRABMON_AT"), "1700000000");
+        assert!(value("CRABMON_VALUE").starts_with("95"), "{}", value("CRABMON_VALUE"));
+        // The command itself is untouched: the context is beside it, not in it.
+        assert_eq!(fired.commands[0].command, "page-oncall");
+    }
+
+    /// ...and the shell really does receive them.
+    ///
+    /// Unix-only: `spawn_hooks` runs `sh -c`, and writing the path of a
+    /// scratch file into that command is not portable to the `sh` that
+    /// happens to be on a Windows runner's PATH.
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_is_handed_its_context_by_the_shell() {
+        let dir = std::env::temp_dir().join(format!("crabmon-hookenv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("seen");
+
+        let mut sup = Supervisor::new(&cfg_with(vec![rule(
+            "hot",
+            90.0,
+            0,
+            &format!(
+                "printf '%s|%s|%s|%s|%s\\n' \"$CRABMON_RULE\" \"$CRABMON_KIND\" \
+             \"$CRABMON_STATE\" \"$CRABMON_VALUE\" \"$CRABMON_HOST\" > {}",
+                out.display()
+            ),
+        )]))
+        .for_host("web-1");
+        let fired = sup.observe(&cpu(95.0));
+        assert!(spawn_hooks(&fired.commands).is_empty());
+
+        // Generous: a loaded CI runner can take a while to start a shell, and
+        // the cost of waiting is nothing next to a test that fails for it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !out.exists() && std::time::Instant::now() < deadline {
+            reap_hooks();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let seen = std::fs::read_to_string(&out).expect("the hook never ran");
+        let fields: Vec<&str> = seen.trim().split('|').collect();
+        assert_eq!(fields[0], "hot", "{seen}");
+        assert_eq!(fields[1], "cpu", "{seen}");
+        assert_eq!(fields[2], "firing", "{seen}");
+        assert!(fields[3].starts_with("95"), "{seen}");
+        assert_eq!(fields[4], "web-1", "{seen}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ...and the recovery hook says it is the same rule, going the other way.
+    #[test]
+    fn a_recovery_hook_is_told_it_is_a_recovery() {
+        let mut r = rule("hot", 90.0, 0, "page");
+        r.command_clear = "all-clear".into();
+        let mut sup = Supervisor::new(&cfg_with(vec![r]));
+
+        let fired = sup.observe(&cpu(95.0));
+        assert!(fired.commands[0].firing);
+        let recovered = sup.observe(&cpu(1.0));
+        assert_eq!(recovered.commands.len(), 1);
+        let call = &recovered.commands[0];
+        assert!(!call.firing);
+        assert_eq!(call.rule, "hot", "the recovery must name the rule it is for");
+        assert_eq!(call.threshold, 90.0);
+        assert!(call.value < 90.0);
+        let env = call.env();
+        let state = env.iter().find(|(n, _)| *n == "CRABMON_STATE").unwrap();
+        assert_eq!(state.1, "cleared");
+        assert!(call.message.contains("recovered"), "{}", call.message);
+    }
+
     #[test]
     fn a_hook_that_cannot_be_started_is_reported_rather_than_lost() {
         // `sh -c` makes almost anything startable, so this is about the
         // return shape: a command that runs reports nothing.
-        assert!(spawn_hooks(&["true".to_string()]).is_empty());
+        assert!(spawn_hooks(&[HookCall::bare("true")]).is_empty());
         assert!(spawn_hooks(&[]).is_empty());
     }
 
@@ -567,6 +717,9 @@ mod freshness_tests {
         assert!(engine.evaluate(&snap, 9).is_empty());
         gate.update(&snap, Some(4), true, start + Duration::from_secs(11), Some(&mut engine));
         assert_eq!(engine.evaluate(&snap, 11).len(), 1);
-        assert_eq!(engine.take_commands(), vec!["page"]);
+        assert_eq!(
+            engine.take_commands().iter().map(|c| c.command.as_str()).collect::<Vec<_>>(),
+            vec!["page"]
+        );
     }
 }

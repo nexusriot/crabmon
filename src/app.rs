@@ -1762,9 +1762,15 @@ impl App {
         // lets the summary beside a dump say what tripped it, exactly as the
         // headless path does.
         let active = self.active_alerts.clone();
-        let mut notes =
+        let drained =
             crate::supervisor::drain_with_alerts(&mut self.alerts, flight, &self.snap, &active);
-        notes.extend(crate::supervisor::spawn_hooks(&self.alerts.take_commands()));
+        let mut notes = drained.notes;
+        // The host a hook is told about is the one whose rows are on screen.
+        // Under a fleet that is the selected target, not this machine.
+        let label = self.fleet_target().unwrap_or_default();
+        let mut commands = self.alerts.take_commands();
+        crate::supervisor::attach_context(&mut commands, &drained.dumps, &label, &self.snap);
+        notes.extend(crate::supervisor::spawn_hooks(&commands));
         notes
     }
 

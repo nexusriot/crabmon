@@ -234,32 +234,226 @@ fn stream_emits_one_parseable_snapshot_per_line() {
 /// The exact pacing is pinned by the `Pacer` unit tests, which run on a fixed
 /// timeline. This is the end-to-end half: that the binary really does stream
 /// on the cadence it was asked for rather than drifting a sample behind on
-/// every frame. The margin is deliberately wide — how much the old bug cost
-/// depended entirely on how expensive a sample was on the machine running it,
-/// which on an idle developer box is around a tenth of an interval and on a
-/// 2000-process host is more than one.
+/// every frame.
+///
+/// The bound cannot be a fixed multiple of the interval. `Pacer` runs as fast
+/// as it can when a sample costs more than the interval it was given, so the
+/// honest expectation is `max(interval, sample_cost)` — and on a loaded
+/// machine with a few thousand tasks a sample costs more than the 300 ms this
+/// used to ask for, which failed the run for being *correct*. (Caught exactly
+/// that way: at load 8 the frames averaged 1.17 s apart.)
+///
+/// So the cost is measured rather than assumed. A stream at the refresh floor
+/// is paced by whichever of the two is larger, so its mean gap is an upper
+/// bound on what one sample costs on this machine right now. The bug — which
+/// adds the cost to the interval on *every* frame rather than overlapping it
+/// — is still caught wherever it was ever visible, because that is precisely
+/// where the cost is a sizeable fraction of the interval.
 #[test]
 fn stream_keeps_to_the_interval_it_was_asked_for() {
-    let refresh = Duration::from_millis(300);
-    let (text, at) = stream_lines(&["--stream", "--refresh", "300"], 6, Duration::from_secs(30));
-    assert_eq!(at.len(), 6, "only {} frames arrived:\n{text}", at.len());
-
     // First to last rather than a mean of the gaps: these are the times this
     // process *read* each line, and a test thread that loses the CPU for a
     // moment reads several at once, which makes individual gaps meaningless
     // while leaving the span across all of them intact. The first gap also
     // carries the cold-cache cost of the opening samples — one
     // `/proc/<pid>/cgroup` read per process — so it is skipped.
-    let span = at[at.len() - 1] - at[1];
-    let mean = span / (at.len() - 2) as u32;
-    // Only an upper bound. Being slower than asked is the bug; being read
-    // later than a frame arrived is the measurement, and both push this the
-    // same way, so the margin is wide. The exact pacing is the `Pacer` unit
-    // tests' job, on a timeline that cannot drift.
+    let mean_gap = |at: &[Instant]| (at[at.len() - 1] - at[1]) / (at.len() - 2) as u32;
+
+    let floor = Duration::from_millis(crabmon::MIN_REFRESH_MS);
+    let (floor_text, floor_at) =
+        stream_lines(&["--stream", "--refresh", "200"], 5, Duration::from_secs(30));
+    assert_eq!(floor_at.len(), 5, "only {} frames arrived:\n{floor_text}", floor_at.len());
+    let cost = mean_gap(&floor_at).max(floor);
+
+    let refresh = Duration::from_millis(1000);
+    let (text, at) = stream_lines(&["--stream", "--refresh", "1000"], 5, Duration::from_secs(30));
+    assert_eq!(at.len(), 5, "only {} frames arrived:\n{text}", at.len());
+    let mean = mean_gap(&at);
+
+    // Half an interval of slack for scheduling and for reading a line late:
+    // both push this the same way, and the exact pacing is the `Pacer` unit
+    // tests' job on a timeline that cannot drift.
+    let bound = refresh.max(cost) + refresh / 2;
     assert!(
-        mean < refresh * 2,
-        "frames averaged {mean:?} apart for a {refresh:?} refresh:\n{text}"
+        mean < bound,
+        "frames averaged {mean:?} apart for a {refresh:?} refresh, \
+         against a {bound:?} bound (a sample costs about {cost:?} here):\n{text}"
     );
+}
+
+/// `--doctor` answers the question every empty panel raises — "is that
+/// nothing, or is it something I am not allowed to see?" — in one place, and
+/// exits non-zero when the config asks for something this host cannot do.
+#[test]
+fn doctor_reports_what_this_host_lets_crabmon_measure() {
+    let out = crabmon(&["--doctor"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    for id in ["platform", "privileges", "config", "alert-rules"] {
+        assert!(text.contains(id), "the report omits {id}:\n{text}");
+    }
+    // Every line is marked, so the shape is greppable.
+    for line in text.lines().filter(|l| !l.trim_start().starts_with('→')) {
+        assert!(line.starts_with(['+', '~', '-']), "a line with no status marker: {line:?}");
+    }
+
+    let out = crabmon(&["--doctor", "--format", "json"]);
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("--doctor --format json must be JSON");
+    let checks = v["checks"].as_array().expect("checks");
+    assert!(checks.len() >= 10, "only {} checks", checks.len());
+    for c in checks {
+        assert!(c["id"].is_string());
+        assert!(["ok", "limited", "unavailable"].contains(&c["status"].as_str().unwrap()), "{c:?}");
+    }
+}
+
+/// The report must be about the config actually in force. It used to read
+/// the default path whatever `--config` said, so a pre-deploy check reported
+/// on the operator's own file rather than the one being deployed.
+#[test]
+fn doctor_reports_on_the_config_that_is_actually_in_force() {
+    let dir = scratch("doctor-path");
+    let cfg = dir.join("named.toml");
+    std::fs::write(&cfg, "refresh_ms = 800\n").unwrap();
+
+    let out = crabmon(&["--config", cfg.to_str().unwrap(), "--doctor"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().find(|l| l.contains("config ")).expect("a config line");
+    assert!(line.contains("named.toml"), "it named another file: {line}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ...and it is a check, not just a report: a config naming something that
+/// cannot work here exits non-zero so a deploy can refuse it.
+#[test]
+fn doctor_exits_non_zero_when_the_config_asks_for_the_impossible() {
+    let dir = scratch("doctor");
+    let cfg = dir.join("crabmon.toml");
+    // A rule over descriptors with the sampling it needs switched off: it can
+    // never fire, and a rule that never fires reads as a quiet machine.
+    std::fs::write(
+        &cfg,
+        "[procs]\nfds = false\n\n[[alert]]\nname = \"descriptors-high\"\nkind = \"fd\"\nthreshold = 90.0\n",
+    )
+    .unwrap();
+
+    let out = crabmon(&["--config", cfg.to_str().unwrap(), "--doctor"]);
+    assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stdout));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("descriptors-high"), "it did not name the rule:\n{text}");
+
+    // ...and a config that asks for nothing impossible is fine.
+    std::fs::write(&cfg, "refresh_ms = 800\n").unwrap();
+    let out = crabmon(&["--config", cfg.to_str().unwrap(), "--doctor"]);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stdout));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A scratch directory of this test's own, cleaned up afterwards.
+fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("crabmon-cli-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    dir
+}
+
+/// Recording used to need a terminal in front of it: `--record` was driven by
+/// the interface's event loop, so every headless mode wrote nothing. That made
+/// the always-on recorder — the whole point of `--record-rotate` — impossible
+/// to deploy under systemd, which is the one place it belongs.
+#[test]
+fn stream_records_the_frames_it_prints() {
+    let dir = scratch("stream-record");
+    let path = dir.join("run.jsonl");
+
+    let (text, at) = stream_lines(
+        &["--stream", "--refresh", "200", "--record", path.to_str().unwrap()],
+        5,
+        Duration::from_secs(30),
+    );
+    assert_eq!(at.len(), 5, "only {} frames arrived:\n{text}", at.len());
+
+    // Flushed per frame, so the file is complete even though the process was
+    // killed rather than asked to stop.
+    let body = std::fs::read_to_string(&path).expect("the recording must exist");
+    let frames = crabmon::record::parse_jsonl(&body).expect("every recorded line must parse");
+    assert!(frames.len() >= 3, "only {} frames reached the recording", frames.len());
+    assert!(frames.iter().all(|f| f.taken_at_unix > 0), "a recorded frame has no timestamp");
+    assert!(
+        frames.iter().any(|f| !f.procs.is_empty()),
+        "a recording with no processes in it is not evidence of anything"
+    );
+
+    // The frame on stdout keeps the full inventory a collector needs; the one
+    // on disk is trimmed by `[record]`, which is what stops an always-on
+    // recorder filling the disk.
+    let streamed: Vec<crabmon::Snapshot> = crabmon::record::parse_jsonl(&text).expect("stdout");
+    let widest_streamed = streamed.iter().map(|f| f.procs.len()).max().unwrap_or(0);
+    let widest_recorded = frames.iter().map(|f| f.procs.len()).max().unwrap_or(0);
+    assert!(
+        widest_recorded <= widest_streamed,
+        "the recording ({widest_recorded}) carries more than the stream ({widest_streamed})"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--watch` is the mode that is *waiting* for something to go wrong, so the
+/// run-up it records is the evidence the condition exists to collect.
+#[test]
+fn a_watch_leaves_a_rotating_recording_of_the_run_up() {
+    let dir = scratch("watch-rotate");
+
+    let out = crabmon(&[
+        "--watch",
+        "name:definitely-no-such-process-exists",
+        "--watch-timeout",
+        "2",
+        "--refresh",
+        "200",
+        "--record-rotate",
+        dir.to_str().unwrap(),
+    ]);
+    // Nothing matched, so the watch exits 0 — and still leaves the recording.
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("rotating recording in"), "it never said where: {err}");
+
+    let segments: Vec<_> = std::fs::read_dir(&dir)
+        .expect("the rotation directory")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| crabmon::record::is_segment_name(n))
+        .collect();
+    assert!(!segments.is_empty(), "a watch wrote no segments: {segments:?}");
+
+    let frames: usize = segments
+        .iter()
+        .map(|n| std::fs::read_to_string(dir.join(n)).expect("segment"))
+        .map(|body| crabmon::record::parse_jsonl(&body).expect("every line parses").len())
+        .sum();
+    // Two, not "about as many as the interval predicts": how fast a machine
+    // samples is the pacing test's subject, and tying this to it would make
+    // a slow CI runner fail a test about whether recording happens at all.
+    assert!(frames >= 2, "a watch recorded only {frames} frames");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ...and the modes that take exactly one sample still refuse, because there
+/// is no sequence for a recording to be of.
+#[test]
+fn the_single_sample_modes_refuse_a_recording_flag() {
+    // A name of this test's own, so the "it wrote nothing" assertion cannot
+    // be satisfied or defeated by anything else in the working directory.
+    let name = format!("crabmon-refused-{}.jsonl", std::process::id());
+    let out = crabmon(&["--once", "--record", &name]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("needs a sequence of samples"), "{err}");
+    assert!(!std::path::Path::new(&name).exists(), "it wrote the file anyway");
 }
 
 #[test]

@@ -88,6 +88,173 @@ impl Recorder {
     }
 }
 
+/// Every recording a run keeps going at once: the explicit `--record` file
+/// and the rotating set from `--record-rotate` or `[record] rotate_frames`.
+///
+/// Resolving "what the flags and the config between them asked for" lives
+/// here rather than in each mode because there are four of them now — the
+/// interface, `--stream`, `--serve` and `--watch` — and the fallback chain
+/// for the rotation directory alone is three deep. That is exactly the sort
+/// of thing that ends up right in one copy and wrong in the other three.
+pub struct Recordings {
+    plain: Option<Recorder>,
+    rotating: Option<RotatingRecorder>,
+    rotate_dir: PathBuf,
+    /// Whether each writer's last attempt failed, so a failure is reported
+    /// once rather than once a frame. A read-only directory or a full disk
+    /// does not get better by itself, and `--serve` would otherwise write a
+    /// line per scrape for as long as it runs.
+    plain_failing: bool,
+    rotating_failing: bool,
+}
+
+impl Recordings {
+    /// `record` and `rotate` are the two flags; everything else comes from
+    /// `[record]`. Fails only when an explicit `--record` path cannot be
+    /// opened — that one was asked for by name, so silently not writing it is
+    /// the failure this whole type exists to avoid.
+    pub fn open(
+        record: Option<&str>,
+        rotate: Option<&str>,
+        cfg: &crate::config::RecordConfig,
+    ) -> Result<Recordings, String> {
+        Recordings::for_host(record, rotate, cfg, "")
+    }
+
+    /// As `open`, for one host of a fleet.
+    ///
+    /// A fleet has a timeline per host and the flags name one place, so each
+    /// host gets its own file: `run.jsonl` becomes `run-web-1.jsonl`, and a
+    /// rotating set gets the host in its segment names. Without that the
+    /// hosts would interleave into one recording that replays as a single
+    /// machine behaving impossibly.
+    pub fn for_host(
+        record: Option<&str>,
+        rotate: Option<&str>,
+        cfg: &crate::config::RecordConfig,
+        label: &str,
+    ) -> Result<Recordings, String> {
+        let plain = match record {
+            Some(path) => {
+                let path = per_host_path(Path::new(path), label);
+                Some(
+                    Recorder::create(&path)
+                        .map_err(|e| format!("cannot record to {}: {e}", path.display()))?
+                        .with_limits(cfg.top_n, cfg.omit_paths, cfg.max_cmd_len),
+                )
+            }
+            None => None,
+        };
+        let rotate_dir = PathBuf::from(match rotate {
+            Some(dir) => dir,
+            None if !cfg.rotate_dir.is_empty() => &cfg.rotate_dir,
+            None if !cfg.flight_dir.is_empty() => &cfg.flight_dir,
+            None => ".",
+        });
+        // The flag turns rotation on by itself: someone who passed it meant
+        // it, even with nothing in the config.
+        let per_segment = match (rotate.is_some(), cfg.rotate_frames) {
+            (true, 0) => DEFAULT_ROTATE_FRAMES,
+            (_, n) => n,
+        };
+        // A host gets a directory of its own rather than a name of its own.
+        // Segments are `crabmon-<unix>.jsonl` and a flight dump is
+        // `crabmon-<rule>-<unix>.jsonl`, so putting the host in the name
+        // would make a three-host fleet's segments indistinguishable from
+        // dumps — and `rotate_dir` defaults to `flight_dir`, so rotation
+        // would then prune the evidence it sits next to.
+        let rotate_dir = match sanitise_label(label) {
+            l if l.is_empty() => rotate_dir,
+            l => rotate_dir.join(l),
+        };
+        let rotating =
+            RotatingRecorder::new(&rotate_dir, per_segment, cfg.rotate_keep, cfg.limits());
+        Ok(Recordings {
+            plain,
+            rotating,
+            rotate_dir,
+            plain_failing: false,
+            rotating_failing: false,
+        })
+    }
+
+    /// Nothing is being written, so a caller need not thread this through.
+    pub fn is_empty(&self) -> bool {
+        self.plain.is_none() && self.rotating.is_none()
+    }
+
+    /// What to say at startup about what is being written and where.
+    pub fn notices(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(rec) = &self.plain {
+            out.push(format!("recording to {}", rec.path().display()));
+        }
+        if self.rotating.is_some() {
+            out.push(format!("rotating recording in {}", self.rotate_dir.display()));
+        }
+        out
+    }
+
+    /// Offer one frame to every recording, returning whatever went wrong.
+    ///
+    /// A recording that cannot be written must not take down the mode writing
+    /// it: a full disk under `--serve` would otherwise stop the exporter
+    /// answering, which is a worse outcome than a gap in a recording.
+    pub fn write(&mut self, snap: &Snapshot) -> Vec<String> {
+        let mut errors = Vec::new();
+        // Reported on the way into failure and on the way out of it, not once
+        // a frame: a read-only directory or a full disk does not get better by
+        // itself, and `--serve` would otherwise write an identical line per
+        // scrape for as long as it ran. The same shape as an alert, which
+        // fires on the crossing rather than on every sample over the line.
+        if let Some(rec) = self.plain.as_mut() {
+            match (rec.write(snap), self.plain_failing) {
+                (Err(e), false) => {
+                    errors.push(format!("recording failed: {e}"));
+                    self.plain_failing = true;
+                }
+                (Err(_), true) => {}
+                (Ok(()), true) => {
+                    errors.push("recording resumed".to_string());
+                    self.plain_failing = false;
+                }
+                (Ok(()), false) => {}
+            }
+        }
+        if let Some(rec) = self.rotating.as_mut() {
+            match (rec.write(snap, snap.taken_at_unix), self.rotating_failing) {
+                (Err(e), false) => {
+                    errors.push(format!("rotating recording failed: {e}"));
+                    self.rotating_failing = true;
+                }
+                (Err(_), true) => {}
+                (Ok(()), true) => {
+                    errors.push("rotating recording resumed".to_string());
+                    self.rotating_failing = false;
+                }
+                (Ok(()), false) => {}
+            }
+        }
+        errors
+    }
+
+    /// What to say on the way out, for the modes that have a way out.
+    pub fn summary(&self) -> Option<String> {
+        let rec = self.plain.as_ref()?;
+        Some(format!("wrote {} frames to {}", rec.frames(), rec.path().display()))
+    }
+
+    /// Frames written to the explicit `--record` file, for tests.
+    pub fn frames(&self) -> usize {
+        self.plain.as_ref().map(|r| r.frames()).unwrap_or(0)
+    }
+
+    /// The rotating set's segments so far, for tests.
+    pub fn segments(&self) -> &[PathBuf] {
+        self.rotating.as_ref().map(|r| r.segments()).unwrap_or(&[])
+    }
+}
+
 /// How a frame budget is spelled everywhere a recording is written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
@@ -135,6 +302,67 @@ pub const DEFAULT_ROTATE_FRAMES: usize = 1800;
 /// at one and the set can be found again on the next run.
 pub fn segment_name(at_unix: u64) -> String {
     format!("crabmon-{at_unix}.jsonl")
+}
+
+/// `run.jsonl` for one host, `run-web-1.jsonl` for another.
+///
+/// The suffix goes before the extension rather than after it so the file is
+/// still obviously a recording, and `--replay run-web-1.jsonl` still works.
+pub fn per_host_path(path: &Path, label: &str) -> PathBuf {
+    let label = sanitise_label(label);
+    if label.is_empty() {
+        return path.to_path_buf();
+    }
+    let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let name = match path.extension() {
+        Some(ext) => format!("{stem}-{label}.{}", ext.to_string_lossy()),
+        None => format!("{stem}-{label}"),
+    };
+    path.with_file_name(name)
+}
+
+/// Filesystem-safe names for a fleet's targets, each distinct from the rest.
+///
+/// `sanitise_label` reduces one target to something a filesystem will take,
+/// and it reduces more than one target to the same thing: `deploy@db-2` and
+/// `deploy-db-2` both become `deploy-db-2`, and a target with no usable
+/// character left — `@@@` — becomes nothing at all. Both are quiet disasters
+/// for a recording. Two hosts that share a name share a directory, and a
+/// recorder truncates what it opens, so the second host destroys the first
+/// one's segments; a host with no name falls back to the unlabelled path and
+/// writes among the flight dumps, where rotation will prune them.
+///
+/// Uniqueness cannot be decided one target at a time, so it is decided here,
+/// where the whole list is known. A name already free is kept exactly as it
+/// is, so an ordinary fleet gets the directory names its operator expects.
+pub fn unique_labels(targets: &[String]) -> Vec<String> {
+    let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(targets.len());
+    for (i, target) in targets.iter().enumerate() {
+        let base = match sanitise_label(target) {
+            l if l.is_empty() => format!("host-{}", i + 1),
+            l => l,
+        };
+        let mut name = base.clone();
+        let mut n = 2;
+        while !taken.insert(name.clone()) {
+            name = format!("{base}-{n}");
+            n += 1;
+        }
+        out.push(name);
+    }
+    out
+}
+
+/// A host name reduced to something a filesystem will take, the way
+/// `dump_name` reduces a rule's. A target is whatever the user wrote:
+/// `deploy@db-2`, `[2001:db8::1]:22`.
+pub fn sanitise_label(label: &str) -> String {
+    let safe: String = label
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    safe.trim_matches('-').to_string()
 }
 
 /// Whether a filename is one of ours, so rotation deletes its own files and
@@ -1093,6 +1321,106 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Three hosts, one base directory: each must get a timeline of its own.
+    ///
+    /// A directory per host rather than a name per host, because a segment is
+    /// `crabmon-<unix>.jsonl` and a flight dump is `crabmon-<rule>-<unix>.jsonl`
+    /// — putting the host in the name would make the two indistinguishable,
+    /// and `rotate_dir` defaults to `flight_dir`, so rotation would prune the
+    /// evidence it sits beside.
+    #[test]
+    fn a_fleet_records_a_timeline_per_host_without_touching_the_dumps() {
+        use crate::config::RecordConfig;
+
+        let dir = std::env::temp_dir().join(format!("crabmon-fleet-rot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A flight dump already sitting where the segments will go.
+        let dump = dir.join(dump_name("cpu-saturated", 1_700_000_000));
+        std::fs::write(&dump, "{}\n").unwrap();
+
+        let cfg = RecordConfig { rotate_frames: 2, rotate_keep: 3, ..RecordConfig::default() };
+        let hosts = ["web-1", "db-2", "deploy@cache-3"];
+        let mut recs: Vec<_> = hosts
+            .iter()
+            .map(|h| {
+                Recordings::for_host(None, Some(dir.to_str().unwrap()), &cfg, h).expect("open")
+            })
+            .collect();
+        for i in 0..12u64 {
+            let mut f = frame(i as u32);
+            f.taken_at_unix = 1_700_000_000 + i;
+            for rec in recs.iter_mut() {
+                assert!(rec.write(&f).is_empty());
+            }
+        }
+
+        for (rec, host) in recs.iter().zip(hosts) {
+            assert_eq!(rec.segments().len(), 3, "{host} kept the wrong number");
+            let host_dir = dir.join(sanitise_label(host));
+            assert!(host_dir.is_dir(), "{host} got no directory of its own");
+            for seg in rec.segments() {
+                assert!(seg.exists(), "{seg:?} was deleted by another host's rotation");
+                assert_eq!(seg.parent(), Some(host_dir.as_path()), "{seg:?}");
+            }
+        }
+        assert!(dump.exists(), "a fleet's rotation deleted a flight dump");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two targets that reduce to the same filesystem name would share a
+    /// recording, and a recorder truncates what it opens — so the second host
+    /// silently destroys the first one's frames. `user@host` is the ordinary
+    /// way to write an SSH target, which is exactly how two of them collide.
+    #[test]
+    fn fleet_targets_that_reduce_to_the_same_name_are_kept_apart() {
+        let targets: Vec<String> =
+            ["deploy@db-2", "deploy-db-2", "web-1"].iter().map(|s| s.to_string()).collect();
+        let labels = unique_labels(&targets);
+        assert_eq!(labels, vec!["deploy-db-2", "deploy-db-2-2", "web-1"]);
+
+        let mut sorted = labels.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), labels.len(), "two hosts share a name: {labels:?}");
+    }
+
+    /// ...and a target with no usable character left gets a name rather than
+    /// none, which would otherwise fall back to the unlabelled path and write
+    /// among the flight dumps.
+    #[test]
+    fn a_fleet_target_with_no_usable_name_still_gets_one() {
+        let targets: Vec<String> = ["@@@", "...", "web-1"].iter().map(|s| s.to_string()).collect();
+        let labels = unique_labels(&targets);
+        assert!(labels.iter().all(|l| !l.is_empty()), "{labels:?}");
+        assert_eq!(labels, vec!["host-1", "host-2", "web-1"]);
+    }
+
+    /// An ordinary fleet keeps the names its operator expects.
+    #[test]
+    fn a_fleet_with_no_collisions_keeps_its_names() {
+        let targets: Vec<String> =
+            ["web-1", "web-2", "db-1"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(unique_labels(&targets), targets);
+    }
+
+    #[test]
+    fn a_fleet_record_file_is_named_per_host() {
+        assert_eq!(
+            per_host_path(Path::new("/var/log/run.jsonl"), "web-1"),
+            Path::new("/var/log/run-web-1.jsonl")
+        );
+        // No host: the single-machine name, exactly as it has always been.
+        assert_eq!(per_host_path(Path::new("run.jsonl"), ""), Path::new("run.jsonl"));
+        assert_eq!(per_host_path(Path::new("run"), "db-2"), Path::new("run-db-2"));
+        // A target is whatever the user wrote.
+        assert_eq!(
+            per_host_path(Path::new("run.jsonl"), "deploy@db-2"),
+            Path::new("run-deploy-db-2.jsonl")
+        );
+    }
+
     /// Rotation must delete its own files and nothing else in the directory.
     #[test]
     fn rotation_leaves_other_files_alone() {
@@ -1248,5 +1576,43 @@ mod tests {
         assert!(src.peek().is_some());
         src.seek(5);
         let _ = src.snapshot(Duration::from_millis(100));
+    }
+}
+
+#[cfg(test)]
+mod recordings_tests {
+    use super::*;
+    use crate::config::RecordConfig;
+    use crate::metrics::Snapshot;
+
+    fn frame(at: u64) -> Snapshot {
+        Snapshot { taken_at_unix: at, ..Default::default() }
+    }
+
+    /// A recording that cannot be written says so once, not once a frame.
+    /// Under `--serve` the old behaviour was an identical line per scrape for
+    /// as long as the process ran.
+    #[test]
+    fn a_failing_recording_is_reported_once_and_again_when_it_recovers() {
+        let dir = std::env::temp_dir().join(format!("crabmon-failrec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let cfg = RecordConfig { rotate_frames: 100, rotate_keep: 2, ..RecordConfig::default() };
+        let mut rec =
+            Recordings::for_host(None, Some(dir.to_str().unwrap()), &cfg, "").expect("open");
+        assert!(rec.write(&frame(1_700_000_000)).is_empty(), "a healthy write says nothing");
+
+        // Take the directory away underneath it.
+        std::fs::remove_dir_all(&dir).unwrap();
+        // The open segment still accepts writes, so force a rotation into the
+        // directory that is now gone.
+        let mut said = Vec::new();
+        for i in 0..4u64 {
+            said.extend(rec.write(&frame(1_700_000_001 + i)));
+        }
+        let failures = said.iter().filter(|n| n.contains("failed")).count();
+        assert!(failures <= 1, "it complained {failures} times: {said:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

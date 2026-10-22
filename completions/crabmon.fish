@@ -31,6 +31,7 @@ complete -c crabmon -l alerts -d 'With --serve/--stream: evaluate alert rules he
 complete -c crabmon -l columns -r -d 'Process-table columns, comma separated' \
     -a 'mark pid user state cpu trend mem pss growth virt thr ni fd disk time ports name'
 complete -c crabmon -l diff -r -F -d 'Compare two snapshots, or one recording end to end'
+complete -c crabmon -l doctor -d 'Report what this host lets crabmon measure, and exit'
 complete -c crabmon -l watch -r -d 'Block until processes match QUERY, then exit 1'
 complete -c crabmon -l watch-rule -r -d 'Block until a metric condition holds, e.g. cpu>=90'
 complete -c crabmon -l watch-for -r -d 'Require the match to hold this many seconds'

@@ -3,6 +3,243 @@
 Notable changes to crabmon. Versions follow [semantic versioning](https://semver.org),
 with the usual 0.x caveat that minor releases may change behaviour.
 
+## 0.14.0 — unreleased
+
+What a round of deliberately awkward inputs turned up. Two of a fleet's
+targets can reduce to the same filesystem name, and one can reduce to no name
+at all — both of which quietly cost a host its recording.
+
+### Fixed
+
+- **Two fleet targets could share a recording and truncate each other's.**
+  A target is reduced to something a filesystem will take, and that reduction
+  is not injective: `deploy@db-2` and `deploy-db-2` both become
+  `deploy-db-2`, and a target with no usable character left — `@@@` — becomes
+  nothing at all. The first pair shared a directory, and since a recorder
+  truncates what it opens, the second host destroyed the first one's
+  segments; the nameless one fell back to the unlabelled path and wrote among
+  the flight dumps, where rotation would prune them. `user@host` is the
+  ordinary way to write an SSH target, which is exactly how two of them
+  collide. Names are now chosen over the whole target list by
+  `record::unique_labels`, which keeps a name that is already free — so an
+  ordinary fleet is unchanged — and disambiguates the rest.
+
+- **A recording that could not be written said so once a frame.** A read-only
+  directory or a full disk does not get better by itself, so `--serve` wrote
+  an identical line per scrape for as long as it ran. Reported on the way
+  into failure and on the way out of it now, the same shape as an alert.
+
+### Changed
+
+- **The documentation and the ignore rules cover how a fleet's recordings are
+  named.** `record::unique_labels` is what names them now, including the
+  disambiguated forms two colliding targets and a nameless one get, so
+  `tests/docs.rs` checks those shapes against `.gitignore` rather than the
+  hand-written examples it used to. The README and the man page say that the
+  names are chosen over the whole fleet and why, and that a recording which
+  cannot be written reports once rather than once a frame.
+
+## 0.13.0 — unreleased
+
+The pass over what the last two releases left behind: a defect in `--doctor`
+found by asking whether its tests would survive CI on three platforms, the
+documentation for the three modes added since, and the ignore rules for the
+files a fleet now writes.
+
+### Fixed
+
+- **`--doctor` reported on the wrong config file.** It read the default path
+  whatever `--config` named, so the one use it was built for — checking a
+  config before deploying it — reported on the operator's own file instead,
+  while quoting the rule count from the file actually loaded. It now reports
+  on the config in force, and says "1 alert rule" rather than "1 alert rules".
+- **Two new tests would have failed on Windows or a slow runner.** The hook
+  test built a shell command around a scratch-file path, which is not portable
+  to the `sh` that happens to be on a Windows runner's PATH, so the variables
+  are now asserted on every platform and only the spawn-and-read-back half is
+  Unix-only. A watch-recording test asserted a frame count derived from
+  sampling speed, which is the pacing test's subject and not this one's, and
+  another looked for the absence of a fixed filename in the working directory.
+- **`.gitignore` said nothing about what a fleet writes.** The rules already
+  covered it — `*.jsonl` is unanchored — but nothing said why that has to stay
+  true now that a fleet export writes `run-web-1.jsonl` beside the path
+  `--record` names and a directory per host under the one `--record-rotate`
+  names. Both shapes are derived from the naming code and pinned by
+  `tests/docs.rs`.
+
+### Changed
+
+- **The design notes and README cover the three modes added since 0.11.0.**
+  `--doctor` has a section of its own in both, explaining the marks and why
+  the exit code distinguishes "this host cannot do that" from "the config
+  asked for something this host cannot do". What a hook is given sits beside
+  the alert-rule reasoning it belongs with.
+
+## 0.12.0 — unreleased
+
+Three things an operator needs that crabmon could measure and could not say.
+A hook knew a rule had fired and could not tell anyone which; a fleet could be
+exported and not recorded; and the care taken never to report zero for
+something unreadable left "is that nothing, or something I am not allowed to
+see?" as a question with no answer anywhere.
+
+### Added
+
+- **Alert hooks are told what fired.** A hook was a bare command string run
+  with nothing but the shell's own environment, so the command was the only
+  place the context could live: every rule carried its own message, and even
+  then the hook could not say what the measurement was or find the recording
+  written beside it. A hook now runs with `CRABMON_RULE`, `CRABMON_KIND`,
+  `CRABMON_STATE` (`firing` or `cleared`), `CRABMON_VALUE`,
+  `CRABMON_THRESHOLD`, `CRABMON_MESSAGE`, `CRABMON_HOST`, `CRABMON_AT` and —
+  where `[record] flight` opened one — `CRABMON_DUMP` and `CRABMON_SUMMARY`
+  pointing at the evidence. Every variable is always set, empty where it does
+  not apply, so a hook written with `set -u` need not guess which exist. One
+  `page-oncall` script now serves every rule on every host.
+
+- **`crabmon --doctor`.** crabmon is careful never to report zero for
+  something it could not read — an unreadable fd table is unknown, a root-only
+  `/dev/kmsg` says so rather than showing an empty list, a rule with nothing
+  to measure is skipped. That is right, and it leaves "is that nothing, or
+  something I am not allowed to see?" as a question nothing answered.
+  `--doctor` asks all of them up front: the platform, privileges, pressure
+  stall, `/dev/kmsg`, RAPL, cgroup version, GPU, fd tables, `smaps_rollup`,
+  per-process IO, whether the config parses, and which rules can measure
+  nothing on this host. It exits **1** when something the config actually
+  asks for cannot work here, so it is a pre-deploy check and not only
+  something to read; a missing GPU is not a failure, a `kind = "fd"` rule on
+  a host whose fd tables are unreadable is. `--format json` emits the same
+  report for something other than a person.
+
+- **A fleet export records a timeline per host.** `--serve --remote` refused
+  `--record` and `--record-rotate` outright, because a fleet has one timeline
+  per machine and the flags name one place. Each host now gets its own:
+  `run.jsonl` becomes `run-web-1.jsonl`, and a rotating set gets a directory
+  per host under the one named. A directory rather than a name, because a
+  segment is `crabmon-<unix>.jsonl` while a flight dump is
+  `crabmon-<rule>-<unix>.jsonl` — putting the host in the name would make the
+  two indistinguishable, and `rotate_dir` defaults to `flight_dir`, so
+  rotation would have pruned the evidence sitting beside it. Only frames that
+  actually arrived are recorded, so a host that has gone quiet leaves a gap
+  rather than a flat line of its last good sample.
+
+
+## 0.11.0 — unreleased
+
+Recording that does not need somebody watching, growth measured in more than
+one dimension, and the exporter defect a one-core machine found that faster
+ones had been hiding for as long as the exporter has existed. The
+always-on recorder was the feature that could not be deployed — it was driven
+by the interface's event loop, so the one place it belongs, a unit file, was
+the one place it did nothing. The rest came out of testing those two: four of
+the eight fixes below are things the new tests tripped over rather than
+anything anyone set out to look for.
+
+### Added
+
+- **Recording without a terminal.** `--record` and `--record-rotate` now work
+  in every mode that samples on a loop — `--stream`, `--serve` and `--watch`
+  as well as the interface — through one `record::Recordings` rather than four
+  copies of the flag-and-config resolution. That is what makes an always-on
+  recorder deployable: a unit running
+  `crabmon --serve :9100 --alerts --record-rotate /var/log/crabmon` exports
+  metrics, evaluates the rules and keeps the last hour on disk with nobody
+  watching. Under `--stream` the frame on stdout keeps the full inventory a
+  collector needs while the one on disk is trimmed by `[record]`; under
+  `--serve` the cadence is the scrape's, because that is when a sample is
+  actually taken. `--once` and `--diff` refuse both flags — a recording is a
+  sequence — as does `--serve --remote`, where a fleet has a timeline per host
+  and one file to put them in.
+
+- **`trend` rules can follow CPU and disk IO, not only RSS.** A leak is
+  usually spelled in resident memory, but it is not the only thing that
+  climbs: a process whose disk rate has risen all week, or whose CPU has crept
+  up since a deploy, is the same shape of problem and no threshold catches
+  either until it is too late to act on. A `trend` rule with a `query` now
+  reads `target` as the series to follow — `rss` (the default), `cpu` or `io`
+  — with the threshold in that series' own unit: bytes, percentage points, or
+  bytes per second. From a shell the series goes in front of the query,
+  `crabmon --watch-rule 'trend:io:postgres>10M'`, and a bare `trend:postgres`
+  still means RSS. Only the series some rule actually names are kept, so
+  asking about IO does not silently start tracking three series per process.
+
+### Fixed
+
+- **The exporter reset roughly half its scrapes on a slow machine.** `handle`
+  read only the request line when no token was configured — "an exporter with
+  no token has no reason to read past it" — then wrote the response and closed.
+  Closing a socket that still has unread bytes in its receive buffer makes
+  Linux send RST instead of FIN, and the RST discards the response that was
+  just written, so the client sees a reset connection rather than the 200 the
+  exporter sent. It is a race, which is why it hid on a developer's machine
+  and was routine on a single-core one: measured there with the e2e suite's
+  own client, 11 of 25 scrapes were answered with the headers unread against
+  25 of 25 with them read — same binary, same client, back to back. Prometheus
+  would have recorded the rest as failed scrapes. The headers are now read to
+  the blank line whether or not anything looks at one, still bounded by
+  `MAX_HEADERS`; only the `Authorization` value is kept, and only when a token
+  is configured.
+
+- **`--record` and `--record-rotate` silently did nothing in a headless
+  mode.** Recording was driven by the interface's own sampling loop, so
+  `crabmon --once --record run.jsonl` printed a snapshot, wrote no recording,
+  said nothing and exited 0 — the failure `--alerts` is already refused for,
+  in its worse form, because the file that was asked for simply never
+  appeared. Every mode that samples on a loop now records (see **Added**),
+  and the two that take a single sample refuse the flags instead.
+
+- **A machine-wide `trend` rule could name a process as though it were the
+  cause.** The subject appended to a trend alert's message was gated on the
+  rule having a parsed filter rather than on it being about processes — and
+  an empty query parses into the filter that matches *everything*, so with
+  any per-process trend rule also configured, "machine memory climbing"
+  arrived as `leak +4.0 GiB ≥ 1.0 GiB (chrome over 10m)`. It now names a
+  process only when the rule selected one.
+
+- **The exporter's constant-time token comparison folded its length check
+  into a `u8`.** Everything above the low eight bits of the length difference
+  was thrown away, so two lengths exactly 256 apart folded to zero and left
+  the byte loop as the only check. Not a bypass on its own — the bytes still
+  have to match the secret — but the length half of the comparison was not
+  doing its job. It folds the full `usize` now.
+
+- **The detail pane showed `STRIPE_KEY` and friends in full.** The
+  environment mask matched `API_KEY` and `SECRET` as fragments but nothing
+  ending in `_KEY`, so an ordinary credential variable reached a pane people
+  screenshot into tickets. `_KEY` and `_PWD` are matched as suffixes — a bare
+  `KEY` fragment would mask `KEYMAP` and teach people to ignore the mask —
+  and `PASSPHRASE` joins the fragment list.
+
+- **Four exporter tests raced the whole machine for a port.** Each asked the
+  kernel for a free ephemeral port, dropped the listener, and handed the
+  number to `serve`. A full `cargo test` run binds a lot of ephemeral ports,
+  and the loser of that race does not fail to connect — it connects to
+  whatever took the port and asserts on somebody else's response, which is
+  how `a_scrape_over_a_socket_must_carry_the_token` failed a parallel run.
+  `serve::serve_listener` now takes an already-bound listener, so the socket
+  the test probed with is the one the exporter serves on and there is no
+  window at all. `serve_rendered` is that plus `TcpListener::bind` and the
+  startup notices.
+
+- **`stream_keeps_to_the_interval_it_was_asked_for` failed a correct binary on
+  a loaded machine.** `Pacer` runs as fast as it can when a sample costs more
+  than the interval it was given, so the honest expectation is
+  `max(interval, sample_cost)` — but the test bounded the gap at twice a
+  300 ms refresh, which a few thousand tasks exceed on their own. At load 8 it
+  measured 1.17 s and failed the run for being right. It now measures what a
+  sample costs on the machine it is running on, by streaming once at the
+  refresh floor, and bounds the real run against that. Confirmed still to
+  catch the regression it exists for by reinstating the old sleep-then-sample
+  behaviour, which it reports as 1.69 s against a 1.5 s bound.
+
+- **`a_process_that_execs_is_reported_as_what_it_became` raced its own first
+  sample.** The wrapper exec'd after a fixed `sleep 1` while the test's first
+  snapshot walks every process on the machine, which on a loaded box takes
+  longer than that — so the run failed on the *setup* assertion, saying
+  nothing about crabmon, roughly one time in three. The wrapper now blocks on
+  stdin and the test closes the pipe when it is ready, the same frame-driven
+  hand-off `tests/e2e_docker.rs` already uses.
+
 ## 0.10.0 — unreleased
 
 The measurements that were wrong, and the questions no threshold could ask.

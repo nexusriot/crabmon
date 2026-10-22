@@ -24,6 +24,14 @@
 # `--record-rotate`, and the flight recorder's dumps — with `[record]
 # flight_dir` unset, those land in the working directory too, named by
 # `record::dump_name` and `record::segment_name`.
+#
+# Unanchored, and it has to stay that way: a fleet export records a timeline
+# per host, which is `run-web-1.jsonl` beside the path `--record` names and a
+# directory per host — `web-1/crabmon-<unix>.jsonl` — under the one
+# `--record-rotate` names. An anchored rule would catch neither. The host part
+# is whatever `record::unique_labels` made of the target, so it may be
+# `deploy-db-2-2` where two targets collided or `host-1` where one had no
+# usable characters at all; `tests/docs.rs` checks those shapes too.
 *.jsonl
 
 # The human-readable incident summary written beside every flight dump, by

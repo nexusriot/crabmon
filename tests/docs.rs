@@ -290,6 +290,23 @@ fn every_sort_key_is_documented_where_the_option_is_described() {
     }
 }
 
+/// `--help` is the one list a user reads without leaving the shell, and
+/// nothing checked the enumerations in it beyond `--sort`. Its `--layout` row
+/// sat at `dashboard|processes|cpu|io` for the whole life of the fleet
+/// layout, so the only documented way to reach it was the README.
+#[test]
+fn the_help_text_enumerates_every_layout_and_theme() {
+    let help = crabmon::cli::help_text();
+    let layout_row = help.lines().find(|l| l.contains("--layout")).expect("--layout in the help");
+    for layout in crabmon::ui::ALL_LAYOUTS {
+        assert!(layout_row.contains(layout.name()), "--help omits layout {}", layout.name());
+    }
+    let theme_row = help.lines().find(|l| l.contains("--theme")).expect("--theme in the help");
+    for theme in crabmon::theme::PRESETS {
+        assert!(theme_row.contains(theme), "--help omits theme {theme}");
+    }
+}
+
 /// `len` bytes of `text` starting at `needle`, for scoping a check to one
 /// man-page entry rather than the whole document.
 fn section_after(text: &str, needle: &str, len: usize) -> String {
@@ -513,6 +530,27 @@ fn gitignore_covers_the_files_crabmon_writes_into_the_working_directory() {
     for name in ["run.jsonl", "recordings/slowdown.jsonl", "crabmon-1788297407.jsonl"] {
         if git_ignores(name) == Some(false) {
             panic!("a recording ({name}) would be committed");
+        }
+    }
+
+    // A fleet records a timeline per host: a file beside the one `--record`
+    // names, and a directory per host under the one `--record-rotate` names.
+    // Through `unique_labels`, which is what actually names them — including
+    // the disambiguated forms two colliding targets and a nameless one get,
+    // which are the shapes least likely to be thought of by hand.
+    let targets: Vec<String> =
+        ["web-1", "deploy@db-2", "deploy-db-2", "@@@"].iter().map(|s| s.to_string()).collect();
+    for label in crabmon::record::unique_labels(&targets) {
+        let file = crabmon::record::per_host_path(std::path::Path::new("run.jsonl"), &label);
+        let name = file.to_string_lossy().to_string();
+        if git_ignores(&name) == Some(false) {
+            panic!("a fleet host's recording ({name}) would be committed");
+        }
+        let segment =
+            std::path::Path::new(&label).join(crabmon::record::segment_name(1_788_297_407));
+        let name = segment.to_string_lossy().to_string();
+        if git_ignores(&name) == Some(false) {
+            panic!("a fleet host's segment ({name}) would be committed");
         }
     }
 
@@ -770,6 +808,26 @@ fn every_alert_kind_is_documented_where_the_rule_is_described() {
     }
 }
 
+/// The per-process series a `trend` rule can follow are a third enumeration
+/// written out in both documents, and the one most likely to gain a member:
+/// `rss` was the only one for several releases.
+#[test]
+fn every_trend_series_is_documented_in_both_places() {
+    let readme = read("README.md");
+    let man = read("docs/crabmon.1");
+    for series in crabmon::alerts::ALL_TREND_SERIES {
+        let name = series.key_name();
+        assert!(
+            readme.contains(&format!("`{name}`")),
+            "the README never names the `{name}` trend series"
+        );
+        assert!(
+            man.contains(&format!("\\fB{name}\\fR")),
+            "the man page never names the {name} trend series"
+        );
+    }
+}
+
 /// Filter fields, like sort keys, are written out in the README and the man
 /// page; both lists are hand-maintained and both went stale before. Scoped to
 /// the worked example in each, which is the list a reader actually consults.
@@ -807,5 +865,31 @@ fn every_filter_field_is_documented_in_both_places() {
     // leave undocumented.
     for (doc, name) in [(&readme_block, "README"), (&man_block, "man page")] {
         assert!(doc.contains('|'), "the {name}'s filter table never shows the OR operator");
+    }
+}
+
+/// The hook contract is an enumeration like the others, and it is the one a
+/// user writes a script against: a variable that exists and is undocumented
+/// is as bad as one that is documented and does not exist.
+#[test]
+fn every_hook_variable_is_documented_in_both_places() {
+    let readme = read("README.md");
+    let man = read("docs/crabmon.1");
+    for var in crabmon::alerts::HOOK_VARS {
+        assert!(readme.contains(var), "the README never mentions {var}");
+        assert!(man.contains(var), "the man page never mentions {var}");
+    }
+    // ...and the mirror: nothing documented that the code does not set.
+    for doc in [&readme, &man] {
+        for word in doc.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            // The two crabmon *reads* rather than sets for a hook.
+            const READ_NOT_SET: [&str; 2] = ["CRABMON_SERVE_TOKEN", "CRABMON_E2E"];
+            if word.starts_with("CRABMON_") && !READ_NOT_SET.contains(&word) {
+                assert!(
+                    crabmon::alerts::HOOK_VARS.contains(&word),
+                    "the docs promise {word}, which no hook is ever given"
+                );
+            }
+        }
     }
 }

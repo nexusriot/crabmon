@@ -154,6 +154,105 @@ pub struct AlertRule {
     pub command_clear: String,
 }
 
+/// A hook the engine wants run, and everything it should be told about why.
+///
+/// A hook used to be a bare command string. That made the command the only
+/// place the context could live, so every rule needed its own —
+/// `command = "page-oncall 'cpu is high'"` — and even then the hook could not
+/// say what the measurement was or find the recording written beside it. The
+/// command is still exactly what the config says; the context is handed over
+/// in the child's environment, so one `page-oncall` script serves every rule.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HookCall {
+    /// The command line from `command` or `command_clear`, unchanged.
+    pub command: String,
+    pub rule: String,
+    pub kind: AlertKind,
+    pub value: f64,
+    pub threshold: f64,
+    /// False for the recovery hook: the same rule, saying it is over.
+    pub firing: bool,
+    /// The one-line description, as the status bar and the `!` popup show it.
+    pub message: String,
+    /// Wall-clock time of the sample that caused this.
+    pub at_unix: u64,
+    /// The host the rule is about. The fleet target when crabmon is watching
+    /// several, and this machine's own name otherwise — a page that does not
+    /// say which machine is a page somebody has to answer twice.
+    pub host: String,
+    /// The flight recording this firing opened, and the readable summary
+    /// beside it. Empty unless `[record] flight` is on and this is the
+    /// crossing that triggered a dump.
+    pub dump: String,
+    pub summary: String,
+}
+
+/// The variables a hook is run with.
+///
+/// Every one is always set, empty where it does not apply, so a hook written
+/// with `set -u` does not have to guess which of them exist. All are plain
+/// strings: a shell should not have to parse anything to use them.
+pub const HOOK_VARS: [&str; 10] = [
+    "CRABMON_RULE",
+    "CRABMON_KIND",
+    "CRABMON_STATE",
+    "CRABMON_VALUE",
+    "CRABMON_THRESHOLD",
+    "CRABMON_MESSAGE",
+    "CRABMON_HOST",
+    "CRABMON_AT",
+    "CRABMON_DUMP",
+    "CRABMON_SUMMARY",
+];
+
+impl HookCall {
+    /// A bare command with no context, for callers that have none to give.
+    pub fn bare(command: &str) -> HookCall {
+        HookCall {
+            command: command.to_string(),
+            rule: String::new(),
+            kind: AlertKind::Cpu,
+            value: 0.0,
+            threshold: 0.0,
+            firing: true,
+            message: String::new(),
+            at_unix: 0,
+            host: String::new(),
+            dump: String::new(),
+            summary: String::new(),
+        }
+    }
+
+    /// `(name, value)` pairs for the child's environment, in `HOOK_VARS` order.
+    pub fn env(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("CRABMON_RULE", self.rule.clone()),
+            ("CRABMON_KIND", self.kind.key_name().to_string()),
+            ("CRABMON_STATE", if self.firing { "firing" } else { "cleared" }.to_string()),
+            ("CRABMON_VALUE", hook_number(self.value)),
+            ("CRABMON_THRESHOLD", hook_number(self.threshold)),
+            ("CRABMON_MESSAGE", self.message.clone()),
+            ("CRABMON_HOST", self.host.clone()),
+            ("CRABMON_AT", self.at_unix.to_string()),
+            ("CRABMON_DUMP", self.dump.clone()),
+            ("CRABMON_SUMMARY", self.summary.clone()),
+        ]
+    }
+}
+
+/// A measurement as a hook should see it: parseable, and not claiming
+/// precision the measurement does not have.
+///
+/// `{}` on an `f64` holding an `f32` percentage prints `23.076923370361328`,
+/// seventeen digits of which about three are real — and a hook that echoes it
+/// into a chat message says so. Byte counts stay whole, because they are.
+fn hook_number(value: f64) -> String {
+    match value.fract() == 0.0 {
+        true => format!("{value:.0}"),
+        false => format!("{value:.3}"),
+    }
+}
+
 /// A rule that is currently over threshold and past its hold time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ActiveAlert {
@@ -199,8 +298,9 @@ pub struct AlertEngine {
     /// refresh is not free, and a query that fails to parse must be inert
     /// rather than an error on every frame.
     queries: Vec<Option<filter::Filter>>,
-    /// Commands the engine wants run; drained by the caller.
-    pending_commands: Vec<String>,
+    /// Hooks the engine wants run, with the context each should be told;
+    /// drained by the caller, which is what runs them.
+    pending_commands: Vec<HookCall>,
     /// Rules that have just gone active, for the flight recorder. Kept apart
     /// from `pending_commands` because a rule with no hook still wants its
     /// dump — the hook is for paging someone, the dump is the evidence.
@@ -277,7 +377,25 @@ impl AlertEngine {
                 // only ever says "started" leaves you guessing when it ended.
                 if std::mem::take(&mut st.fired) {
                     if !rule.command_clear.is_empty() {
-                        self.pending_commands.push(rule.command_clear.clone());
+                        self.pending_commands.push(HookCall {
+                            command: rule.command_clear.clone(),
+                            rule: rule.name.clone(),
+                            kind: rule.kind,
+                            value,
+                            threshold: rule.threshold,
+                            firing: false,
+                            message: format!(
+                                "{} recovered: {} {} {}",
+                                rule.name,
+                                quantity(value, unit),
+                                if rule.below { "≥" } else { "<" },
+                                quantity(rule.threshold, unit),
+                            ),
+                            at_unix,
+                            host: String::new(),
+                            dump: String::new(),
+                            summary: String::new(),
+                        });
                     }
                     events.push(AlertEvent {
                         name: rule.name.clone(),
@@ -292,38 +410,58 @@ impl AlertEngine {
             if now_secs.saturating_sub(since) < rule.for_secs {
                 continue;
             }
-            if !st.fired {
+            let just_fired = !st.fired;
+            if just_fired {
                 st.fired = true;
-                if !rule.command.is_empty() {
-                    self.pending_commands.push(rule.command.clone());
-                }
                 self.pending_fired.push(rule.name.clone());
                 events.push(AlertEvent { name: rule.name.clone(), fired: true, at_unix, value });
             }
             // The process that is actually growing, when the rule is about
             // processes: "leak ≥ 200 MiB" is a fact about the machine, and
             // "leak: postgres +412 MiB in 10m" is something to act on.
+            // ...and only when it is. An empty query parses into the filter
+            // that matches *everything*, so a rule about the machine's own
+            // memory would otherwise name whichever process happened to be
+            // growing fastest — as though that were the cause.
             let subject = match rule.kind {
-                AlertKind::Trend => self
-                    .queries
-                    .get(i)
-                    .and_then(|q| q.as_ref())
-                    .and_then(|f| self.trends.worst_proc_growth(f, snap, rule.window(), rule.below))
+                AlertKind::Trend if !rule.query.trim().is_empty() => proc_trend_series(rule)
+                    .zip(self.queries.get(i).and_then(|q| q.as_ref()))
+                    .and_then(|(axis, f)| {
+                        self.trends.worst_proc_growth(f, snap, rule.window(), rule.below, axis)
+                    })
                     .map(|(_, span, name)| {
                         format!(" ({name} over {})", crate::format::human_duration(span))
                     })
                     .unwrap_or_default(),
                 _ => String::new(),
             };
+            // Built before the hook so the hook is told the same line the
+            // status bar and the `!` popup show, subject and all.
+            let message = format!(
+                "{} {} {} {}{subject}",
+                rule.name,
+                quantity(value, unit),
+                if rule.below { "<" } else { "≥" },
+                quantity(rule.threshold, unit),
+            );
+            if just_fired && !rule.command.is_empty() {
+                self.pending_commands.push(HookCall {
+                    command: rule.command.clone(),
+                    rule: rule.name.clone(),
+                    kind: rule.kind,
+                    value,
+                    threshold: rule.threshold,
+                    firing: true,
+                    message: message.clone(),
+                    at_unix,
+                    host: String::new(),
+                    dump: String::new(),
+                    summary: String::new(),
+                });
+            }
             active.push(ActiveAlert {
                 name: rule.name.clone(),
-                message: format!(
-                    "{} {} {} {}{subject}",
-                    rule.name,
-                    quantity(value, unit),
-                    if rule.below { "<" } else { "≥" },
-                    quantity(rule.threshold, unit),
-                ),
+                message,
                 value,
                 threshold: rule.threshold,
             });
@@ -359,9 +497,22 @@ impl AlertEngine {
             .chain(windowed(AlertKind::FillIn))
             .max()
             .unwrap_or(DEFAULT_TREND_WINDOW);
-        let track_procs =
-            self.rules.iter().any(|r| r.kind == AlertKind::Trend && !r.query.is_empty());
-        self.trends.observe(snap, window, track_procs);
+        // Only the axes some rule actually names: keeping all three for every
+        // process is three times the points for a question almost nobody
+        // asks three ways at once.
+        let axes = self
+            .rules
+            .iter()
+            .filter(|r| r.kind == AlertKind::Trend && !r.query.is_empty())
+            .filter_map(proc_trend_series)
+            .fold(ProcAxes::default(), ProcAxes::with);
+        self.trends.observe(snap, window, axes);
+    }
+
+    /// Which per-process series this engine is keeping, for tests and so the
+    /// cost of a rule is assertable.
+    pub fn tracked_axes(&self) -> ProcAxes {
+        self.trends.axes
     }
 
     /// The trend series, so the interface can draw what the rules measure.
@@ -374,7 +525,7 @@ impl AlertEngine {
         self.trends.tracked_procs()
     }
 
-    pub fn take_commands(&mut self) -> Vec<String> {
+    pub fn take_commands(&mut self) -> Vec<HookCall> {
         std::mem::take(&mut self.pending_commands)
     }
 
@@ -443,11 +594,32 @@ impl AlertEngine {
 /// Bytes get `human_bytes`, because `+432013312.0B` is a number nobody reads
 /// as 412 MiB, and a trend alert is read in a hurry.
 fn quantity(value: f64, unit: &str) -> String {
-    if unit != "B" {
-        return format!("{value:.1}{unit}");
+    // A leading `+` asks for an explicit sign. A trend can be negative — that
+    // is what `below` is for — and `20.0%` of growth reads as a level.
+    let (signed, unit) = match unit.strip_prefix('+') {
+        Some(rest) => (true, rest),
+        None => (false, unit),
+    };
+    // `B`, and anything built on it such as `B/s`: the suffix rides along so
+    // a rate reads as `+412 MiB/s` rather than losing its denominator.
+    if let Some(suffix) = unit.strip_prefix('B') {
+        let sign = if value < 0.0 { "-" } else { "+" };
+        return format!("{sign}{}{suffix}", crate::format::human_bytes(value.abs() as u64));
     }
-    let sign = if value < 0.0 { "-" } else { "+" };
-    format!("{sign}{}", crate::format::human_bytes(value.abs() as u64))
+    match signed {
+        true => format!("{value:+.1}{unit}"),
+        false => format!("{value:.1}{unit}"),
+    }
+}
+
+/// The per-process series a `trend` rule follows, or `None` when its `target`
+/// names one that does not exist.
+///
+/// Inert rather than defaulted: a rule that said `target = "ioo"` and got RSS
+/// would report a number about something nobody asked for, which is worse
+/// than reporting nothing.
+fn proc_trend_series(rule: &AlertRule) -> Option<TrendSeries> {
+    TrendSeries::parse(&rule.target)
 }
 
 /// How far back a `trend` rule looks when it does not say.
@@ -490,6 +662,9 @@ pub struct TrendTracker {
     /// Bytes used per mount point, which is what turns "95% full" into "full
     /// in three hours".
     disks: HashMap<String, Series>,
+    /// The per-process axes being kept, so a change of rules can drop the
+    /// series nothing asks for any more.
+    axes: ProcAxes,
 }
 
 /// Points kept per series. Eight is enough to measure a slope across a
@@ -511,13 +686,170 @@ struct Series {
     latest: Option<(u64, u64)>,
 }
 
-#[derive(Debug, Clone)]
+/// Which series of a matched process a `trend` rule measures.
+///
+/// RSS is the one a leak is usually spelled in, and was for a long time the
+/// only one. It is not the only thing that climbs: a process whose IO rate
+/// has been rising all week, or whose CPU has crept up since a deploy, is the
+/// same shape of problem and no threshold catches either until it is too late
+/// to act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrendSeries {
+    /// Resident memory, in bytes.
+    #[default]
+    Rss,
+    /// CPU percentage, which can exceed 100 on a multi-threaded process.
+    Cpu,
+    /// Disk read plus write, in bytes per second.
+    Io,
+}
+
+/// Every per-process series a `trend` rule can name, so the docs can be
+/// checked against the code rather than a hand-kept list.
+pub const ALL_TREND_SERIES: [TrendSeries; 3] =
+    [TrendSeries::Rss, TrendSeries::Cpu, TrendSeries::Io];
+
+impl TrendSeries {
+    pub fn key_name(self) -> &'static str {
+        match self {
+            TrendSeries::Rss => "rss",
+            TrendSeries::Cpu => "cpu",
+            TrendSeries::Io => "io",
+        }
+    }
+
+    /// An empty name is RSS, which is what every `trend` rule meant before
+    /// there was anything else to name.
+    pub fn parse(s: &str) -> Option<TrendSeries> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "rss" | "mem" | "memory" => Some(TrendSeries::Rss),
+            "cpu" => Some(TrendSeries::Cpu),
+            "io" | "disk" => Some(TrendSeries::Io),
+            _ => None,
+        }
+    }
+
+    /// The unit its measurement is quoted in. A leading `+` asks `quantity`
+    /// for an explicit sign: a trend can be negative, and `20.0%` reads as a
+    /// level rather than as growth.
+    pub fn unit(self) -> &'static str {
+        match self {
+            TrendSeries::Rss => "B",
+            TrendSeries::Cpu => "+%",
+            TrendSeries::Io => "B/s",
+        }
+    }
+
+    /// What one sample of this series is, as the integer `Series` keeps.
+    ///
+    /// CPU is stored in hundredths of a percent rather than whole ones: a
+    /// process creeping up by a third of a percent a minute is exactly the
+    /// kind of drift this is for, and rounding it to zero would make the
+    /// series flat.
+    fn sample(self, p: &crate::metrics::ProcRow) -> u64 {
+        match self {
+            TrendSeries::Rss => p.mem,
+            TrendSeries::Cpu => (p.cpu as f64 * 100.0).round().max(0.0) as u64,
+            TrendSeries::Io => p.io_bps().max(0.0) as u64,
+        }
+    }
+
+    /// Back from what `Series` keeps to what the threshold is written in.
+    fn scale(self, delta: i64) -> f64 {
+        match self {
+            TrendSeries::Cpu => delta as f64 / 100.0,
+            _ => delta as f64,
+        }
+    }
+}
+
+/// Split a `trend` rule's target into the series it names and the rest.
+///
+/// `trend:postgres` measures RSS, because that is what it has always meant;
+/// `trend:io:postgres` measures the same processes' IO rate. Only a target
+/// that begins with a series name *and a colon* is split, so a query is never
+/// mistaken for one — and no filter term is spelled `rss:`, `cpu:` or `io:`,
+/// so there is nothing for this to collide with.
+pub fn split_trend_target(target: &str) -> (TrendSeries, &str) {
+    if let Some((head, rest)) = target.split_once(':')
+        && let Some(series) = TrendSeries::parse(head)
+        && !head.is_empty()
+    {
+        return (series, rest);
+    }
+    (TrendSeries::Rss, target)
+}
+
+/// Which per-process series the rules in force actually need.
+///
+/// Keeping all three for every process is three times the points for a
+/// question almost nobody asks three ways at once, so each is kept only when
+/// some rule names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProcAxes {
+    pub rss: bool,
+    pub cpu: bool,
+    pub io: bool,
+}
+
+impl ProcAxes {
+    pub fn with(mut self, series: TrendSeries) -> ProcAxes {
+        match series {
+            TrendSeries::Rss => self.rss = true,
+            TrendSeries::Cpu => self.cpu = true,
+            TrendSeries::Io => self.io = true,
+        }
+        self
+    }
+
+    pub fn any(self) -> bool {
+        self.rss || self.cpu || self.io
+    }
+
+    fn wants(self, series: TrendSeries) -> bool {
+        match series {
+            TrendSeries::Rss => self.rss,
+            TrendSeries::Cpu => self.cpu,
+            TrendSeries::Io => self.io,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 struct ProcSeries {
-    series: Series,
+    /// One per axis. An axis no rule asked for is never pushed to and stays
+    /// empty, which costs a `VecDeque` header and no allocation.
+    rss: Series,
+    cpu: Series,
+    io: Series,
     name: String,
     /// The sample this was last seen in, so processes that have exited can
     /// be dropped rather than tracked for ever.
     last_seen: u64,
+}
+
+impl ProcSeries {
+    fn series(&self, axis: TrendSeries) -> &Series {
+        match axis {
+            TrendSeries::Rss => &self.rss,
+            TrendSeries::Cpu => &self.cpu,
+            TrendSeries::Io => &self.io,
+        }
+    }
+
+    fn push(&mut self, axes: ProcAxes, at: u64, p: &crate::metrics::ProcRow, window: u64) {
+        for axis in ALL_TREND_SERIES {
+            if !axes.wants(axis) {
+                continue;
+            }
+            let value = axis.sample(p);
+            match axis {
+                TrendSeries::Rss => self.rss.push(at, value, window),
+                TrendSeries::Cpu => self.cpu.push(at, value, window),
+                TrendSeries::Io => self.io.push(at, value, window),
+            }
+        }
+    }
 }
 
 impl Series {
@@ -566,7 +898,7 @@ impl TrendTracker {
     /// and `track_procs` says whether any rule needs per-process series at
     /// all — tracking every process costs a map entry per process per
     /// sample, and most configurations never ask for it.
-    pub fn observe(&mut self, snap: &Snapshot, window: u64, track_procs: bool) {
+    pub fn observe(&mut self, snap: &Snapshot, window: u64, axes: ProcAxes) {
         let at = snap.taken_at_unix;
         if at == 0 {
             return;
@@ -582,23 +914,31 @@ impl TrendTracker {
         }
         self.disks.retain(|mount, _| snap.disks.iter().any(|d| &d.mount == mount));
 
-        if !track_procs {
+        // A series whose axis has stopped being asked for would otherwise go
+        // on being read with points that stopped arriving — a slope frozen at
+        // whatever it last was.
+        if self.axes != axes {
+            self.procs.clear();
+            self.axes = axes;
+        }
+        if !axes.any() {
             self.procs.clear();
             return;
         }
         for p in &snap.procs {
             let key = (p.pid, p.start_time_unix);
             if let Some(entry) = self.procs.get_mut(&key) {
-                entry.series.push(at, p.mem, window);
+                entry.push(axes, at, p, window);
                 entry.last_seen = at;
                 continue;
             }
             if self.procs.len() >= MAX_TRACKED {
                 continue;
             }
-            let mut series = Series::default();
-            series.push(at, p.mem, window);
-            self.procs.insert(key, ProcSeries { series, name: p.name.clone(), last_seen: at });
+            let mut entry =
+                ProcSeries { name: p.name.clone(), last_seen: at, ..ProcSeries::default() };
+            entry.push(axes, at, p, window);
+            self.procs.insert(key, entry);
         }
         // A process that has exited keeps nothing: its leak is over.
         self.procs.retain(|_, entry| entry.last_seen == at);
@@ -619,6 +959,7 @@ impl TrendTracker {
         snap: &Snapshot,
         window: u64,
         shrinking: bool,
+        axis: TrendSeries,
     ) -> Option<(i64, u64, String)> {
         let matched: std::collections::HashSet<(u32, u64)> = snap
             .procs
@@ -630,7 +971,7 @@ impl TrendTracker {
             .iter()
             .filter(|(key, _)| matched.contains(key))
             .filter_map(|(_, entry)| {
-                entry.series.growth(window).map(|(d, span)| (d, span, entry.name.clone()))
+                entry.series(axis).growth(window).map(|(d, span)| (d, span, entry.name.clone()))
             })
             // `below` rules are looking for the biggest *fall*, so the
             // extreme to report is the other end.
@@ -717,29 +1058,37 @@ fn measure(
                 .map(|b| (b, "%"));
         }
         AlertKind::Psi => return psi_value(&rule.target, snap).map(|v| (v, "%")),
-        // A slope, in bytes, over the rule's own window. `None` until the
-        // series actually spans that window: a rule that fired on two
-        // samples a second apart would be reporting noise as a trend.
+        // A slope over the rule's own window, in whichever unit the series it
+        // names is quoted in. `None` until the series actually spans that
+        // window: a rule that fired on two samples a second apart would be
+        // reporting noise as a trend.
         AlertKind::Trend => {
             let trends = trends?;
             let window = rule.window();
             // An empty query parses into the filter that matches
             // *everything*, so the machine series has to be chosen by the
             // query being absent rather than by the filter being empty.
-            let growth = match query.filter(|_| !rule.query.trim().is_empty()) {
-                Some(filter) => trends
-                    .worst_proc_growth(filter, snap, window, rule.below)
-                    .map(|(delta, _, _)| delta),
+            return match query.filter(|_| !rule.query.trim().is_empty()) {
+                Some(filter) => {
+                    // With a query, `target` names which of the process's
+                    // series to follow. An unknown one measures nothing
+                    // rather than quietly falling back to RSS and reporting
+                    // a number about something the rule did not ask for.
+                    let axis = proc_trend_series(rule)?;
+                    let (delta, _, _) =
+                        trends.worst_proc_growth(filter, snap, window, rule.below, axis)?;
+                    Some((axis.scale(delta), axis.unit()))
+                }
                 None => {
                     let series = match rule.target.trim() {
                         "" | "mem" | "memory" | "rss" => "mem",
                         "swap" => "swap",
                         _ => return None,
                     };
-                    trends.machine_growth(series, window).map(|(delta, _)| delta)
+                    let (delta, _) = trends.machine_growth(series, window)?;
+                    Some((delta as f64, "B"))
                 }
-            }?;
-            return Some((growth as f64, "B"));
+            };
         }
         // The group's own limit, which the host's gauges cannot see: a
         // container at 98% of a 512 MB limit is about to be killed on a
@@ -973,6 +1322,33 @@ mod trend_tests {
         let fired = fired.expect("a 4 GiB climb never fired a 1 GiB trend rule");
         assert!(fired.value >= (1u64 << 30) as f64, "{fired:?}");
         assert!(fired.message.contains("GiB"), "bytes must read as bytes: {}", fired.message);
+    }
+
+    /// A rule about the machine must not name a process as though it were
+    /// the cause. The empty query parses into the filter that matches
+    /// everything, so the subject has to be gated on the rule actually being
+    /// about processes rather than on the filter being non-empty.
+    #[test]
+    fn a_machine_trend_names_no_process_even_while_one_is_tracked() {
+        // Two rules, so per-process series *are* being kept: the machine rule
+        // still has to keep its own message to itself.
+        let mut e = AlertEngine::new(vec![
+            trend_rule("", (1 << 30) as f64, 600),
+            series_rule("rss", "postgres", (1u64 << 40) as f64),
+        ]);
+        let base = 1_700_000_000;
+        let mut fired = None;
+        for step in 0..=10u64 {
+            let used = (2 << 30) + step * (4 << 30) / 10;
+            let snap = climbing(base + step * 60, used, step * (64 << 20));
+            let active = e.evaluate(&snap, step * 60);
+            if let Some(a) = active.iter().find(|a| a.name == "leak") {
+                fired = Some(a.clone());
+            }
+        }
+        let fired = fired.expect("the machine rule never fired");
+        assert!(!fired.message.contains("postgres"), "it named a process: {}", fired.message);
+        assert!(!fired.message.contains(" over "), "it named a window: {}", fired.message);
     }
 
     /// ...and a flat machine does not.
@@ -1272,12 +1648,146 @@ mod trend_tests {
         assert_eq!(quantity(1024.0, "B"), "+1.0 KiB");
         assert_eq!(quantity(-1024.0, "B"), "-1.0 KiB");
         assert_eq!(quantity(90.0, "%"), "90.0%");
+        // A rate keeps its denominator, and a growth figure its sign.
+        assert_eq!(quantity(1024.0, "B/s"), "+1.0 KiB/s");
+        assert_eq!(quantity(-2048.0, "B/s"), "-2.0 KiB/s");
+        assert_eq!(quantity(20.0, "+%"), "+20.0%");
+        assert_eq!(quantity(-20.0, "+%"), "-20.0%");
+    }
+
+    /// A rule that names a series to follow.
+    fn series_rule(target: &str, query: &str, threshold: f64) -> AlertRule {
+        AlertRule { target: target.into(), ..trend_rule(query, threshold, 600) }
+    }
+
+    /// One process whose CPU and IO rate climb while its RSS does not move.
+    fn busy(at: u64, cpu: f32, io: f64) -> Snapshot {
+        Snapshot {
+            procs: vec![ProcRow {
+                pid: 42,
+                name: "postgres".into(),
+                mem: 1 << 20,
+                cpu,
+                read_bps: io,
+                start_time_unix: 1,
+                ..Default::default()
+            }],
+            taken_at_unix: at,
+            ..Default::default()
+        }
+    }
+
+    /// The whole point of the addition: RSS is flat, so an `rss` trend rule
+    /// is silent, and the thing that is actually running away is caught only
+    /// by a rule that names the series it is running away in.
+    #[test]
+    fn a_climbing_io_rate_fires_a_rule_that_asks_for_io_and_not_one_that_asks_for_rss() {
+        let threshold = (10 << 20) as f64; // 10 MiB/s of growth
+        let mut io_rule = AlertEngine::new(vec![series_rule("io", "postgres", threshold)]);
+        let mut rss_rule = AlertEngine::new(vec![series_rule("rss", "postgres", threshold)]);
+
+        let base = 1_700_000_000;
+        let mut io_fired = None;
+        for step in 0..=10u64 {
+            // From nothing to 40 MiB/s over ten minutes.
+            let snap = busy(base + step * 60, 1.0, (step * (40 << 20) / 10) as f64);
+            let active = io_rule.evaluate(&snap, step * 60);
+            if !active.is_empty() && io_fired.is_none() {
+                io_fired = Some(active[0].clone());
+            }
+            assert!(rss_rule.evaluate(&snap, step * 60).is_empty(), "flat RSS fired an rss rule");
+        }
+        let fired = io_fired.expect("a 40 MiB/s climb never fired a 10 MiB/s io trend rule");
+        assert!(fired.value >= threshold, "{fired:?}");
+        assert!(fired.message.contains("iB/s"), "a rate must read as one: {}", fired.message);
+        assert!(fired.message.contains("postgres"), "{}", fired.message);
+    }
+
+    /// CPU is kept in hundredths of a percent, so the threshold is read in
+    /// whole percentage points on the way back out.
+    #[test]
+    fn a_cpu_trend_is_measured_in_percentage_points() {
+        let mut e = AlertEngine::new(vec![series_rule("cpu", "postgres", 20.0)]);
+        let base = 1_700_000_000;
+        let mut fired = None;
+        for step in 0..=10u64 {
+            // 5% to 55%: fifty points of drift that no `cpu` threshold at 90
+            // would ever catch.
+            let snap = busy(base + step * 60, 5.0 + step as f32 * 5.0, 0.0);
+            let active = e.evaluate(&snap, step * 60);
+            if !active.is_empty() && fired.is_none() {
+                fired = Some(active[0].clone());
+            }
+        }
+        let fired = fired.expect("a fifty-point climb never fired a twenty-point rule");
+        assert!((20.0..=60.0).contains(&fired.value), "read in the wrong unit: {fired:?}");
+        assert!(fired.message.contains('%'), "{}", fired.message);
+        assert!(fired.message.contains('+'), "growth needs its sign: {}", fired.message);
+    }
+
+    /// Only the axes some rule names are kept: three series per process for a
+    /// question nobody asked is the cost this gate exists to avoid.
+    #[test]
+    fn only_the_series_a_rule_names_are_tracked() {
+        let axes = |rules: Vec<AlertRule>| {
+            let mut e = AlertEngine::new(rules);
+            e.evaluate(&busy(1_700_000_000, 1.0, 1.0), 0);
+            e.tracked_axes()
+        };
+        assert_eq!(axes(vec![]), ProcAxes::default());
+        assert_eq!(
+            axes(vec![series_rule("io", "pg", 1.0)]),
+            ProcAxes::default().with(TrendSeries::Io)
+        );
+        assert_eq!(
+            axes(vec![series_rule("", "pg", 1.0)]),
+            ProcAxes::default().with(TrendSeries::Rss),
+            "an unnamed series is still resident memory"
+        );
+        assert_eq!(
+            axes(vec![series_rule("io", "pg", 1.0), series_rule("cpu", "pg", 1.0)]),
+            ProcAxes::default().with(TrendSeries::Io).with(TrendSeries::Cpu)
+        );
+        // A machine trend needs no per-process series at all.
+        assert_eq!(axes(vec![trend_rule("", 1.0, 600)]), ProcAxes::default());
+    }
+
+    /// A target that names no series measures nothing rather than quietly
+    /// measuring RSS and reporting a number about something else.
+    #[test]
+    fn a_rule_naming_a_series_that_does_not_exist_is_inert() {
+        let mut e = AlertEngine::new(vec![series_rule("ioo", "postgres", 1.0)]);
+        let base = 1_700_000_000;
+        for step in 0..=10u64 {
+            let snap = busy(base + step * 60, 5.0 + step as f32 * 5.0, (step << 20) as f64);
+            assert!(e.evaluate(&snap, step * 60).is_empty(), "a misspelled series fired");
+        }
+        assert_eq!(e.tracked_axes(), ProcAxes::default(), "it should not even be sampled");
+    }
+
+    #[test]
+    fn a_trend_target_splits_into_a_series_and_a_query() {
+        assert_eq!(split_trend_target("postgres"), (TrendSeries::Rss, "postgres"));
+        assert_eq!(split_trend_target("io:postgres"), (TrendSeries::Io, "postgres"));
+        assert_eq!(split_trend_target("cpu:user:pg"), (TrendSeries::Cpu, "user:pg"));
+        // A query whose first segment is not a series is left whole.
+        assert_eq!(split_trend_target("user:pg"), (TrendSeries::Rss, "user:pg"));
+        assert_eq!(
+            split_trend_target("re:^chrom(e|ium)$"),
+            (TrendSeries::Rss, "re:^chrom(e|ium)$")
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The command lines a pass wants run, which is what these assertions
+    /// have always been about; the context around them has its own tests.
+    fn commands_of(e: &mut AlertEngine) -> Vec<String> {
+        e.take_commands().into_iter().map(|c| c.command).collect()
+    }
     use crate::metrics::{CpuSample, DiskRow, MemSample, ProcRow, Sensor};
 
     fn rule(name: &str, kind: AlertKind, threshold: f64, for_secs: u64) -> AlertRule {
@@ -1396,7 +1906,7 @@ mod tests {
         let mut e = AlertEngine::new(vec![r]);
 
         e.evaluate(&snap_cpu(95.0), 0);
-        assert_eq!(e.take_commands(), vec!["notify-send hot".to_string()]);
+        assert_eq!(commands_of(&mut e), vec!["notify-send hot"]);
         e.evaluate(&snap_cpu(95.0), 1);
         assert!(e.take_commands().is_empty(), "must not re-fire while still active");
 
@@ -1527,7 +2037,7 @@ mod tests {
         let mut e = AlertEngine::new(vec![over, under]);
 
         assert_eq!(e.evaluate(&snap_cpu(95.0), 0).len(), 1);
-        assert_eq!(e.take_commands(), vec!["page".to_string()]);
+        assert_eq!(commands_of(&mut e), vec!["page"]);
         for t in 1..5 {
             e.evaluate(&snap_cpu(95.0), t);
             assert!(e.take_commands().is_empty(), "re-fired at t={t}");
@@ -1688,5 +2198,26 @@ mod tests {
         let active = e.evaluate(&snap, 0);
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].name, "mem");
+    }
+}
+
+#[cfg(test)]
+mod hook_number_tests {
+    use super::hook_number;
+
+    /// A hook that echoes the value into a message must not print seventeen
+    /// digits of an `f32` percentage, and must still be parseable.
+    #[test]
+    fn a_measurement_is_quoted_without_inventing_precision() {
+        assert_eq!(hook_number(23.076923370361328), "23.077");
+        assert_eq!(hook_number(0.0), "0");
+        assert_eq!(hook_number(90.0), "90");
+        // Bytes are whole, and stay whole rather than gaining a decimal tail.
+        assert_eq!(hook_number(412_013_312.0), "412013312");
+        assert_eq!(hook_number(-2048.0), "-2048");
+        // ...and everything it prints parses back as a number.
+        for v in [23.076923370361328f64, 0.0, 90.0, 412_013_312.0, -2048.0, 0.5] {
+            assert!(hook_number(v).parse::<f64>().is_ok(), "{v}");
+        }
     }
 }

@@ -773,9 +773,17 @@ pub fn secret_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     // The length is not a secret — the lengths of the two are compared in
     // constant time anyway by folding it into the difference.
-    let mut diff = (a.len() ^ b.len()) as u8;
+    //
+    // `usize`, not `u8`: narrowing the fold threw away every bit of the length
+    // difference above the low eight, so two lengths 256 apart — 6 and 262 —
+    // folded to zero and left the byte loop as the only check. The bytes past
+    // the shorter string compare against 0, so the pair that survived both
+    // was a correct prefix followed by NUL padding. Not a bypass on its own,
+    // since the prefix still has to be the secret, but the length check was
+    // simply not doing its job.
+    let mut diff = a.len() ^ b.len();
     for i in 0..a.len().max(b.len()) {
-        diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
+        diff |= (a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0)) as usize;
     }
     diff == 0
 }
@@ -898,26 +906,37 @@ fn handle<S: Conn>(mut stream: S, token: Option<&str>, body: impl FnOnce() -> St
     if reader.read_line(&mut line).is_err() {
         return;
     }
-    // Headers are only read when something is going to look at one: an
-    // exporter with no token configured has no reason to read past the
-    // request line, and reading it would only give a client more to say.
+    // The headers are read to the blank line whether or not anything is going
+    // to look at one. Reading only the request line and answering looks like a
+    // saving and is a bug: closing a socket that still has unread bytes in its
+    // receive buffer makes Linux send RST instead of FIN, and the RST discards
+    // the response that was just written. The client sees a reset connection
+    // rather than the 200 the exporter sent.
+    //
+    // It is a race, so it hides on a fast machine and is routine on a slow
+    // one. Measured on a single-core box with the suite's own client: 11 of 25
+    // scrapes answered with the headers unread, 25 of 25 with them read —
+    // same binary, same client, back to back. Prometheus would have recorded
+    // more than half those scrapes as failures.
+    //
+    // Only the value anybody needs is kept; the rest is read and dropped,
+    // bounded by `MAX_HEADERS` and by the `take` above.
     let mut auth: Option<String> = None;
-    if token.is_some() {
-        for _ in 0..MAX_HEADERS {
-            let mut header = String::new();
-            match reader.read_line(&mut header) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(_) => return,
-            }
-            if header.trim().is_empty() {
-                break;
-            }
-            if let Some((name, value)) = header.split_once(':')
-                && name.trim().eq_ignore_ascii_case("authorization")
-            {
-                auth = Some(value.trim().to_string());
-            }
+    for _ in 0..MAX_HEADERS {
+        let mut header = String::new();
+        match reader.read_line(&mut header) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => return,
+        }
+        if header.trim().is_empty() {
+            break;
+        }
+        if token.is_some()
+            && let Some((name, value)) = header.split_once(':')
+            && name.trim().eq_ignore_ascii_case("authorization")
+        {
+            auth = Some(value.trim().to_string());
         }
     }
     // A line that filled the budget without a newline is not a request line.
@@ -1015,6 +1034,22 @@ pub fn serve_rendered(
         ),
         (None, false) => {}
     }
+    serve_listener(listener, token, render_body)
+}
+
+/// Serve on a listener somebody else bound.
+///
+/// `serve_rendered` is this plus `TcpListener::bind` and the startup notices.
+/// Taking the listener matters for a caller that needs to know which port it
+/// got: asking the kernel for a free one, dropping it and handing over the
+/// number leaves a window in which anything on the machine can take that port
+/// — and the loser of that race does not fail to connect, it connects to
+/// whatever won.
+pub fn serve_listener(
+    listener: TcpListener,
+    token: Option<String>,
+    render_body: impl FnMut(Duration) -> String + Send + 'static,
+) -> std::io::Result<()> {
     accept_loop(listener.incoming(), token, render_body)
 }
 
@@ -1662,6 +1697,99 @@ mod tests {
         assert!(secret_eq("", ""));
     }
 
+    /// The length half of that comparison was folded into a `u8`, which threw
+    /// away everything above the low eight bits: a candidate exactly 256 bytes
+    /// longer than the token folded to zero and left the byte loop — which
+    /// compares the extra bytes against 0 — as the only check.
+    #[test]
+    fn a_candidate_a_whole_byte_longer_in_the_high_bits_is_still_rejected() {
+        let want = "s3cret";
+        let padded = format!("{want}{}", "\0".repeat(256));
+        assert_eq!(padded.len(), want.len() + 256);
+        assert!(!secret_eq(&padded, want), "NUL padding passed as the token");
+        assert!(!authorized(Some(&format!("Bearer {padded}")), Some(want)));
+        // ...and from the other side, for a token that is itself the longer one.
+        assert!(!secret_eq(want, &padded));
+    }
+
+    /// An exporter on an ephemeral port, serving `body`.
+    ///
+    /// The listener this binds is the one the exporter serves on, rather than
+    /// a probe that is dropped so its port number can be handed over. That
+    /// gap is a real race: a full `cargo test` run binds a lot of ephemeral
+    /// ports, and the loser does not fail to connect — it connects to
+    /// whatever took the port, and then asserts on somebody else's response.
+    fn exporter(token: Option<&str>, mut body: impl FnMut() -> String + Send + 'static) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a free port");
+        let addr = listener.local_addr().unwrap().to_string();
+        let token = token.map(str::to_string);
+        std::thread::spawn(move || {
+            let _ = serve_listener(listener, token, move |_| body());
+        });
+        // The listener is already bound, so a connection is accepted the
+        // moment the loop reaches it; this only waits for the thread to start.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::net::TcpStream::connect(&addr).is_err() {
+            assert!(std::time::Instant::now() < deadline, "exporter never came up");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        addr
+    }
+
+    /// Answering before the request has been read destroys the answer.
+    ///
+    /// Closing a socket with unread bytes still in its receive buffer makes
+    /// Linux send RST rather than FIN, and the RST discards whatever was
+    /// written. The exporter used to read only the request line when no token
+    /// was configured, so every scrape whose headers had not all arrived by
+    /// then was reset instead of answered — a race that hides on a fast
+    /// machine and was losing more than half the scrapes on a single-core one.
+    ///
+    /// Asserted as the invariant rather than by trying to lose the race: the
+    /// exporter must not answer until it has read the blank line that ends the
+    /// request. Whether a given reset actually lands depends on timing the
+    /// test cannot control — on a fast machine the client usually gets its
+    /// response anyway — but "answered too early" is exactly the condition
+    /// that leaves bytes unread, and it is deterministic.
+    #[test]
+    fn a_scrape_is_not_answered_before_the_request_has_been_read() {
+        use std::io::Read;
+        use std::net::TcpStream;
+
+        let addr = exporter(None, || "metrics body\n".into());
+        let mut c = TcpStream::connect(&addr).expect("connect");
+
+        // A complete request line, and nothing else yet.
+        c.write_all(b"GET /metrics HTTP/1.1\r\n").unwrap();
+        c.flush().unwrap();
+
+        c.set_read_timeout(Some(Duration::from_millis(400))).unwrap();
+        let mut early = [0u8; 64];
+        match c.read(&mut early) {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Ok(n) => panic!(
+                "answered after the request line alone, leaving {} unread: {:?}",
+                "the headers",
+                String::from_utf8_lossy(&early[..n])
+            ),
+            Err(e) => panic!("unexpected error waiting for the headers to matter: {e:?}"),
+        }
+
+        // Now finish the request; the answer should follow.
+        c.write_all(b"Host: x\r\nUser-Agent: late\r\n\r\n").unwrap();
+        c.flush().unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut response = Vec::new();
+        c.read_to_end(&mut response).expect("the response");
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "{text}");
+        assert!(text.contains("metrics body"), "{text}");
+    }
+
     /// End to end over a socket, because the header has to be *read* as well
     /// as checked, and the request line alone used to be all that was read.
     #[test]
@@ -1669,19 +1797,7 @@ mod tests {
         use std::io::Read;
         use std::net::TcpStream;
 
-        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = probe.local_addr().unwrap().to_string();
-        drop(probe);
-
-        let bound = addr.clone();
-        std::thread::spawn(move || {
-            let _ = serve_rendered(&bound, Some("s3cret".into()), |_| "metrics body\n".into());
-        });
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while TcpStream::connect(&addr).is_err() {
-            assert!(std::time::Instant::now() < deadline, "exporter never came up");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let addr = exporter(Some("s3cret"), || "metrics body\n".into());
 
         let ask = |request: &str| -> String {
             let mut c = TcpStream::connect(&addr).expect("connect");
@@ -1723,22 +1839,7 @@ mod tests {
         use std::io::Read;
         use std::net::TcpStream;
 
-        // Bind ourselves so the test never guesses a port, then let `serve`
-        // take the listener's address.
-        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = probe.local_addr().unwrap().to_string();
-        drop(probe);
-
-        let bound = addr.clone();
-        std::thread::spawn(move || {
-            let _ = serve(&bound, 0, |_| Snapshot::default());
-        });
-        // Wait for the listener rather than sleeping a guess.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while TcpStream::connect(&addr).is_err() {
-            assert!(std::time::Instant::now() < deadline, "exporter never came up");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let addr = exporter(None, || render(&Snapshot::default(), 0));
 
         // Connections that open and say nothing. Before connections were
         // handled off the accept loop, one of these was enough to wedge the
@@ -1768,28 +1869,16 @@ mod tests {
         use std::net::TcpStream;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = probe.local_addr().unwrap().to_string();
-        drop(probe);
-
         // Panic on every scrape but the last round, so the slots have to come
         // back for the final request to be answered at all.
         let scrapes = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&scrapes);
-        let bound = addr.clone();
-        std::thread::spawn(move || {
-            let _ = serve_rendered(&bound, None, move |_| {
-                if counter.fetch_add(1, Ordering::SeqCst) < MAX_CONNECTIONS * 2 {
-                    panic!("scrape blew up");
-                }
-                "ok\n".to_string()
-            });
+        let addr = exporter(None, move || {
+            if counter.fetch_add(1, Ordering::SeqCst) < MAX_CONNECTIONS * 2 {
+                panic!("scrape blew up");
+            }
+            "ok\n".to_string()
         });
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while TcpStream::connect(&addr).is_err() {
-            assert!(std::time::Instant::now() < deadline, "exporter never came up");
-            std::thread::sleep(Duration::from_millis(10));
-        }
 
         let scrape = |addr: &str| -> String {
             let mut c = TcpStream::connect(addr).expect("connect");
@@ -1823,19 +1912,7 @@ mod tests {
     fn a_client_that_never_sends_a_newline_is_cut_off_rather_than_buffered() {
         use std::net::TcpStream;
 
-        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = probe.local_addr().unwrap().to_string();
-        drop(probe);
-
-        let bound = addr.clone();
-        std::thread::spawn(move || {
-            let _ = serve(&bound, 0, |_| Snapshot::default());
-        });
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while TcpStream::connect(&addr).is_err() {
-            assert!(std::time::Instant::now() < deadline, "exporter never came up");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let addr = exporter(None, || render(&Snapshot::default(), 0));
 
         let mut flood = TcpStream::connect(&addr).expect("connect");
         flood.set_write_timeout(Some(Duration::from_secs(3))).unwrap();

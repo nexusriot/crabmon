@@ -101,8 +101,9 @@ and it can print all of it as JSON or CSV for scripts.
   stall, network throughput, file descriptors — or the number of processes
   matching a filter query, which with `below` is how you get paged when
   something *stops*, and `kind = "trend"` on growth rather than level — the
-  process leaking 200 MB every ten minutes, which no threshold catches until
-  it is too late to act on. `--serve --alerts` and `--stream --alerts` run the same
+  process leaking 200 MB every ten minutes, or whose disk rate or CPU has been
+  climbing since Tuesday, which no threshold catches until it is too late to
+  act on. `--serve --alerts` and `--stream --alerts` run the same
   rules with no terminal at all, exporting each one firing or not — which is
   what puts pressure stall, device saturation and descriptor exhaustion within
   reach of a pager.
@@ -116,7 +117,10 @@ and it can print all of it as JSON or CSV for scripts.
   question is "what is this box doing" over SSH and `jq` is not the answer.
 - **Record & replay** — `--record` writes every sample to a JSONL file (trimmed
   to keep it a sane size) and `--replay` drives the whole UI from one, so "send
-  me a recording of the slowdown" is a workable bug report.
+  me a recording of the slowdown" is a workable bug report. `--record-rotate`
+  keeps a bounded window of it on disk at all times, and both work headlessly
+  under `--stream`, `--serve` and `--watch` — so the always-on recorder is a
+  systemd unit rather than something that needs a terminal in front of it.
 - **Flight recorder** — `[record] flight` keeps the last N frames in memory and
   writes them out, with the aftermath, whenever an alert fires. The recording
   of an incident then exists because the incident happened, rather than because
@@ -153,6 +157,11 @@ and it can print all of it as JSON or CSV for scripts.
   the most.
 - **Action log** — every signal, renice and affinity change is recorded to a
   local file, viewable in the TUI with `L`.
+- **Self-check** — `crabmon --doctor` says what this machine will and will not
+  let crabmon see, and exits non-zero when the config asks for something that
+  cannot work here. crabmon never reports zero for a thing it could not read,
+  which is right and leaves "is that nothing, or something I am not allowed to
+  see?" as a question only this answers.
 - **Themes and layouts** — five colour themes, five layouts, and a config file
   that covers every panel, threshold and colour.
 
@@ -231,12 +240,13 @@ run of stuck workers.
 | `--no-color` | Disable colour (same as `--theme mono`) |
 | `--no-mouse` | Do not capture mouse events |
 | `-1`, `--once` | Print one snapshot and exit (this host only) |
-| `--format <FMT>` | `json` or `csv`, for `--once` |
+| `--format <FMT>` | `json` (default), `csv` or `text` for `--once` and `--watch`; `--diff` renders `json` or text |
 | `-n`, `--top <N>` | Limit `--once` and `P` snapshot output to the top N processes |
 | `-c`, `--config <PATH>` | Use an alternate config file |
 | `-g`, `--group <BY>` | Group processes: `none`, `service`, `container`, `user` |
 | `--columns <LIST>` | Process-table columns, e.g. `pid,user,cpu,mem,name` |
-| `--record <PATH>` | Record every sample to a JSONL file, replacing it if it exists |
+| `--record <PATH>` | Record every sample to a JSONL file, replacing it if it exists; works headless too |
+| `--record-rotate <DIR>` | Keep a rotating recording in DIR: `[record] rotate_keep` segments of `rotate_frames` frames, oldest deleted; works headless too |
 | `--replay <PATH>` | Replay a recording instead of sampling this host |
 | `--remote <TARGET>` | Monitor TARGET over SSH; comma-separated for a fleet |
 | `--remote-command <C>` | Command to run on the remote host |
@@ -244,6 +254,7 @@ run of stuck workers.
 | `--stream` | Print one JSON snapshot per line forever (this host only) |
 | `--alerts` | With `--serve`/`--stream`: evaluate alert rules headlessly |
 | `--diff <A> [B]` | Compare two snapshots, or one recording end to end |
+| `--doctor` | Report what this host lets crabmon measure, and exit |
 | `--watch <QUERY>` | Block until processes match QUERY, then exit 1 |
 | `--watch-rule <EXPR>` | ...or until a measurement does: `cpu>=90`, `proc:nginx<1` |
 | `--watch-for <SECS>` | ...only once the match has held this long |
@@ -356,6 +367,8 @@ nice<0             scheduling priority
 time>2h            run time, in s/m/h/d; a bare number is seconds
 fd>1000            open file descriptors (needs `[procs] fds`)
 fd%>90             ...as a percentage of the process's own limit
+pss>500M           proportional set size (needs `[procs] pss`)
+uss>100M           unique set size — what killing it would free
 ```
 
 Only a `|` with whitespace on both sides is an operator, so
@@ -370,8 +383,8 @@ so `!thr>2` is how you find them instead.
 ## Recordings
 
 `--record` writes one JSON object per sample. An existing file at that path is
-replaced, not appended to. Frames are trimmed to the busiest 100 processes with
-argv truncated to 200 characters, which is roughly 55 KiB a frame — about
+replaced, not appended to. Frames are trimmed to the busiest 100 processes
+with argv truncated to 200 characters, which is roughly 55 KiB a frame — about
 240 MiB for an hour at the default interval. `[record]` controls all three
 limits.
 
@@ -394,6 +407,57 @@ by default while scrubbing: `[` and `]` step a frame, `{` and `}` step ten, and
 scans it once for line offsets, which touches no JSON at all, and parses one
 frame at a time as you scrub. Smaller ones are read whole, where holding them
 costs less than indexing them.
+
+### Recording without a terminal
+
+Both flags work in every mode that samples on a loop, not only the interface:
+`--stream`, `--serve` and `--watch` record what they measured. That is what
+makes an always-on recorder deployable — the one place it belongs is a unit
+file, which is the one place an event loop is not:
+
+```sh
+crabmon --stream --record-rotate /var/log/crabmon > /dev/null   # a black box
+crabmon --serve :9100 --alerts --record-rotate /var/log/crabmon # ...or with metrics
+crabmon --watch 'state:D' --watch-for 30 --record-rotate /var/log/crabmon
+```
+
+Under `--stream` the frame on stdout keeps the full inventory a collector
+needs while the one on disk is trimmed by `[record]`, so a long-running stream
+does not fill the disk to say what it has already said.
+
+Under `--serve` a frame is recorded per **scrape**, not per `refresh_ms`,
+because a scrape is when a sample is actually taken. Size `rotate_frames`
+against the scrape interval rather than the refresh: 1800 frames is about
+twenty-four minutes at the default 800 ms refresh and about seven hours at a
+fifteen-second scrape, which is the same setting meaning very different
+amounts of disk.
+
+A fleet records a timeline per host. `--record run.jsonl` becomes
+`run-web-1.jsonl`, `run-db-2.jsonl` and so on, and `--record-rotate DIR` gives
+each host a directory of its own under `DIR` — a directory rather than a name
+because a segment is `crabmon-<unix>.jsonl` while a flight dump is
+`crabmon-<rule>-<unix>.jsonl`, so putting the host in the name would make the
+two indistinguishable and rotation would prune the evidence sitting beside it.
+Only frames that actually arrived are recorded, so a host that has gone quiet
+leaves a gap rather than a flat line of its last good sample.
+
+The host part of those names is the target reduced to something a filesystem
+will take, and that reduction can collide: `deploy@db-2` and `deploy-db-2`
+both come out as `deploy-db-2`, and a target with no usable character left has
+nothing to come out as. Names are therefore chosen over the whole fleet rather
+than one target at a time — one that is already free is kept, so an ordinary
+fleet gets the names you would expect, and the rest become `deploy-db-2-2` or
+`host-1`. Without that the two hosts would share a recording, and a recorder
+truncates what it opens.
+
+A recording that cannot be written is reported once, and again if it starts
+working: a read-only directory or a full disk does not improve by itself, and
+`--serve` would otherwise log an identical line on every scrape for as long as
+it ran. It is never fatal — a gap in a recording is better than an exporter
+that stopped answering.
+
+`--once` and `--diff` refuse both flags: they take a single sample, and there
+is no sequence for a recording to be of.
 
 ## The flight recorder
 
@@ -463,11 +527,17 @@ crabmon --watch-rule 'proc:nginx<1' --watch-timeout 0 && echo 'nginx came back'
 ```
 
 `EXPR` is `kind[:target]op value`, where `kind` is any alert kind — `cpu`,
-`mem`, `swap`, `load`, `disk`, `temp`, `gpu`, `psi`, `io`, `net`, `fd`, `proc`.
+`mem`, `swap`, `load`, `disk`, `temp`, `gpu`, `psi`, `io`, `net`, `fd`, `proc`,
+`trend`, `fillin`, `cgroup`, `kernel`.
 `>` and `>=` both mean at-or-over and `<` means strictly under, matching the
 way an `[[alert]]` compares; `<=` is refused rather than quietly read as `<`.
 The operator is taken from the right, so a `proc` query may contain one of its
 own: `proc:cpu>5<1` is "fewer than one process over 5% CPU".
+
+The threshold is read in the kind's own units: `net` and `trend` take the
+filter language's size suffixes (`net>=1M`, `trend:postgres>200M`), `fillin`
+takes durations (`fillin:/var<3h`), and everything else is a plain number — a
+percentage, a temperature, a load average or a count.
 
 Both forms *are* alert rules — `--watch nginx` is `proc:nginx>=1` — so a
 condition behaves identically here, in the config file, and under
@@ -596,7 +666,7 @@ filter = ""                 # initial filter query
 tree = false
 show_threads = false        # Linux reports every task; threads are hidden by default
 group_by = "none"           # none|service|container|user
-layout = "dashboard"        # dashboard|processes|cpu|io
+layout = "dashboard"        # dashboard|processes|cpu|io|fleet
 theme = "default"           # default|mono|nord|solarized|gruvbox
 group_sensors = true
 show_virtual_ifaces = false
@@ -713,8 +783,10 @@ over_secs = 0               # trend rules: the window growth is measured
 below = false               # fire when strictly *under* the threshold instead
 target = ""                 # mount point, sensor prefix, GPU or interface
                             # name, psi resource (cpu|mem|io[.full]), a
-                            # kernel event (oom|segfault|io-error|oops), or a
-                            # process name for fd rules
+                            # kernel event (oom|segfault|io-error|oops), a
+                            # process name for fd rules, or — for a trend
+                            # rule with a query — which series of those
+                            # processes to follow: rss (default)|cpu|io
 query = ""                  # the filter query a proc rule counts matches of
 command = ""                # run once when the alert activates
 command_clear = ""          # ...and once when it recovers
@@ -754,6 +826,29 @@ over_secs = 600             # ...measured over ten minutes
 for_secs = 120              # ...and still true two minutes later
 ```
 
+`target` says which of the matched processes' series to follow: `rss` (the
+default), `cpu` or `io`. RSS is how a leak is usually spelled, but it is not
+the only thing that climbs — a process whose disk rate has risen all week, or
+whose CPU has crept up since a deploy, is the same shape of problem and no
+threshold catches either until it is too late:
+
+```toml
+[[alert]]
+name = "io-creep"
+kind = "trend"
+target = "io"               # rss (default) | cpu | io
+query = "postgres"
+threshold = 1.0e7           # bytes per second of growth — about 10 MB/s
+over_secs = 600
+```
+
+Thresholds are read in the series' own unit: bytes for `rss`, bytes per second
+for `io`, percentage points for `cpu`. From a shell the series goes in front of
+the query — `crabmon --watch-rule 'trend:io:postgres>10M'`,
+`'trend:cpu:postgres>20'` — and a bare `trend:postgres` still means RSS. A
+`target` naming no series measures nothing rather than quietly reporting RSS
+under another name.
+
 `over_secs` is the window the growth is measured over; `for_secs` is how long
 the answer has to hold before the rule fires, and a leak alert usually wants
 both. A series reports nothing until it actually spans half its window, so a
@@ -766,9 +861,14 @@ which is a cache being dropped or a service restarting. From a shell:
 crabmon --watch-rule 'trend:postgres>200M' --watch-timeout 3600 || page-oncall
 ```
 
-Per-process series are only kept when a `trend` rule has a `query`, and at
-most a few thousand processes are tracked, so a machine that forks constantly
-cannot turn the leak detector into a leak.
+`--watch-rule` has nowhere to put an `over_secs`, so a trend watched from a
+shell always measures over the five-minute default; the window is a
+`[[alert]]` setting.
+
+Per-process series are only kept when a `trend` rule has a `query`, only for
+the series some rule actually names, and for at most a few thousand processes
+— so a machine that forks constantly cannot turn the leak detector into a
+leak, and asking about IO does not silently start keeping CPU and RSS too.
 
 A `target` that names data rather than a fixed vocabulary — a mount, a
 container, a unit, a sensor prefix — is not checked against what exists now,
@@ -821,8 +921,89 @@ command = "page-oncall 'the OOM killer has been busy'"
 On a host where `/dev/kmsg` needs root the rule reports *nothing* rather than
 zero, so it neither fires nor claims the machine is healthy.
 
+### What a hook is told
+
+A hook is run as `sh -c <command>` with the context in its environment, so one
+script serves every rule instead of each rule carrying its own message:
+
+| Variable | |
+| --- | --- |
+| `CRABMON_RULE` | the rule's name |
+| `CRABMON_KIND` | `cpu`, `trend`, `kernel`… |
+| `CRABMON_STATE` | `firing` or `cleared` |
+| `CRABMON_VALUE` | what was measured |
+| `CRABMON_THRESHOLD` | what it was compared against |
+| `CRABMON_MESSAGE` | the line the status bar shows |
+| `CRABMON_HOST` | the fleet target, or this machine's name |
+| `CRABMON_AT` | the sample's Unix time |
+| `CRABMON_DUMP` | the flight recording this firing opened, if any |
+| `CRABMON_SUMMARY` | the readable summary beside it |
+
+Every one is always set, empty where it does not apply, so a hook written with
+`set -u` does not have to guess which exist.
+
+```toml
+[[alert]]
+name = "cpu-saturated"
+kind = "cpu"
+threshold = 90.0
+command = "page-oncall"
+command_clear = "page-oncall"
+```
+
+```sh
+#!/bin/sh
+# page-oncall — the same script for every rule.
+set -eu
+case "$CRABMON_STATE" in
+  firing)  text="🔥 $CRABMON_HOST: $CRABMON_MESSAGE" ;;
+  cleared) text="✅ $CRABMON_HOST: $CRABMON_MESSAGE" ;;
+esac
+[ -n "$CRABMON_SUMMARY" ] && text="$text (evidence: $CRABMON_SUMMARY)"
+curl -sS -X POST -d "$text" "$WEBHOOK"
+```
+
 `!` lists the rules, which are firing, and a log of every transition — an alert
 that fires at 03:12 and clears at 03:14 says both.
+
+## Asking what this host can measure
+
+```sh
+crabmon --doctor
+```
+
+crabmon never reports zero for something it could not read: an unreadable fd
+table is unknown rather than none, a root-only `/dev/kmsg` says so rather than
+showing an empty list, and a rule with nothing to measure is skipped rather
+than firing. That is the right behaviour, and it leaves one question the
+interface cannot answer — *is that nothing, or something I am not allowed to
+see?* `--doctor` asks all of them at once:
+
+```text
++ platform       linux on x86_64
+~ privileges     running as uid 1000; other users' processes report less
++ pressure       /proc/pressure is readable
++ kernel-events  /dev/kmsg is readable; OOM kills, segfaults and IO errors are reported
+~ package-power  RAPL counters exist but are not readable; package watts are omitted
+                 → root-only on most kernels since CVE-2020-8694; run as root to read them
+```
+
+`+` works, `~` works but reports less here, `-` reports nothing at all, and a
+`→` line is what to do about it.
+
+It is a check as well as a report. It exits **1** when something the config
+actually asks for cannot work on this host, and **0** otherwise — so it
+belongs in a deploy, not only in a terminal:
+
+```sh
+crabmon --config ./crabmon.toml --doctor || exit 1
+```
+
+A missing GPU is not a failure; a `kind = "fd"` rule on a host whose fd tables
+are unreadable is, because that rule will never fire and a rule that never
+fires looks exactly like a quiet machine. The report is about the config
+actually in force, so `--config` is honoured. `--format json` emits the same
+thing for something other than a person.
 
 ## Platform notes
 
@@ -854,9 +1035,10 @@ that fires at 03:12 and clears at 03:14 says both.
 - `--remote` needs crabmon installed on the far end and non-interactive SSH
   (`BatchMode=yes`). It holds one session open and reads a stream of frames,
   falling back to a process per sample if the far end predates `--stream`; a
-  fetch that does not answer within 15 s is killed rather than left to hang. It
-  applies to the TUI only: `--once`, `--serve`, `--stream` and `--watch` sample
-  the host they run on and refuse to be combined with `--remote` or `--replay`.
+  fetch that does not answer within 15 s is killed rather than left to hang.
+  It applies to the TUI and to `--serve`, which exports a fleet. `--once`,
+  `--stream` and `--watch` sample the host they run on and refuse to be
+  combined with `--remote` or `--replay`.
 - Temperature sensors depend on the OS exposing them; if none are available the
   panel says so.
 - Alert rules are evaluated in the TUI and, with `--alerts`, under `--serve`

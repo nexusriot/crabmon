@@ -41,7 +41,7 @@ for one reason: it makes the whole program testable headlessly.
 src/
   main.rs            terminal setup/teardown, signals, panic hook, event loop
   lib.rs             module tree and the shared refresh bounds
-  cli.rs             argument parsing (hand-rolled, ~200 lines)
+  cli.rs             argument parsing (hand-rolled, ~400 lines)
   config.rs          the on-disk config, with defaults and clamping
   theme.rs           colour themes and threshold→colour mapping
   format.rs          byte/rate/duration formatting
@@ -52,10 +52,12 @@ src/
   alerts.rs          threshold rules and their state machine
   export.rs          JSON/CSV snapshot rendering
   app.rs             all state and input handling
-  record.rs          JSONL recording and the replay source
+  record.rs          JSONL recording, rotation, the replay source and
+                     `Recordings`, which every mode records through
   remote.rs          monitoring another host over SSH
   sampler.rs         sampling on a worker thread
   diff.rs            comparing two snapshots
+  doctor.rs          what this host lets crabmon measure, for `--doctor`
   watch.rs           the headless wait-for-a-condition mode
   supervisor.rs      alert rules and the flight recorder, outside the TUI
   fleet.rs           several hosts behind one metric source
@@ -97,7 +99,8 @@ src/
     sensors.rs       grouped temperatures
     gpu.rs           GPU rows
     fleet.rs         one row per host, when several are being watched
-    popups.rs        signal, confirm, renice, affinity, detail, help, alerts
+    popups.rs        signal, confirm, renice, affinity, ionice, detail,
+                     help, alerts, audit log
 ```
 
 ## The metric boundary
@@ -112,6 +115,11 @@ pub trait MetricSource {
     fn seek(&mut self, _position: usize) {}
     fn peek(&self) -> Option<Snapshot> { None }
     fn label(&self) -> Option<String> { None }
+    fn error(&self) -> Option<String> { None }
+    fn fleet(&self) -> Vec<FleetHost> { Vec::new() }
+    fn select_host(&mut self, _index: usize) {}
+    fn selected_host(&self) -> usize { 0 }
+    fn is_local(&self) -> bool { true }
     fn frame_id(&self) -> Option<u64> { None }
 }
 ```
@@ -129,6 +137,15 @@ would step straight past the frame just sought. `frame_id` belongs to
 asynchronous sources: `None` means every call produces a genuinely new sample,
 and anything else lets `App` tell a fresh frame from the same one handed out
 again. Live sources inherit the defaults and the scrub keys are inert for them.
+
+`error`, `fleet`, `select_host` and `selected_host` are the fleet view's half:
+`label` already says why a source cannot sample, but as prose with the answer
+embedded in it, and a row has to *know* whether to draw numbers or an
+explanation rather than match on a word inside a sentence. `is_local` is the
+one with teeth — everything crabmon does beyond drawing acts on a PID, and
+under `--remote` or `--replay` a local PID that happens to match is an
+unrelated program, so signalling, renicing, affinity, ionice and the detail
+pane's `/proc` reads are all gated on it.
 
 `Snapshot` is plain data (`HostInfo`, `CpuSample`, `MemSample`, `ProcRow`,
 `NetIface`, `DiskRow`, `Sensor`, `GpuInfo`, `CgroupInfo`) and derives
@@ -161,14 +178,16 @@ Two details matter:
 | `ConfirmKill` | `Enter` in the signal menu | confirmation |
 | `Renice` | `r` | numeric prompt |
 | `Affinity` | `A` | CPU-list prompt |
+| `IoPriority` | `I` | IO class and level prompt |
 | `Detail` | `Enter` | process detail |
 | `Help` | `?` | key bindings |
 | `Alerts` | `!` | rule list and state |
 | `AuditLog` | `L` | the local record of actions taken |
 
 Sending a signal is two-step by construction: `SignalMenu` → `ConfirmKill`.
-Every action that targets a process — signal, renice and affinity alike —
-re-checks that the PID still has the start time it had when the prompt opened,
+Every action that targets a process — signal, renice, affinity and IO priority
+alike — re-checks that the PID still has the start time it had when the prompt
+opened,
 so a recycled PID is refused rather than acted on. Linux samples also carry
 the kernel start tick, distinguishing reuse within one Unix second. Controls
 validate live identity immediately before the OS call; signals use a pidfd
@@ -308,6 +327,15 @@ construction. A query that fails to parse leaves the rule inert rather than
 counting zero, because counting zero would make every `below` rule fire for
 ever on a typo, hook and all.
 
+A hook is `sh -c` with the context in its environment rather than in the
+command: `CRABMON_RULE`, `CRABMON_VALUE`, `CRABMON_STATE` and the rest, listed
+in `alerts::HOOK_VARS` and checked against both documents by `tests/docs.rs`.
+Every variable is always set, empty where it does not apply, so a hook written
+with `set -u` need not guess which exist. The two that cannot come from the
+engine — which machine the rule was about, and which flight recording this
+pass opened for it — are filled in by `supervisor::attach_context`, because
+the dump does not exist until `drain` has written it.
+
 A rule with nothing to measure is skipped rather than read as zero. That is
 what makes `kind = "fd"` safe to leave in a config on a machine where
 `[procs] fds` is off, and `cpu.full` report nothing on the kernels that
@@ -332,6 +360,41 @@ hides threads by default the replay would then look almost empty.
 Every snapshot type carries `#[serde(default)]`, so a recording made by an older
 crabmon still loads when fields are added.
 
+### Where a recording comes from
+
+`record::Recordings` is the one place that turns `--record`, `--record-rotate`
+and `[record]` into open files. The interface, `--stream`, `--serve` and
+`--watch` all hold one and offer it every frame they sample.
+
+That is a single type rather than four copies because the resolution is not
+trivial: the rotation directory falls back through `--record-rotate`,
+`[record] rotate_dir`, `[record] flight_dir` and finally the working
+directory, and the flag turns rotation on by itself where the config alone
+would leave it off. Four copies of that is four chances to get it wrong, and
+the three that are not the interface have nobody watching a status line to
+notice.
+
+A fleet's host names are chosen by `record::unique_labels` over the whole
+target list rather than one target at a time. `sanitise_label` reduces a
+target to something a filesystem will take and is not injective — `user@host`
+is the ordinary way to write an SSH target, so `deploy@db-2` and
+`deploy-db-2` both reduce to `deploy-db-2`, and `@@@` reduces to nothing.
+Either is a quiet disaster: a shared directory means the second host truncates
+the first's segments, because a recorder truncates what it opens, and a
+nameless host falls back to the unlabelled path and writes among the flight
+dumps, where rotation prunes them. A name already free is kept, so an
+ordinary fleet is unchanged.
+
+A write that fails is reported, never fatal: a full disk under `--serve`
+would otherwise stop the exporter answering, which is worse than a gap in a
+recording. It is reported on the way *into* failure and again on the way out,
+not once a frame — a read-only directory does not improve by itself, and an
+exporter scraped every fifteen seconds would otherwise write an identical
+line four times a minute for as long as it ran. The same shape as an alert,
+which fires on the crossing rather than on every sample past the line. The interface reports into its status line and the headless modes
+onto stderr, which under `--stream` is the only place they can go — stdout is
+a frame per line that something else is parsing.
+
 ### The flight recorder
 
 `--record` only helps if it was started before the incident, which is the one
@@ -344,10 +407,13 @@ Three details:
 - **Frames are trimmed on the way *into* the ring, not on the way out.** A
   ten-minute window of untrimmed frames is well over a gigabyte of live memory,
   in the process whose job is to make memory pressure visible.
-- **The ring is written before the frame budget starts.** `run_flight_recorder`
-  pushes the frame *then* handles triggers, so the ring already contains the
-  frame that tripped the rule; the other order would stop every recording one
-  frame short of the evidence.
+- **The ring is written before the frame budget starts.**
+  `supervisor::drain_named` pushes the frame *then* handles triggers, so the
+  ring already contains the frame that tripped the rule; the other order would
+  stop every recording one frame short of the evidence. Both callers — the TUI
+  event loop and `Supervisor::observe` — go through it, which is the point:
+  this ordering is the kind of thing that ends up right in one copy and wrong
+  in the other.
 - **A trigger while a dump is running extends it** rather than opening a second
   file. A flapping rule would otherwise leave a file per refresh, each one
   mostly the same frames.
@@ -410,14 +476,21 @@ popup on top.
 | `Processes` | the process table full-width |
 | `Cpu` | one bar per core, in as many columns as fit, plus the average chart |
 | `Io` | network chart and table, disks, GPU |
+| `Fleet` | one row per host, when several `--remote` targets are being watched |
 
 The right-hand column's contents and order come from `panel_order`, and every
 panel can be switched off in `[panels]`.
 
-The process table's columns are chosen to fit the available width: PID, CPU and
-memory plus the command are always present, and state, user, disk, time, virtual
-size and thread count are added in that order as the terminal gets wider. A
-property test checks the chosen set fits at every width from 20 to 200 columns.
+The process table's columns are chosen to fit the available width: the marker,
+PID, CPU and memory plus the command are always present, and state, user, disk,
+time, nice, the CPU sparkline, virtual size and thread count are added in that
+order as the terminal gets wider (`procs::OPTIONAL`). PORTS and FD are not in
+that set at any width: each costs syscalls per row or per process, so they join
+only when `[procs] ports` or `[procs] fds` asks for them — and having been
+asked for, they outrank the columns that are free. Whichever subset is chosen
+is then drawn in one canonical left-to-right order rather than in the order it
+was added. A property test checks the chosen set fits at every width from 20 to
+200 columns.
 
 ## Terminal lifecycle
 
@@ -437,7 +510,7 @@ terminal or a runaway process:
 
 ## Testing
 
-Over 750 tests: the in-crate unit tests plus eight integration suites. All are
+Over 800 tests: the in-crate unit tests plus eight integration suites. All are
 offline and deterministic except `proc_control` and `e2e_local`, which exercise
 the running machine, and `e2e_docker`, which builds and runs a container:
 
@@ -464,7 +537,16 @@ the running machine, and `e2e_docker`, which builds and runs a container:
 - **`tests/cli.rs`** — the built binary: `--help`, `--version`, exit codes,
   `--once` JSON/CSV output, `--diff` in both formats, `--stream` read back
   through the recording parser, `--watch`'s exit codes, and the refusal to
-  combine a headless mode with `--remote` or `--replay`.
+  combine a headless mode with `--remote` or `--replay`. Also that recording
+  works without a terminal — `--stream` leaving a parseable recording no wider
+  than the frames it printed, `--watch` leaving a rotating one of the run-up,
+  and `--once` refusing both flags and writing nothing — and that `--stream`
+  keeps to its interval, bounded against a sample cost the test measures on
+  the machine it is running on rather than a fixed multiple of the refresh.
+  And `--doctor`: that every check is marked and identified, that
+  `--format json` parses, that it reports on the config `--config` actually
+  named, and that it exits 1 for a rule this host cannot measure and 0
+  otherwise.
 - **`tests/proc_control.rs`** — renice, CPU affinity and signals against a real
   spawned child, checked by reading the state back from the kernel. A unit test
   can only prove the arguments were well-formed, not that they were accepted.
@@ -549,8 +631,10 @@ the running machine, and `e2e_docker`, which builds and runs a container:
 
   These checks derive their expectations from the code — a serialised default
   `Config`, `cli::LONG_FLAGS`, `ALL_SORTS`, `PRESETS`, `ALL_GROUPINGS`, the
-  `KEYS` table, and the key literals parsed out of `on_normal_key` — rather than
-  from a hand-maintained list that could go stale in the same way the docs do.
+  `KEYS` table, `ALL_TREND_SERIES`, and the key literals parsed out of
+  `on_normal_key` — rather than from a hand-maintained list that could go stale
+  in the same way the docs do. `--help`'s own enumerations are checked too: its
+  `--layout` row sat at four layouts for the whole life of the fifth.
   They are also scoped to the relevant section of each document, so an
   incidental mention of a word elsewhere cannot satisfy them.
 
@@ -594,8 +678,8 @@ cfg-gated code paths against aarch64 Linux and FreeBSD.
 
 `--serve` is a hand-rolled `TcpListener` loop rather than a framework, because
 the whole contract is one method and four routes (`/`, `/metrics`, `/healthz`,
-and 404 for everything else). It samples once per scrape, on the accepting
-thread. Per-process series are capped (default 20) — one series per process on
+and 404 for everything else). It samples once per scrape, on the connection
+thread serving it, behind a mutex. Per-process series are capped (default 20) — one series per process on
 a 2000-task machine would dwarf every other metric in the scrape and make the
 exporter the most expensive thing on the box.
 
@@ -613,6 +697,14 @@ over loopback across an 18 s gap at the default 800 ms interval reported
 250 MiB/s rather than 11.6 MiB/s. Gauges carry no delta and were unaffected,
 which is what made it easy to miss.
 
+The whole request is read before anything is answered, even when nothing is
+going to look at a header. Reading only the request line looks like a saving
+and is a bug: closing a socket with unread bytes still in its receive buffer
+makes Linux send RST rather than FIN, and the RST discards the response that
+was just written. It is a race, so it hides on a fast machine — on a
+single-core one it was losing more than half the scrapes, which Prometheus
+records as failures rather than as anything crabmon said.
+
 Each connection is handled on its own thread, capped at `MAX_CONNECTIONS` with
 a 503 past it, and both socket directions carry a timeout. Doing the socket IO
 on the accept loop meant a client that connected and never sent a request — a
@@ -625,6 +717,23 @@ A bare `--serve 9100` binds to loopback; `:9100` keeps its conventional "every
 interface" meaning and says so at startup. The per-process series name every
 running command and its arguments, and the shortest spelling should not be the
 one that publishes them.
+
+## Answering for the machine
+
+`--doctor` exists because of the rule above. crabmon never reports zero for
+something it could not read — an unreadable fd table is unknown, a root-only
+`/dev/kmsg` says so, a rule with nothing to measure is skipped — which is
+right, and which leaves "is that nothing, or something I am not allowed to
+see?" as a question the interface cannot answer. `doctor::run` asks all of
+them once and says so.
+
+It is a *check*, not only a report: it exits 1 when something the config
+actually asks for cannot work here, and 0 otherwise. That distinction is the
+whole design. A missing GPU is a `Status::Unavailable` with no remedy and
+costs nothing; a `kind = "fd"` rule on a host whose fd tables are unreadable
+is an `Unavailable` *with* one, because that rule will never fire and a rule
+that never fires reads as a quiet machine. `Report::has_problems` is exactly
+"an unavailable check that carries a remedy".
 
 ## Known limitations
 
@@ -682,6 +791,28 @@ one that publishes them.
 - `--once` and `--diff` never fire a rule: they take one sample, and a hold
   time needs a sequence. `--serve --alerts`, `--stream --alerts` and
   `--watch` all evaluate rules, through the same `Supervisor` the TUI uses.
+- `--record` and `--record-rotate` work in every mode that samples on a loop:
+  the interface, `--stream`, `--serve` and `--watch`, all through one
+  `record::Recordings`. `--once` and `--diff` refuse them — a recording is a
+  sequence and they take one sample — as does `--serve --remote`, where a
+  fleet has a timeline per host and `--record` names one file. Under `--serve`
+  the cadence is the scrape's, not `refresh_ms`, because that is when a sample
+  is actually taken.
+- `--diff` renders JSON or the text report; there is no CSV form of a diff,
+  and `--format csv` alongside it falls through to text.
+- `--watch-rule` always measures a `trend` over `DEFAULT_TREND_WINDOW`:
+  `parse_rule` has nowhere to put an `over_secs`, so the window a `[[alert]]`
+  can set is fixed at five minutes from the command line.
+- `--ssh-option` does not exist. `RemoteSource` takes a vector of extra SSH
+  arguments and every caller passes an empty one, so anything beyond
+  `BatchMode` and `ConnectTimeout` has to go in `~/.ssh/config`.
+- `supervisor::spawn_hooks` reaps finished hooks lazily and holds the rest, so
+  a hook that never exits is held for the life of the process. Bounded in
+  practice by hooks being pagers rather than daemons.
+- `App::ProcSeries::push` drops the oldest sample with `Vec::remove(0)`, which
+  is a memmove of `PROC_HIST_LEN` elements per series per process per sample.
+  It does not show up against the cost of taking the sample, but a `VecDeque`
+  is what it wants to be.
 - Pins do not reorder the tree view. The ordering there is structural, and
   hoisting a child out of its parent would draw a tree that is not one.
 - `--diff` holds both snapshots in memory, so diffing two ends of a large
@@ -702,7 +833,15 @@ one that publishes them.
 - A `trend` rule keeps about eight points per series across its window. That
   is enough to measure a slope and to survive a missed sample; it is not a
   regression, and a sawtooth that happens to start and end high reads as
-  growth. Per-process series are capped at 4096 processes.
+  growth. Per-process series are capped at 4096 processes, and only the axes
+  (`rss`, `cpu`, `io`) some rule actually names are kept — `TrendTracker`
+  clears what it holds when that set changes, because a series whose points
+  stopped arriving would otherwise be read as a slope frozen at whatever it
+  last was.
+- A `trend` rule's CPU series is stored in hundredths of a percent, because a
+  process creeping up by a third of a percent a minute is exactly what it is
+  for and whole percent would round that series flat. The scaling is undone in
+  `measure`, so a threshold is written in whole percentage points.
 - `--serve --remote` samples every host on the scrape, so a scrape takes as
   long as the slowest host's worker has been waiting. The sources are
   threaded, so that is a frame's staleness rather than a scrape's delay.
@@ -714,4 +853,8 @@ Open defects, found by review and not yet fixed:
   blanking process names on a narrow terminal, the detail pane reading the
   local host under `--remote`/`--replay`, and `MATCHED` colliding with the
   failure exit code — were fixed together with the process-control guard that
-  the third of them turned up.
+  the third of them turned up. The most recent review's four are fixed too:
+  the recording flags that did nothing in a headless mode, `secret_eq`
+  narrowing its length fold to a `u8`, the environment mask missing `_KEY`-
+  suffixed credentials, and `a_process_that_execs_is_reported_as_what_it_became`
+  racing its own first sample.

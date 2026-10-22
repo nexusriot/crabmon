@@ -1,4 +1,4 @@
-.TH CRABMON 1 "2026-10-15" "crabmon 0.10.0" "User Commands"
+.TH CRABMON 1 "2026-10-22" "crabmon 0.14.0" "User Commands"
 .SH NAME
 crabmon \- terminal system monitor
 .SH SYNOPSIS
@@ -59,11 +59,15 @@ Do not capture mouse events.
 .TP
 .BR \-1 ", " \-\-once
 Print one snapshot to standard output and exit instead of starting the TUI.
-Always samples the host it runs on; \fB\-\-remote\fR and \fB\-\-replay\fR are
-ignored.
+Always samples the host it runs on; combining it with \fB\-\-remote\fR or
+\fB\-\-replay\fR is refused rather than quietly reporting the wrong machine.
 .TP
 .B \-\-format " " \fIFMT\fR
-Output format for \fB\-\-once\fR: \fBjson\fR (default) or \fBcsv\fR.
+Output format for \fB\-\-once\fR and \fB\-\-watch\fR: \fBjson\fR (default),
+\fBcsv\fR or \fBtext\fR. \fBtext\fR is an aligned table laid out by the same
+column planner the interface uses, i.e. the \fBtop \-b \-n1\fR shape.
+\fB\-\-diff\fR writes its report as \fBjson\fR or, for anything else, as the
+text report.
 .TP
 .BR \-n ", " \-\-top " " \fIN\fR
 Limit \fB\-\-once\fR and \fBP\fR snapshot output to the top \fIN\fR processes.
@@ -85,7 +89,11 @@ from the table. \fBname\fR is always drawn last.
 .TP
 .B \-\-record " " \fIPATH\fR
 Record every sample to a JSON Lines file, replacing any file already at that
-path. See \fBRECORDINGS\fR.
+path. See \fBRECORDINGS\fR. Works in every mode that samples on a loop: the
+interface, \fB\-\-stream\fR, \fB\-\-serve\fR and \fB\-\-watch\fR.
+\fB\-\-once\fR and \fB\-\-diff\fR refuse it, because a recording is a
+sequence and they take one sample; so does \fB\-\-serve \-\-remote\fR,
+where a fleet has a timeline per host and one file to put them in.
 .TP
 .B \-\-record\-rotate " " \fIDIR\fR
 Keep a rotating recording in \fIDIR\fR: segments of \fB[record]\fR
@@ -93,7 +101,17 @@ Keep a rotating recording in \fIDIR\fR: segments of \fB[record]\fR
 \fIrotate_keep\fR of them. Unlike \fB\-\-record\fR this is meant to be left
 on, so a replay of the last hour is always available without having predicted
 the incident \(em and unlike the flight recorder it does not depend on an
-alert rule having described what went wrong.
+alert rule having described what went wrong. Under \fB\-\-serve \-\-remote\fR
+each host gets a directory of its own under \fIDIR\fR, so a fleet records a
+timeline per machine rather than interleaving them into one. The directory is
+the target reduced to something a filesystem will take, chosen over the whole
+fleet so that two targets reducing to the same thing \(em \fBdeploy@db-2\fR
+and \fBdeploy\-db\-2\fR both do \(em do not share a recording and truncate
+each other's. A recording that cannot be written is reported once rather than
+once a frame, and never stops the mode that is writing it. Available
+headlessly on the same terms as \fB\-\-record\fR, which is what makes
+.B crabmon \-\-serve :9100 \-\-alerts \-\-record\-rotate /var/log/crabmon
+a complete black box in a unit file.
 .TP
 .B \-\-replay " " \fIPATH\fR
 Drive the interface from a recording instead of sampling this host.
@@ -153,6 +171,20 @@ its last. \fB\-\-format json\fR emits the report as JSON.
 Processes are matched on PID \fIand\fR start time, so a recycled PID reads as
 one process exiting and another starting rather than as enormous growth.
 .TP
+.B \-\-doctor
+Report what this machine will and will not let crabmon see \(em whether
+\fB/dev/kmsg\fR and the RAPL counters are readable, whether pressure stall
+accounting exists, whether another user's fd tables can be read \(em and
+exit. crabmon never reports zero for something it could not read, which is
+right and leaves "is that nothing, or something I am not allowed to see?" as
+a question only this answers.
+.IP
+Exits \fB1\fR when something the config actually asks for cannot work here,
+so it is usable as a check before a deploy and not only as something to read:
+a missing GPU is not a failure, a \fBkind = "fd"\fR rule on a host whose fd
+tables are unreadable is. \fB\-\-format json\fR emits the same report for
+something other than a person.
+.TP
 .B \-\-watch " " \fIQUERY\fR
 Sample headlessly until processes match \fIQUERY\fR (see \fBFILTER LANGUAGE\fR),
 then print them and exit \fB1\fR. Exits \fB0\fR if \fB\-\-watch\-timeout\fR
@@ -165,6 +197,13 @@ As \fB\-\-watch\fR, but for a measurement rather than a process list:
 \fIkind\fR is any \fB[[alert]]\fR kind. \fBcpu>=90\fR, \fBpsi:io>20\fR,
 \fBdisk:/var>=95\fR, \fBtemp>=80\fR, \fBfd>=90\fR, \fBnet>=1M\fR,
 \fBproc:nginx<1\fR.
+.PP
+A \fBtrend\fR rule may name the series it follows in front of its query:
+\fBtrend:postgres>200M\fR is resident memory, \fBtrend:io:postgres>10M\fR
+the same processes' disk rate in bytes per second, and
+\fBtrend:cpu:postgres>20\fR their CPU in percentage points. The query keeps
+its own colons, so \fBtrend:io:user:postgres>10M\fR is the IO rate of
+everything that user runs.
 .PP
 \fB>\fR and \fB>=\fR both mean at-or-over and \fB<\fR means strictly under,
 which is how an \fB[[alert]]\fR compares; \fB<=\fR is refused rather than
@@ -345,6 +384,8 @@ nice<0             scheduling priority
 time>2h            run time, in s/m/h/d; a bare number is seconds
 fd>1000            open file descriptors (needs [procs] fds)
 fd%>90             ...as a percentage of the process's own limit
+pss>500M           proportional set size (needs [procs] pss)
+uss>100M           unique set size, same suffixes
 .fi
 .PP
 A process that does not report a value never satisfies a comparison on it: a
@@ -476,7 +517,10 @@ bound a rotating recording (\fB\-\-record\-rotate\fR): frames per segment
 file, and segments kept including the one being written. 0 frames switches
 rotation off, which is the default. At the default 800 ms refresh,
 \fBrotate_frames = 1800\fR with \fBrotate_keep = 4\fR is about ninety
-minutes on disk.
+minutes on disk. Under \fB\-\-serve\fR a frame is recorded per scrape
+rather than per \fIrefresh_ms\fR, because a scrape is when a sample is
+actually taken, so size \fIrotate_frames\fR against the scrape interval
+there: the same 1800 is about seven hours at a fifteen-second scrape.
 .B rotate_dir
 is where segments go when the flag names no directory.
 .SS [procs]
@@ -564,13 +608,39 @@ panel for any mount that will fill within a week.
 .PP
 .I trend
 measures growth rather than level: \fIover_secs\fR is the window (default
-300), \fIthreshold\fR is in bytes, and a \fIquery\fR selects the processes
-whose RSS is measured \(em the worst grower wins \(em while an empty query
-measures the machine's \fImem\fR or \fIswap\fR.
+300) and a \fIquery\fR selects the processes measured \(em the worst grower
+wins \(em while an empty query measures the machine's \fImem\fR or
+\fIswap\fR in bytes. With a query, \fItarget\fR names which of those
+processes' series to follow: \fBrss\fR (the default), \fBcpu\fR or
+\fBio\fR. \fIthreshold\fR is read in that series' own unit \(em bytes for
+\fBrss\fR, bytes per second for \fBio\fR, percentage points for \fBcpu\fR
+\(em and a \fItarget\fR naming no series measures nothing rather than
+quietly reporting \fBrss\fR under another name.
 A rule fires only once its condition has held for \fIfor_secs\fR seconds, and
 its \fIcommand\fR runs once per activation. \fIcommand_clear\fR runs once when
 it recovers, and the alert popup (\fB!\fR) logs every transition,
 so an alert that fired at 03:12 and cleared at 03:14 says both.
+.PP
+A hook runs as \fBsh \-c\fR \fIcommand\fR with the context in its
+environment, so one script can serve every rule:
+.BR CRABMON_RULE ,
+.BR CRABMON_KIND ,
+.B CRABMON_STATE
+(\fBfiring\fR or \fBcleared\fR),
+.BR CRABMON_VALUE ,
+.BR CRABMON_THRESHOLD ,
+.BR CRABMON_MESSAGE ,
+.B CRABMON_HOST
+(the fleet target, or this machine's name),
+.BR CRABMON_AT ,
+and
+.B CRABMON_DUMP
+and
+.B CRABMON_SUMMARY
+for the flight recording a firing opened and the readable summary beside it.
+Every one is always set, empty where it does not apply, so a hook written with
+\fBset \-u\fR need not guess which exist. Output goes nowhere and the hook is
+not waited on: one that blocks the sampler is worse than no hook at all.
 .PP
 .I threshold
 is a percentage for \fIcpu\fR, \fImem\fR, \fIswap\fR, \fIdisk\fR,
@@ -588,7 +658,9 @@ restricts disk and io rules to a mount point, temperature rules to a sensor
 prefix, GPU rules to a device name, net rules to an interface and fd rules to a
 process name. For \fIpsi\fR it names the resource \(em \fBcpu\fR,
 \fBmem\fR or \fBio\fR, optionally suffixed \fB.full\fR \(em and an empty
-target is the worst \fBsome\fR reading of the three.
+target is the worst \fBsome\fR reading of the three. For a \fItrend\fR rule
+with a \fIquery\fR it names the series to follow: \fBrss\fR, \fBcpu\fR or
+\fBio\fR.
 .I query
 is the filter query a \fIproc\fR rule counts matches of; a query that does not
 parse leaves the rule inert rather than counting zero.

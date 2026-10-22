@@ -17,7 +17,7 @@ use crabmon::cli::{self, Args, Parsed};
 use crabmon::config::{self, Config};
 use crabmon::export;
 use crabmon::metrics::{MetricSource, SysinfoSource};
-use crabmon::record::{FlightRecorder, Recorder, ReplaySource};
+use crabmon::record::{FlightRecorder, ReplaySource};
 use crabmon::remote::RemoteSource;
 use crabmon::sampler::{Pacer, ThreadedSource};
 use crabmon::supervisor;
@@ -49,16 +49,22 @@ fn main() -> Result<()> {
     }
     let cfg = apply_args(loaded, &args);
 
+    // Before everything else that samples: the whole question is what this
+    // machine will let crabmon see, and the answer must not depend on having
+    // got far enough to take a sample.
+    if args.doctor {
+        return print_doctor(&cfg, &args);
+    }
     // The headless modes. `cli::parse` refuses to combine any of them with
     // `--remote` or `--replay`, so each one here samples this host.
     if let Some((a, b)) = &args.diff {
         return print_diff(a, b.as_deref(), &args);
     }
     if let Some(addr) = &args.serve {
-        return serve_metrics(addr, &cfg, args.alerts, args.remote.as_deref());
+        return serve_metrics(addr, &cfg, &args);
     }
     if args.stream {
-        return stream_frames(&cfg, args.alerts);
+        return stream_frames(&cfg, &args);
     }
     let hold = args.watch_for.unwrap_or(0);
     if let Some(query) = &args.watch {
@@ -134,6 +140,24 @@ fn build_source(cfg: &Config, args: &Args) -> Result<Box<dyn MetricSource>> {
     Ok(Box::new(ThreadedSource::new(Box::new(live_source(cfg)))))
 }
 
+/// Open whatever `--record`, `--record-rotate` and `[record]` between them
+/// ask for, and announce it on stderr.
+///
+/// stderr because `--stream`'s stdout is a frame per line that something else
+/// is parsing, and the same call serves every headless mode.
+fn open_recordings(cfg: &Config, args: &Args) -> Result<crabmon::record::Recordings> {
+    let recordings = crabmon::record::Recordings::open(
+        args.record.as_deref(),
+        args.record_rotate.as_deref(),
+        &cfg.record,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    for note in recordings.notices() {
+        eprintln!("crabmon: {note}");
+    }
+    Ok(recordings)
+}
+
 /// `--stream`: one JSON snapshot per line, forever. This is what a streaming
 /// `--remote` runs on the far end. Transport frames retain the complete
 /// inventory: trimming would turn a quiet service into a false absence alert.
@@ -142,30 +166,67 @@ fn build_source(cfg: &Config, args: &Args) -> Result<Box<dyn MetricSource>> {
 /// streaming to a collector also pages and writes flight recordings. Hook
 /// output and recording notices go to stderr, which keeps stdout a clean
 /// stream of frames for whatever is reading it.
-fn stream_frames(cfg: &Config, alerts: bool) -> Result<()> {
+///
+/// `--record` and `--record-rotate` write here too. The frame on stdout stays
+/// untrimmed — a collector needs the full inventory — while the one going to
+/// disk is trimmed by `[record]` like any other recording, so a long-running
+/// stream does not fill the disk to say what it has already said.
+fn stream_frames(cfg: &Config, args: &Args) -> Result<()> {
     let mut source = live_source(cfg);
     source.snapshot(Duration::ZERO);
     // The interval the rates are divided by has to be the one that actually
     // passed, not the one that was asked for — see `Pacer`.
     let mut pacer = Pacer::new(Duration::from_millis(cfg.refresh_ms));
-    let mut sup = alerts.then(|| supervisor::Supervisor::new(cfg));
+    let mut sup = args.alerts.then(|| supervisor::Supervisor::new(cfg));
+    let mut recordings = open_recordings(cfg, args)?;
     let mut out = io::stdout().lock();
     loop {
         let dt = pacer.wait();
         let snap = source.snapshot(dt);
+        for note in recordings.write(&snap) {
+            eprintln!("crabmon: {note}");
+        }
         if let Some(sup) = sup.as_mut() {
             report(sup.observe(&snap));
         }
         let line = serde_json::to_string(&snap)?;
         // A broken pipe means the reader went away; that is a normal exit here,
         // not a crash to report.
-        if out.write_all(line.as_bytes()).is_err() || out.write_all(b"\n").is_err() {
-            return Ok(());
-        }
-        if out.flush().is_err() {
+        if out.write_all(line.as_bytes()).is_err()
+            || out.write_all(b"\n").is_err()
+            || out.flush().is_err()
+        {
+            if let Some(note) = recordings.summary() {
+                eprintln!("crabmon: {note}");
+            }
             return Ok(());
         }
     }
+}
+
+/// `--doctor`: what this host lets crabmon measure.
+///
+/// Exits non-zero when something the config actually asks for cannot work
+/// here, so it is usable as a check before a deploy rather than only as
+/// something to read. A missing GPU is not a failure; a `kind = "fd"` rule on
+/// a host whose fd tables are unreadable is, because that rule will never
+/// fire and a rule that never fires looks exactly like a quiet machine.
+fn print_doctor(cfg: &Config, args: &Args) -> Result<()> {
+    // The file this run actually loaded, which `--config` may have redirected:
+    // a report naming a different file than the one in force is worse than one
+    // that says nothing about config at all.
+    let report = crabmon::doctor::run(cfg, &config_path(args));
+    let text = match args.format {
+        Some(export::ExportFormat::Json) => report.to_json(),
+        _ => report.to_text(),
+    };
+    let mut out = io::stdout().lock();
+    out.write_all(text.as_bytes())?;
+    out.flush()?;
+    if report.has_problems() {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// `--diff`: compare two snapshots, or the two ends of one recording.
@@ -216,10 +277,18 @@ fn watch_for(rule: crabmon::alerts::AlertRule, cfg: &Config, args: &Args) -> Res
     let started = Instant::now();
     let mut pacer = Pacer::new(interval);
     let mut engine = crabmon::alerts::AlertEngine::new(vec![rule]);
+    // A watch is the one headless mode that is *waiting* for something to go
+    // wrong, so a recording of the run-up to it is the evidence the condition
+    // exists to collect: `--watch 'state:D' --record-rotate /var/log/crabmon`
+    // leaves the minutes before the stall on disk.
+    let mut recordings = open_recordings(cfg, args)?;
 
     let (outcome, fired) = loop {
         let dt = pacer.wait();
         let snap = source.snapshot(dt);
+        for note in recordings.write(&snap) {
+            eprintln!("crabmon: {note}");
+        }
         let now = Instant::now();
         // The engine's hold time is in seconds since the watch started, which
         // is the same clock `--watch-for` is quoted in.
@@ -279,6 +348,12 @@ fn watch_for(rule: crabmon::alerts::AlertRule, cfg: &Config, args: &Args) -> Res
         out.write_all(text.as_bytes())?;
         out.flush()?;
     }
+    // Before `exit`, which runs no destructors: every frame is flushed as it
+    // is written, so the recording is already complete, but the line saying
+    // where it is would otherwise never be printed.
+    if let Some(note) = recordings.summary() {
+        eprintln!("crabmon: {note}");
+    }
     std::process::exit(outcome.exit_code());
 }
 
@@ -289,9 +364,10 @@ fn watch_for(rule: crabmon::alerts::AlertRule, cfg: &Config, args: &Args) -> Res
 /// Evaluating on the scrape rather than on a timer of its own is deliberate:
 /// it is the only moment a fresh sample exists, and a second sampler would
 /// double this process's cost to measure the same machine twice.
-fn serve_metrics(addr: &str, cfg: &Config, alerts: bool, remote: Option<&str>) -> Result<()> {
-    if let Some(spec) = remote {
-        return serve_fleet(addr, cfg, alerts, spec);
+fn serve_metrics(addr: &str, cfg: &Config, args: &Args) -> Result<()> {
+    let alerts = args.alerts;
+    if let Some(spec) = &args.remote {
+        return serve_fleet(addr, cfg, args, spec);
     }
     let mut source = live_source(cfg);
     let interval = Duration::from_millis(cfg.refresh_ms);
@@ -303,10 +379,21 @@ fn serve_metrics(addr: &str, cfg: &Config, alerts: bool, remote: Option<&str>) -
     if alerts {
         eprintln!("crabmon: evaluating {} alert rules on every scrape", cfg.alerts.len());
     }
+    // Recording an exporter records what it *measured*, so the cadence is the
+    // scrape's rather than `refresh_ms`. That is the honest timeline to keep:
+    // a recording of samples nobody took would not line up with the series
+    // the same process published.
+    let mut recordings = open_recordings(cfg, args)?;
+    if !recordings.is_empty() {
+        eprintln!("crabmon: recording one frame per scrape");
+    }
     // `serve` measures the gap between scrapes and hands it over; the rates are
     // deltas over that interval, not over the configured refresh.
     crabmon::serve::serve_rendered(addr, cfg.serve_token(), move |elapsed| {
         let snap = source.snapshot(elapsed);
+        for note in recordings.write(&snap) {
+            eprintln!("crabmon: {note}");
+        }
         let states = match sup.as_mut() {
             None => Vec::new(),
             Some(sup) => {
@@ -327,7 +414,8 @@ fn serve_metrics(addr: &str, cfg: &Config, alerts: bool, remote: Option<&str>) -
 /// host gets its own alert engine — rules are about *a* machine, and one
 /// engine fed three hosts' snapshots in turn would hold one `fired` flag
 /// between them and page about whichever host sampled last.
-fn serve_fleet(addr: &str, cfg: &Config, alerts: bool, spec: &str) -> Result<()> {
+fn serve_fleet(addr: &str, cfg: &Config, args: &Args, spec: &str) -> Result<()> {
+    let alerts = args.alerts;
     let targets = crabmon::fleet::parse_targets(spec);
     if targets.is_empty() {
         return Err(anyhow::anyhow!("--remote names no hosts"));
@@ -342,42 +430,61 @@ fn serve_fleet(addr: &str, cfg: &Config, alerts: bool, spec: &str) -> Result<()>
     // host that is down costs a scrape nothing but its own missing series.
     // `Send`, because the sampling closure runs on whichever connection
     // thread is serving the scrape.
-    let mut hosts: Vec<(
-        String,
-        ThreadedSource,
-        Option<supervisor::Supervisor>,
-        supervisor::RemoteFreshness,
-    )> = targets
-        .iter()
-        .map(|target| {
-            let remote = match cfg.remote.stream {
-                true => RemoteSource::streaming(target, cfg.refresh_ms, Vec::new()),
-                false => RemoteSource::new(target, None, Vec::new()),
-            };
-            let source = ThreadedSource::new(Box::new(remote));
-            let sup = alerts.then(|| supervisor::Supervisor::new(cfg).for_host(target));
-            (
-                target.clone(),
-                source,
-                sup,
-                supervisor::RemoteFreshness::new(Duration::from_millis(cfg.refresh_ms)),
-            )
-        })
-        .collect();
+    // One source, one supervisor and one set of recordings per host. A fleet
+    // has a timeline per machine, so a single file would interleave them into
+    // a recording that replays as one machine behaving impossibly; each host
+    // gets its own name instead.
+    // Distinct filesystem names for the targets, decided over the whole list:
+    // two that reduce to the same thing would otherwise share a recording and
+    // truncate each other's, and one that reduces to nothing would write
+    // among the flight dumps.
+    let labels = crabmon::record::unique_labels(&targets);
+    let mut hosts: Vec<Host> = Vec::with_capacity(targets.len());
+    for (target, label) in targets.iter().zip(&labels) {
+        let remote = match cfg.remote.stream {
+            true => RemoteSource::streaming(target, cfg.refresh_ms, Vec::new()),
+            false => RemoteSource::new(target, None, Vec::new()),
+        };
+        let recordings = crabmon::record::Recordings::for_host(
+            args.record.as_deref(),
+            args.record_rotate.as_deref(),
+            &cfg.record,
+            label,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        for note in recordings.notices() {
+            eprintln!("crabmon: {target}: {note}");
+        }
+        hosts.push(Host {
+            name: target.clone(),
+            source: ThreadedSource::new(Box::new(remote)),
+            sup: alerts.then(|| supervisor::Supervisor::new(cfg).for_host(target)),
+            freshness: supervisor::RemoteFreshness::new(Duration::from_millis(cfg.refresh_ms)),
+            recordings,
+        });
+    }
 
     crabmon::serve::serve_rendered(addr, cfg.serve_token(), move |elapsed| {
         let parts: Vec<(String, String)> = hosts
             .iter_mut()
-            .map(|(name, source, sup, freshness)| {
-                let snap = source.snapshot(elapsed);
-                let (fresh, reachable) = freshness.update(
+            .map(|host| {
+                let snap = host.source.snapshot(elapsed);
+                let (fresh, reachable) = host.freshness.update(
                     &snap,
-                    source.frame_id(),
-                    source.error().is_none(),
+                    host.source.frame_id(),
+                    host.source.error().is_none(),
                     Instant::now(),
-                    sup.as_mut().map(|s| &mut s.alerts),
+                    host.sup.as_mut().map(|s| &mut s.alerts),
                 );
-                let states = match sup.as_mut() {
+                // Only a frame that actually arrived: re-recording the last
+                // good one on every scrape would fill the file with an
+                // outage drawn as measurement.
+                if fresh {
+                    for note in host.recordings.write(&snap) {
+                        eprintln!("crabmon: {}: {note}", host.name);
+                    }
+                }
+                let states = match host.sup.as_mut() {
                     None => Vec::new(),
                     Some(sup) => {
                         if fresh {
@@ -388,12 +495,22 @@ fn serve_fleet(addr: &str, cfg: &Config, alerts: bool, spec: &str) -> Result<()>
                 };
                 // A host that cannot be reached is not up, whatever its
                 // last good frame still says.
-                (name.clone(), crabmon::serve::render_host(&snap, top, &states, reachable))
+                (host.name.clone(), crabmon::serve::render_host(&snap, top, &states, reachable))
             })
             .collect();
         crabmon::serve::merge_hosts(&parts)
     })?;
     Ok(())
+}
+
+/// One machine of a fleet export: where its frames come from, what its rules
+/// make of them, and where they are recorded.
+struct Host {
+    name: String,
+    source: ThreadedSource,
+    sup: Option<supervisor::Supervisor>,
+    freshness: supervisor::RemoteFreshness,
+    recordings: crabmon::record::Recordings,
 }
 
 /// Print what a headless alert pass produced, and run its hooks.
@@ -539,20 +656,23 @@ fn run_tui(
     }
     app.audit_path = audit_path(&app.cfg);
 
-    let mut recorder = match &args.record {
-        Some(path) => match Recorder::create(std::path::Path::new(path)) {
-            Ok(r) => Some(r.with_limits(
-                app.cfg.record.top_n,
-                app.cfg.record.omit_paths,
-                app.cfg.record.max_cmd_len,
-            )),
-            Err(e) => {
-                restore(mouse);
-                return Err(anyhow::anyhow!("cannot record to {path}: {e}"));
-            }
-        },
-        None => None,
+    // The same resolution every headless mode does, through the same type:
+    // an explicit `--record` file, plus a rotating set from
+    // `--record-rotate` or `[record] rotate_frames`.
+    let mut recordings = match crabmon::record::Recordings::open(
+        args.record.as_deref(),
+        args.record_rotate.as_deref(),
+        &app.cfg.record,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            restore(mouse);
+            return Err(anyhow::anyhow!("{e}"));
+        }
     };
+    for note in recordings.notices() {
+        eprintln!("crabmon: {note}");
+    }
     // The flight recorder writes into the working directory by default, the
     // same place `P` exports to, so a dump lands somewhere the user can find.
     let flight_dir = match app.cfg.record.flight_dir.is_empty() {
@@ -565,41 +685,8 @@ fn run_tui(
         app.cfg.record.flight_after,
         app.cfg.record.limits(),
     );
-    // A recording that never ends, for the incident nobody predicted and no
-    // rule described. The flag names the directory; the config says how much
-    // of it to keep.
-    let rotate_dir =
-        args.record_rotate.clone().unwrap_or_else(|| match app.cfg.record.rotate_dir.is_empty() {
-            false => app.cfg.record.rotate_dir.clone(),
-            true => match app.cfg.record.flight_dir.is_empty() {
-                false => app.cfg.record.flight_dir.clone(),
-                true => ".".to_string(),
-            },
-        });
-    // The flag turns rotation on by itself: someone who passed it meant it,
-    // even with nothing in the config.
-    let per_segment = match (args.record_rotate.is_some(), app.cfg.record.rotate_frames) {
-        (true, 0) => crabmon::record::DEFAULT_ROTATE_FRAMES,
-        (_, n) => n,
-    };
-    let mut rotating = Recorder::rotating(
-        std::path::Path::new(&rotate_dir),
-        per_segment,
-        app.cfg.record.rotate_keep,
-        app.cfg.record.limits(),
-    );
-    if rotating.is_some() {
-        eprintln!("crabmon: rotating recording in {rotate_dir}");
-    }
 
-    let res = event_loop(
-        &mut terminal,
-        &mut app,
-        &stop,
-        recorder.as_mut(),
-        flight.as_mut(),
-        rotating.as_mut(),
-    );
+    let res = event_loop(&mut terminal, &mut app, &stop, &mut recordings, flight.as_mut());
 
     // Always restore the terminal, even if the loop failed.
     restore(mouse);
@@ -611,8 +698,8 @@ fn run_tui(
     // persists; only what the file itself said about the filter is written.
     app.cfg.filter = file_filter;
     app.persist();
-    if let Some(rec) = &recorder {
-        eprintln!("crabmon: wrote {} frames to {}", rec.frames(), rec.path().display());
+    if let Some(note) = recordings.summary() {
+        eprintln!("crabmon: {note}");
     }
     res
 }
@@ -637,9 +724,8 @@ fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     stop: &StopFlag,
-    mut recorder: Option<&mut Recorder>,
+    recordings: &mut crabmon::record::Recordings,
     mut flight: Option<&mut FlightRecorder>,
-    mut rotating: Option<&mut crabmon::record::RotatingRecorder>,
 ) -> Result<()> {
     let mut last_tick = Instant::now();
     loop {
@@ -685,15 +771,10 @@ fn event_loop(
         if app.due() {
             app.tick();
             last_tick = Instant::now();
-            if let Some(rec) = recorder.as_deref_mut()
-                && let Err(e) = rec.write(&app.snap)
-            {
-                app.set_status(format!("recording failed: {e}"));
-            }
-            if let Some(rec) = rotating.as_deref_mut()
-                && let Err(e) = rec.write(&app.snap, app.snap.taken_at_unix)
-            {
-                app.set_status(format!("rotating recording failed: {e}"));
+            // On screen rather than on stderr: stderr is behind the alternate
+            // screen and nobody would ever see it.
+            for note in recordings.write(&app.snap) {
+                app.set_status(note);
             }
             // Hooks and flight recordings. `App::tick` has already evaluated
             // the rules; this drains what that produced, through the same

@@ -11,6 +11,7 @@ pub mod cli;
 pub mod clipboard;
 pub mod config;
 pub mod diff;
+pub mod doctor;
 pub mod export;
 pub mod filter;
 pub mod fleet;

@@ -15,6 +15,7 @@ _crabmon() {
         '--alerts[with --serve/--stream: evaluate alert rules headlessly]' \
         '--columns[process-table columns, comma separated]:columns:' \
         '--diff[compare two snapshots, or one recording end to end]:file:_files' \
+        '--doctor[report what this host lets crabmon measure, and exit]' \
         '--watch[block until processes match QUERY, then exit 1]:query:' \
         '--watch-rule[block until a metric condition holds, e.g. cpu>=90]:rule:' \
         '--watch-for[require the match to hold this many seconds]:seconds:' \

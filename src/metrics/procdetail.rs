@@ -99,17 +99,35 @@ pub const MAX_ENV: usize = 256;
 /// to a stuck process is a credential leak with a very ordinary cause, so the
 /// name is shown — knowing the variable is *set* is often the whole question
 /// — and the value is not.
-const SECRET_HINTS: [&str; 8] =
-    ["SECRET", "PASSWORD", "PASSWD", "TOKEN", "APIKEY", "API_KEY", "CREDENTIAL", "PRIVATE_KEY"];
+const SECRET_HINTS: [&str; 9] = [
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "PASSPHRASE",
+    "TOKEN",
+    "APIKEY",
+    "API_KEY",
+    "CREDENTIAL",
+    "PRIVATE_KEY",
+];
+
+/// Names whose *ending* makes them a secret, for the ones the fragments above
+/// cannot reach. `STRIPE_KEY`, `ENCRYPTION_KEY` and `SIGNING_KEY` are all
+/// credentials and none of them contains `API_KEY` or `SECRET`.
+const SECRET_SUFFIXES: [&str; 2] = ["_KEY", "_PWD"];
 
 /// Whether a variable's value should be withheld.
 ///
-/// `KEY` on its own is deliberately not a hint: `SSH_AUTH_SOCK`-shaped names
-/// like `KEYBOARD_LAYOUT`, `KEYMAP` and `XKB_DEFAULT_LAYOUT` are not secrets,
-/// and masking half an environment teaches people to ignore the mask.
+/// `KEY` as a bare fragment is deliberately not a hint: names like
+/// `KEYBOARD_LAYOUT`, `KEYMAP` and `XKB_DEFAULT_LAYOUT` are not secrets, and
+/// masking half an environment teaches people to ignore the mask. `_KEY` as a
+/// *suffix* is a different question — nothing is called `FOO_KEY` unless it
+/// holds one — so the two are matched separately rather than by loosening the
+/// fragment.
 pub fn is_secret_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     SECRET_HINTS.iter().any(|h| upper.contains(h))
+        || SECRET_SUFFIXES.iter().any(|s| upper.ends_with(s))
 }
 
 /// Parse the NUL-separated block `/proc/<pid>/environ` holds.
@@ -172,10 +190,33 @@ mod tests {
     /// Masking everything teaches people to ignore the mask.
     #[test]
     fn ordinary_variables_are_not_masked() {
-        for name in ["PATH", "HOME", "KEYBOARD_LAYOUT", "XKB_DEFAULT_LAYOUT", "LANG", "TERM"] {
+        for name in [
+            "PATH",
+            "HOME",
+            "KEYBOARD_LAYOUT",
+            "XKB_DEFAULT_LAYOUT",
+            "LANG",
+            "TERM",
+            // The `_KEY` suffix must not widen into a bare `KEY` fragment.
+            "KEYMAP",
+            "SSH_AUTH_SOCK",
+            "GPG_KEY_ID",
+        ] {
             assert!(!is_secret_name(name), "{name} was masked");
         }
-        for name in ["AWS_SECRET_ACCESS_KEY", "DB_PASSWORD", "GITHUB_TOKEN", "MY_API_KEY"] {
+        for name in [
+            "AWS_SECRET_ACCESS_KEY",
+            "DB_PASSWORD",
+            "GITHUB_TOKEN",
+            "MY_API_KEY",
+            // Credentials the fragment list alone could not reach: nothing is
+            // called `FOO_KEY` unless it holds one.
+            "STRIPE_KEY",
+            "ENCRYPTION_KEY",
+            "SIGNING_KEY",
+            "SSL_PASSPHRASE",
+            "MYSQL_PWD",
+        ] {
             assert!(is_secret_name(name), "{name} was not masked");
         }
     }

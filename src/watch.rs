@@ -149,13 +149,20 @@ pub fn parse_rule(expr: &str, for_secs: u64) -> Result<AlertRule, String> {
 
     // A `trend` rule's target is either a machine series or a process
     // query, and one that is neither measures nothing for ever.
-    if kind == AlertKind::Trend {
-        match target {
-            "" | "mem" | "memory" | "rss" | "swap" => {}
-            query => {
-                crate::filter::parse(query).map_err(|e| format!("bad query: {e}"))?;
-            }
+    //
+    // A process query may be prefixed with the series to follow:
+    // `trend:io:postgres` is "postgres's IO rate", where `trend:postgres`
+    // remains "postgres's RSS".
+    if kind == AlertKind::Trend && !is_machine_series(target) {
+        let (series, query) = crate::alerts::split_trend_target(target);
+        if query.trim().is_empty() {
+            return Err(format!(
+                "{} needs a query, e.g. trend:{}:postgres",
+                series.key_name(),
+                series.key_name()
+            ));
         }
+        crate::filter::parse(query).map_err(|e| format!("bad query: {e}"))?;
     }
 
     if kind == AlertKind::Kernel && !crate::alerts::kernel_target_is_known(target) {
@@ -187,14 +194,21 @@ pub fn parse_rule(expr: &str, for_secs: u64) -> Result<AlertRule, String> {
         below,
         // A `trend` target that is not one of the machine series is a
         // process query, which belongs in `query` like a `proc` rule's.
+        // A `trend` over processes keeps the series it follows in `target`
+        // and the query in `query`, which is the shape an `[[alert]]` is
+        // written in — so the two spellings produce the same rule.
         target: match (kind, target) {
             (AlertKind::Proc, _) => String::new(),
-            (AlertKind::Trend, q) if !is_machine_series(q) => String::new(),
+            (AlertKind::Trend, q) if !is_machine_series(q) => {
+                crate::alerts::split_trend_target(q).0.key_name().to_string()
+            }
             (_, t) => t.to_string(),
         },
         query: match (kind, target) {
             (AlertKind::Proc, q) => q.to_string(),
-            (AlertKind::Trend, q) if !is_machine_series(q) => q.to_string(),
+            (AlertKind::Trend, q) if !is_machine_series(q) => {
+                crate::alerts::split_trend_target(q).1.to_string()
+            }
             _ => String::new(),
         },
         command: String::new(),
@@ -330,11 +344,44 @@ mod tests {
 
         let per_proc = parse_rule("trend:postgres>200M", 0).expect("a per-process trend rule");
         assert_eq!(per_proc.query, "postgres");
-        assert!(per_proc.target.is_empty(), "a query must not be read as a series name");
+        assert_eq!(per_proc.target, "rss", "a bare query still means resident memory");
 
         // A size, not a bare number: 200M is the point.
         assert!(parse_rule("trend:mem>nonsense", 0).is_err());
         assert!(parse_rule("trend:re:[>1G", 0).is_err(), "a broken query must be refused");
+    }
+
+    /// RSS is not the only thing that climbs. `trend:io:postgres` follows the
+    /// same processes' disk rate and `trend:cpu:postgres` their CPU, in the
+    /// same `target`/`query` shape an `[[alert]]` is written in — so the two
+    /// spellings cannot come to mean different things.
+    #[test]
+    fn a_trend_rule_can_name_the_series_it_follows() {
+        let io = parse_rule("trend:io:postgres>1M", 0).expect("an io trend rule");
+        assert_eq!(io.target, "io");
+        assert_eq!(io.query, "postgres");
+        assert_eq!(io.threshold, (1u64 << 20) as f64);
+
+        let cpu = parse_rule("trend:cpu:postgres>20", 0).expect("a cpu trend rule");
+        assert_eq!(cpu.target, "cpu");
+        assert_eq!(cpu.query, "postgres");
+        assert_eq!(cpu.threshold, 20.0);
+
+        // The query keeps its own colons: a filter term has them too.
+        let scoped = parse_rule("trend:io:user:postgres>1M", 0).expect("a scoped io rule");
+        assert_eq!(scoped.target, "io");
+        assert_eq!(scoped.query, "user:postgres");
+
+        // `rss` may be said out loud, and means what it always did.
+        assert_eq!(parse_rule("trend:rss:nginx>1M", 0).unwrap().query, "nginx");
+
+        // A series with nothing to measure is a rule that waits for ever.
+        let err = parse_rule("trend:io:>1M", 0).unwrap_err();
+        assert!(err.contains("needs a query"), "{err}");
+
+        // ...and a word that is not a series is still an ordinary query, so
+        // the spelling that has always worked goes on working.
+        assert_eq!(parse_rule("trend:chrome>1M", 0).unwrap().query, "chrome");
     }
 
     /// A rule that cannot measure anything never fires, so a typo in the

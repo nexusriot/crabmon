@@ -9,7 +9,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Every long flag the parser accepts. The docs tests check this against the
 /// README, the man page and the shell completions.
-pub const LONG_FLAGS: [&str; 32] = [
+pub const LONG_FLAGS: [&str; 33] = [
     "--refresh",
     "--sort",
     "--ascending",
@@ -35,6 +35,7 @@ pub const LONG_FLAGS: [&str; 32] = [
     "--stream",
     "--alerts",
     "--diff",
+    "--doctor",
     "--watch",
     "--watch-rule",
     "--watch-for",
@@ -79,6 +80,8 @@ pub struct Args {
     pub alerts: bool,
     /// Compare two snapshots, or the ends of one recording.
     pub diff: Option<(String, Option<String>)>,
+    /// Report what this machine will and will not let crabmon see.
+    pub doctor: bool,
     /// Headless: watch for processes matching this query.
     pub watch: Option<String>,
     /// Headless: watch for a metric condition, e.g. `cpu>=90` or `proc:nginx<1`.
@@ -116,12 +119,12 @@ OPTIONS:
     -f, --filter <QUERY>     Initial process filter, e.g. 'user:root cpu>5'
         --columns <LIST>     Process-table columns, e.g. 'pid,user,cpu,mem,name'
     -t, --tree               Start in process-tree view
-    -l, --layout <NAME>      dashboard|processes|cpu|io
+    -l, --layout <NAME>      dashboard|processes|cpu|io|fleet
         --theme <NAME>       default|mono|nord|solarized|gruvbox
         --no-color           Disable colour (same as --theme mono)
         --no-mouse           Do not capture mouse events
     -1, --once               Print a single snapshot and exit
-        --format <FMT>       Output format for --once: json|csv|text (default json)
+        --format <FMT>       json|csv|text for --once/--watch; json|text for --diff
     -n, --top <N>            Limit --once output to the top N processes
     -c, --config <PATH>      Use an alternate config file
     -g, --group <BY>         Group processes: none|service|container|user
@@ -137,6 +140,7 @@ OPTIONS:
         --stream             Print a JSON snapshot per line forever
         --alerts             With --serve/--stream: run alert rules headlessly
         --diff <A> [B]       Compare two snapshots, or one recording end to end
+        --doctor             Report what this host lets crabmon measure, and exit
         --watch <QUERY>      Wait for processes matching QUERY, then exit 1
         --watch-rule <EXPR>  ...or for a metric: 'cpu>=90', 'proc:nginx<1'
         --watch-for <SECS>   ...only if the match holds this long
@@ -292,6 +296,7 @@ where
             }
             "--serve" => out.serve = Some(take_value(&mut i, &args, inline, &flag)?),
             "--stream" => out.stream = true,
+            "--doctor" => out.doctor = true,
             "--alerts" => out.alerts = true,
             "--diff" => {
                 let a = take_value(&mut i, &args, inline, &flag)?;
@@ -381,9 +386,12 @@ where
         out.stream,
         out.watch.is_some() || out.watch_rule.is_some(),
         out.diff.is_some(),
+        out.doctor,
     ];
     if headless.iter().filter(|s| **s).count() > 1 {
-        return Err("--once, --serve, --stream, --watch and --diff are mutually exclusive".into());
+        return Err(
+            "--once, --serve, --stream, --watch, --diff and --doctor are mutually exclusive".into(),
+        );
     }
     if out.watch.is_some() && out.watch_rule.is_some() {
         return Err("--watch and --watch-rule cannot be combined".into());
@@ -393,6 +401,21 @@ where
     // a hold time, so neither is a mode it means anything in.
     if out.alerts && !(out.serve.is_some() || out.stream) {
         return Err("--alerts needs --serve or --stream".into());
+    }
+    // A recording is a sequence of frames, so the modes that take exactly one
+    // sample have nothing to record — and a flag that silently does nothing is
+    // worse than one that is refused, the more so here because the file that
+    // was asked for by name simply never appears.
+    if let Some(flag) =
+        [("--record", out.record.is_some()), ("--record-rotate", out.record_rotate.is_some())]
+            .into_iter()
+            .find_map(|(name, on)| on.then_some(name))
+    {
+        for (mode, on) in [("--once", out.once), ("--diff", out.diff.is_some())] {
+            if on {
+                return Err(format!("{flag} needs a sequence of samples; {mode} takes one"));
+            }
+        }
     }
     Ok(Parsed::Run(Box::new(out)))
 }
@@ -461,6 +484,57 @@ mod tests {
         for argv in [vec!["--alerts"], vec!["--once", "--alerts"], vec!["--alerts", "--tree"]] {
             let err = parse(&argv).unwrap_err();
             assert!(err.contains("--serve or --stream"), "{argv:?}: {err}");
+        }
+    }
+
+    /// A flag that silently does nothing is worse than one that is refused,
+    /// the more so for a recording: `crabmon --once --record run.jsonl` wrote
+    /// no file, said nothing and exited 0, so it looked like it had worked.
+    #[test]
+    fn a_recording_flag_is_refused_where_there_is_no_sequence_to_record() {
+        for flag in ["--record", "--record-rotate"] {
+            for mode in [vec!["--once"], vec!["--diff", "a.json", "b.json"]] {
+                let mut argv = mode.clone();
+                argv.extend([flag, "out"]);
+                let err = parse(&argv).unwrap_err();
+                assert!(err.contains("needs a sequence of samples"), "{argv:?} gave: {err}");
+                assert!(err.contains(flag), "the error should name the flag: {err}");
+            }
+            // ...but a fleet export is fine: each host records under its own
+            // name, which is what makes three machines in one directory
+            // replay as three machines.
+            assert!(parse(["--serve", ":9100", "--remote", "a,b", flag, "out"]).is_ok());
+        }
+    }
+
+    /// ...and every mode that *does* sample on a loop records, which is the
+    /// whole point: an always-on recorder must not need a terminal in front
+    /// of it.
+    #[test]
+    fn every_mode_that_samples_on_a_loop_accepts_a_recording_flag() {
+        for mode in [
+            vec![],
+            vec!["--stream"],
+            vec!["--serve", ":9100"],
+            vec!["--watch", "nginx"],
+            vec!["--watch-rule", "cpu>=90"],
+            vec!["--remote", "box"],
+        ] {
+            let mut argv = mode.clone();
+            argv.extend(["--record", "run.jsonl"]);
+            assert_eq!(
+                run(&argv).record.as_deref(),
+                Some("run.jsonl"),
+                "{mode:?} refused --record"
+            );
+
+            let mut argv = mode.clone();
+            argv.extend(["--record-rotate", "/var/log/crabmon"]);
+            assert_eq!(
+                run(&argv).record_rotate.as_deref(),
+                Some("/var/log/crabmon"),
+                "{mode:?} refused --record-rotate"
+            );
         }
     }
 
