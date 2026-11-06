@@ -368,6 +368,7 @@ fn alerts_fire_once_their_hold_time_elapses() {
         name: "disk-full".into(),
         kind: crabmon::alerts::AlertKind::Disk,
         threshold: 90.0,
+        hysteresis: 0.0,
         for_secs: 0,
         over_secs: 0,
         below: false,

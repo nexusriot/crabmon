@@ -317,6 +317,14 @@ comparison, and is *strict* where the default is inclusive: the obvious
 `threshold = 1` on a `proc` rule has to mean "none running" rather than firing
 while the one process is still up.
 
+`hysteresis` is a finite, nonnegative recovery margin in the measurement's
+unit, defaulting to zero. It applies only after firing: above rules recover
+strictly below `threshold - hysteresis`, below rules at or above
+`threshold + hysteresis`. Hold times still use the original firing boundary.
+A rule inside the margin remains active without rerunning its hook, and its
+message shows the recovery boundary rather than claiming it is above the
+firing threshold.
+
 Rule state is keyed by **position, not name**. Nothing makes names unique, and
 two rules sharing one — the pair `below` makes obvious, one over a threshold
 and one under — shared a `fired` flag, each clearing what the other had just
@@ -360,6 +368,16 @@ hides threads by default the replay would then look almost empty.
 
 Every snapshot type carries `#[serde(default)]`, so a recording made by an older
 crabmon still loads when fields are added.
+
+Credential redaction is applied to a copy of the snapshot before command
+truncation. `[record] redact_commands` controls plain, rotating and flight
+recordings and incident summaries; `[export] redact_commands` controls snapshot
+exports and stream output. Both default to true. The shared implementation is
+`export::redact_command`: common credential arguments, bearer tokens and URL
+userinfo are hidden. Unquoted credential values hide the remainder of the
+command because the joined command cannot recover argv boundaries. Positional
+secrets and unknown credential names are outside this heuristic. Local live
+filters retain raw data; remote filters see what the remote host exported.
 
 ### Where a recording comes from
 
@@ -452,7 +470,8 @@ handshake, a key exchange and a full crabmon startup per frame. It now starts
 `crabmon --stream` once and reads JSON Lines from the session for as long as it
 lasts, with the reader on its own thread and stderr drained on another — a full
 stderr pipe would otherwise block the far end mid-frame and stall the stream
-with nothing to show for it.
+with nothing to show for it. The frame channel holds at most two snapshots;
+a reader that gets ahead blocks rather than growing a queue without limit.
 
 Falling back to the old behaviour is deliberately narrow: only the far end's
 argument parser refusing `--stream` triggers it. Falling back on any failure
@@ -556,6 +575,12 @@ the running machine, and `e2e_docker`, which builds and runs a container:
   a controlled SSH transport, and replay in a pseudo-terminal with hook and
   flight-recording side effects forbidden. Workloads and files are isolated
   and cleaned up by the tests; Docker is not required.
+- **`scripts/e2e-ssh.py`** — opt-in checks on a real Linux SSH host using a
+  compatible release binary. Creates a private remote `/tmp` directory and
+  temporary workloads, then removes them. Covers credential redaction and
+  opt-out, hysteresis hooks, streams, plain/rotating/flight recordings, and a
+  real SSH collector through stalls, failures and recovery. Run with
+  `python3 scripts/e2e-ssh.py --target user@host --binary target/release/crabmon`.
 - **`tests/build_script.rs`** — the build tooling against itself: that every
   `make` target has a command behind it, that every command is reachable through
   make and described in the script's own help, and that the script runs, reports
@@ -695,9 +720,10 @@ thread serving it, behind a mutex. Per-process series are capped (default 20) �
 a 2000-task machine would dwarf every other metric in the scrape and make the
 exporter the most expensive thing on the box.
 
-It always samples the host it runs on, as do `--once`, `--stream` and `--watch`.
-Combining any of them with `--replay` or `--remote` is refused rather than
-ignored: `crabmon --once --remote prod-db` used to print the *local* machine's
+Without `--remote`, it samples the local host. `--serve --remote` exports a
+fleet with a `host` label on every series and honors `--remote-command` for
+nonstandard binary locations. `--serve --replay` is refused. The local-only
+`--once`, `--stream` and `--watch` modes refuse both `--remote` and `--replay`: `crabmon --once --remote prod-db` used to print the *local* machine's
 snapshot with exit 0, which is a worse failure than an error, because a script
 gets plausible data about the wrong host and never finds out.
 
@@ -718,7 +744,9 @@ single-core one it was losing more than half the scrapes, which Prometheus
 records as failures rather than as anything crabmon said.
 
 Each connection is handled on its own thread, capped at `MAX_CONNECTIONS` with
-a 503 past it, and both socket directions carry a timeout. Doing the socket IO
+a 503 past it, and both socket directions carry a timeout. Request reads also
+share one five-second deadline, so a trickling client cannot renew its slot
+indefinitely. Incomplete headers are rejected before a scrape is generated. Doing the socket IO
 on the accept loop meant a client that connected and never sent a request — a
 stalled load balancer health check will do — stopped the exporter answering
 anybody, with no error anywhere; a timeout alone only bounds how long that
@@ -726,9 +754,19 @@ lasts. Sampling stays behind a mutex, so concurrent scrapes see consistent
 counter deltas instead of racing each other's `prev` state.
 
 A bare `--serve 9100` binds to loopback; `:9100` keeps its conventional "every
-interface" meaning and says so at startup. The per-process series name every
-running command and its arguments, and the shortest spelling should not be the
-one that publishes them.
+interface" meaning and says so at startup. Per-process series expose the
+busiest processes' names and PIDs, not their command arguments.
+
+For remote hosts, `supervisor::RemoteFreshness` distinguishes new measurements
+from repeated frames. `ThreadedSource` carries the worker's monotonic arrival
+time, unchanged when the underlying frame ID repeats. Delayed scrapes cannot
+make old data young, and remote wall-clock skew does not affect age.
+`crabmon_sample_age_seconds` is omitted before first contact;
+`crabmon_sample_stale` is 1 while connecting, failed, or without a new frame
+for at least the larger of five seconds and three refresh intervals.
+`crabmon_up` is 0 in those cases. Stale samples neither complete pending
+alert hold timers nor get recorded again; an already firing rule awaits a
+real recovery measurement.
 
 ## Answering for the machine
 
@@ -808,10 +846,10 @@ reads as a quiet machine.
 - `--record` and `--record-rotate` work in every mode that samples on a loop:
   the interface, `--stream`, `--serve` and `--watch`, all through one
   `record::Recordings`. `--once` and `--diff` refuse them — a recording is a
-  sequence and they take one sample — as does `--serve --remote`, where a
-  fleet has a timeline per host and `--record` names one file. Under `--serve`
-  the cadence is the scrape's, not `refresh_ms`, because that is when a sample
-  is actually taken.
+  sequence and they take one sample. A fleet records one timeline per host,
+  with distinct file and directory labels. Under local `--serve`, cadence
+  follows scrapes; a remote host is recorded only when a new live frame is
+  observed on a scrape.
 - `--diff` renders JSON or the text report; there is no CSV form of a diff,
   and `--format csv` alongside it falls through to text.
 - `--watch-rule` always measures a `trend` over `DEFAULT_TREND_WINDOW`:
@@ -837,8 +875,10 @@ reads as a quiet machine.
   so a crash mid-save leaves either the old config or the new one. A config
   that cannot be parsed is reported and never written back over.
 - The streaming `--remote` path is unit-tested against a controlled child and
-  driven end to end through a stand-in `ssh`, but has not been run over a real
-  SSH connection; the same caveat the FreeBSD `iostat` path carries.
+  driven end to end through a stand-in `ssh`. `scripts/e2e-ssh.py` also
+  exercises real SSH: exports, redaction, hooks, recordings, stale/failure
+  handling and recovery. This passed against the Linux test server for 0.15.0;
+  it does not establish coverage for every SSH or remote-platform setup.
 - Kernel events are matched on message text, because the kernel has no
   structured form of "this is an OOM kill". The patterns are ones that have
   been spelled the same way for many years, and anything unrecognised is
@@ -856,9 +896,9 @@ reads as a quiet machine.
   process creeping up by a third of a percent a minute is exactly what it is
   for and whole percent would round that series flat. The scaling is undone in
   `measure`, so a threshold is written in whole percentage points.
-- `--serve --remote` samples every host on the scrape, so a scrape takes as
-  long as the slowest host's worker has been waiting. The sources are
-  threaded, so that is a frame's staleness rather than a scrape's delay.
+- `--serve --remote` polls each host's worker on a scrape without waiting
+  for outstanding samples. A slow host affects its sample age and stale
+  state, not the other hosts' scrape latency.
 
 Open defects, found by review and not yet fixed:
 

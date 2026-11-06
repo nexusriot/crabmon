@@ -3,6 +3,21 @@
 Notable changes to crabmon. Versions follow [semantic versioning](https://semver.org),
 with the usual 0.x caveat that minor releases may change behaviour.
 
+## 0.15.0 — 2026-11-06
+
+- Added per-host remote sample age and stale-state Prometheus metrics, based
+  on collector arrival time rather than the remote clock.
+- Added configurable alert hysteresis with separate firing and recovery
+  boundaries and tests for both directions and hold times.
+- Enabled configurable command credential redaction for exports, streams,
+  plain/rotating recordings and flight evidence, before truncation.
+- Fixed exporter slow-client connection exhaustion, incomplete header handling,
+  unbounded remote snapshot queues and ignored fleet `--remote-command`.
+- Added regression tests and an opt-in real SSH end-to-end test harness.
+- Updated the README, man page and design notes for current exporter labels,
+  redaction, freshness, fleet recordings and real SSH coverage. Ignore rules
+  cover Python bytecode and snapshots in configured relative directories.
+
 ## 0.14.0 — unreleased
 
 What a round of deliberately awkward inputs turned up. Two of a fleet's

@@ -21,6 +21,7 @@ pub struct Recorder {
     top_n: usize,
     omit_paths: bool,
     max_cmd_len: usize,
+    redact_commands: bool,
 }
 
 impl Recorder {
@@ -38,6 +39,7 @@ impl Recorder {
             top_n: 100,
             omit_paths: false,
             max_cmd_len: 200,
+            redact_commands: true,
         })
     }
 
@@ -50,9 +52,15 @@ impl Recorder {
         self
     }
 
+    pub fn with_redaction(mut self, enabled: bool) -> Self {
+        self.redact_commands = enabled;
+        self
+    }
+
     /// Write one frame. Flushed immediately so a recording survives a kill.
     pub fn write(&mut self, snap: &Snapshot) -> std::io::Result<()> {
-        let trimmed = trim_frame(snap, self.top_n, self.omit_paths, self.max_cmd_len);
+        let safe = crate::export::redact_commands(snap, self.redact_commands);
+        let trimmed = trim_frame(&safe, self.top_n, self.omit_paths, self.max_cmd_len);
         self.write_trimmed(&trimmed)
     }
 
@@ -140,7 +148,8 @@ impl Recordings {
                 Some(
                     Recorder::create(&path)
                         .map_err(|e| format!("cannot record to {}: {e}", path.display()))?
-                        .with_limits(cfg.top_n, cfg.omit_paths, cfg.max_cmd_len),
+                        .with_limits(cfg.top_n, cfg.omit_paths, cfg.max_cmd_len)
+                        .with_redaction(cfg.redact_commands),
                 )
             }
             None => None,
@@ -261,11 +270,12 @@ pub struct Limits {
     pub top_n: usize,
     pub omit_paths: bool,
     pub max_cmd_len: usize,
+    pub redact_commands: bool,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { top_n: 100, omit_paths: false, max_cmd_len: 200 }
+        Self { top_n: 100, omit_paths: false, max_cmd_len: 200, redact_commands: true }
     }
 }
 
@@ -404,8 +414,12 @@ impl RotatingRecorder {
         if self.current.is_none() || self.written >= self.per_segment {
             self.rotate(at_unix)?;
         }
-        let trimmed =
-            trim_frame(snap, self.limits.top_n, self.limits.omit_paths, self.limits.max_cmd_len);
+        let trimmed = trim_frame(
+            &crate::export::redact_commands(snap, self.limits.redact_commands),
+            self.limits.top_n,
+            self.limits.omit_paths,
+            self.limits.max_cmd_len,
+        );
         if let Some(rec) = self.current.as_mut() {
             rec.write_trimmed(&trimmed)?;
             self.written += 1;
@@ -490,8 +504,12 @@ impl FlightRecorder {
 
     /// Offer a frame. Returns the path of a dump that this frame completed.
     pub fn push(&mut self, snap: &Snapshot) -> Option<PathBuf> {
-        let trimmed =
-            trim_frame(snap, self.limits.top_n, self.limits.omit_paths, self.limits.max_cmd_len);
+        let trimmed = trim_frame(
+            &crate::export::redact_commands(snap, self.limits.redact_commands),
+            self.limits.top_n,
+            self.limits.omit_paths,
+            self.limits.max_cmd_len,
+        );
 
         let mut finished = None;
         if let Some(dump) = &mut self.active {
@@ -536,7 +554,7 @@ impl FlightRecorder {
         let body = crate::incident::summary(
             alert,
             &first,
-            at,
+            &crate::export::redact_commands(at, self.limits.redact_commands),
             dump_name.as_deref().unwrap_or("recording.jsonl"),
         );
         // Best effort: the recording is the thing that matters, and a
@@ -1007,9 +1025,13 @@ mod tests {
         // well over a gigabyte of live memory in the process whose job is to
         // make memory pressure visible.
         let dir = flight_dir("trim");
-        let mut fr =
-            FlightRecorder::new(&dir, 2, 0, Limits { top_n: 3, omit_paths: false, max_cmd_len: 8 })
-                .unwrap();
+        let mut fr = FlightRecorder::new(
+            &dir,
+            2,
+            0,
+            Limits { top_n: 3, omit_paths: false, max_cmd_len: 8, ..Limits::default() },
+        )
+        .unwrap();
         let mut big = frame(1);
         big.procs = (0..50)
             .map(|i| ProcRow {
@@ -1614,5 +1636,59 @@ mod recordings_tests {
         let failures = said.iter().filter(|n| n.contains("failed")).count();
         assert!(failures <= 1, "it complained {failures} times: {said:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+    #[test]
+    fn plain_rotating_and_flight_recordings_respect_redaction_and_opt_out() {
+        let dir = std::env::temp_dir().join(format!(
+            "crabmon-redaction-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let snap = Snapshot {
+            taken_at_unix: 100,
+            procs: vec![crate::metrics::ProcRow {
+                pid: 123,
+                name: "service".into(),
+                cmd: "service --password=hunter2".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for enabled in [true, false] {
+            let path = dir.join(format!("plain-{enabled}.jsonl"));
+            let mut rec = Recorder::create(&path).unwrap().with_redaction(enabled);
+            rec.write(&snap).unwrap();
+            let plain = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(plain.contains("hunter2"), !enabled);
+            let limits = Limits { redact_commands: enabled, ..Limits::default() };
+            let mut rotating =
+                RotatingRecorder::new(&dir.join(format!("rotate-{enabled}")), 1, 2, limits)
+                    .unwrap();
+            rotating.write(&snap, 100).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&rotating.segments()[0]).unwrap().contains("hunter2"),
+                !enabled
+            );
+            let mut flight = FlightRecorder::new(&dir, 2, 1, limits).unwrap();
+            flight.push(&snap);
+            let path = flight.trigger(&format!("flight-{enabled}"), 100).unwrap().unwrap();
+            flight.push(&snap);
+            let text = std::fs::read_to_string(path).unwrap();
+            assert_eq!(text.contains("hunter2"), !enabled);
+            assert_eq!(text.lines().count(), 2);
+        }
+        // A secret cut in half by the length budget must never be persisted.
+        let path = dir.join("short.jsonl");
+        let mut rec = Recorder::create(&path).unwrap().with_limits(0, false, 23);
+        rec.write(&snap).unwrap();
+        assert!(!std::fs::read_to_string(path).unwrap().contains("hunt"));
+        assert!(snap.procs[0].cmd.contains("hunter2"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

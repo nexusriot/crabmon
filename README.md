@@ -645,8 +645,8 @@ dumps are named `crabmon-<host>-<rule>-<unix>.jsonl` for the same reason, and
 hooks and notes say which machine they are about. A host that is down costs a
 scrape nothing but its own missing series.
 
-Binding the exporter off loopback publishes the argv of every process on the
-machine. `[serve] token = "…"`, or `CRABMON_SERVE_TOKEN` in the environment,
+Binding the exporter off loopback exposes host metrics and the names and PIDs
+of the busiest processes. Prometheus series do not contain command arguments. `[serve] token = "…"`, or `CRABMON_SERVE_TOKEN` in the environment,
 makes a scrape present it first:
 
 ```sh
@@ -681,7 +681,9 @@ scrape_configs:
 
 `--stream` prints one complete JSON snapshot per line, forever. Recording
 limits do not trim transport frames: remote filters and alerts need every
-process and its full command line. It is what `--remote` runs on the far end,
+process. Command lines follow `[export] redact_commands` (true by default);
+remote `cmd:` filters therefore see redacted arguments unless that setting is
+disabled on the remote host. It is what `--remote` runs on the far end,
 and it works on its own as a collector:
 
 ```sh
@@ -767,6 +769,7 @@ enabled = true
 nvidia_smi = false          # shell out to nvidia-smi each refresh
 
 [export]
+redact_commands = true      # hide credentials in exported command lines
 dir = ""                    # empty means the working directory
 format = "json"             # json|csv|text
 top_n = 0                   # 0 keeps every process
@@ -774,6 +777,7 @@ top_n = 0                   # 0 keeps every process
 [record]
 top_n = 100                 # processes kept per frame; 0 keeps all (~1.5 MB/frame)
 omit_paths = false          # drop command lines, exe and cwd entirely
+redact_commands = true      # hide credential arguments before truncating
 max_cmd_len = 200           # truncate argv; Chromium's runs to kilobytes
 flight = 0                  # flight recorder: frames of context held in memory
                             # and written out when an alert fires. 0 is off.
@@ -816,6 +820,7 @@ name = "cpu-saturated"
 kind = "cpu"                # cpu mem swap load disk temp gpu psi io net fd proc trend fillin cgroup kernel
 threshold = 90.0            # % for most kinds; °C for temp, B/s for net,
                             # a count for proc and kernel, absolute for load
+hysteresis = 0.0            # recovery margin in the measurement's unit
 for_secs = 30               # must hold this long before firing
 over_secs = 0               # trend rules: the window growth is measured
                             # over, in seconds. 0 means 300.
@@ -1085,7 +1090,44 @@ thing for something other than a person.
   `--diff` take a single sample, so a hold time has nothing to hold against
   and they never fire one.
 
+## Freshness, alert hysteresis and credential redaction
+
+Fleet exporters publish `crabmon_sample_age_seconds{host="..."}` using the
+collector's monotonic clock, so remote clock skew cannot change sample age.
+It is omitted until the first frame arrives. `crabmon_sample_stale{host="..."}`
+is 1 while connecting, after an error, or after no new frame for the larger
+of five seconds and three refresh intervals. It returns to 0 on a new frame.
+
+Set `hysteresis = 5.0` on an `[[alert]]` to give recovery a margin in the
+measurement's own unit. An above rule with `threshold = 90` fires at 90 and
+recovers strictly below 85; a below rule with threshold 10 recovers at 15.
+The default is 0; values must be finite and nonnegative. The margin applies
+after firing; `for_secs` still measures
+continuous time beyond the original threshold. Hooks run once per transition.
+
+`[export] redact_commands = true` and `[record] redact_commands = true` are
+the defaults. They hide common credential arguments (`--password`, `--token`,
+API/access keys and secret assignments), bearer tokens and URL credentials.
+Redaction happens before recording truncation and covers JSON/CSV/text exports,
+stream output, plain and rotating recordings, and flight dumps and summaries.
+Local live data and filters keep the original command; remote views receive
+the remote host's exported, possibly redacted command. Unquoted credential
+values conservatively hide the remainder of the command because joined argv
+cannot distinguish spaces inside a secret from argument boundaries. Set either
+setting to `false` to retain raw commands for that output. Positional secrets
+and unrecognized credential names still require `[record] omit_paths = true`
+or care before sharing exports; this is not a general secret scanner.
+
 ## Development
+
+For opt-in end-to-end checks over real SSH, build the release binary and run
+`python3 scripts/e2e-ssh.py --target user@host --binary target/release/crabmon`.
+The harness requires Linux on both ends, Python 3, noninteractive SSH access,
+and a release binary compatible with the remote architecture and libc. It
+uploads into a private remote `/tmp` directory, starts temporary workloads,
+checks exports, hysteresis hooks, recording/rotation/flight evidence, then
+checks collector sample age, stalls, failures and recovery. It cleans up its
+test processes and files; it does not install a system binary.
 
 ```sh
 make test         # unit, behaviour, rendering, CLI and doc tests

@@ -296,3 +296,39 @@ fn open_pty() -> (File, File) {
     // SAFETY: successful openpty transferred two fresh owned descriptors.
     unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) }
 }
+
+#[test]
+fn fleet_exporter_honors_custom_remote_command_and_exports_freshness() {
+    let dir = Scratch::new("remote-command");
+    let ssh = dir.file("ssh");
+    fs::write(&ssh, "#!/bin/sh\nfor arg do last=$arg; done\n[ \"$last\" = 'chosen-command' ] || exit 1\nprintf '%s\\n' '{\"taken_at_unix\":100,\"host\":{\"hostname\":\"custom\"}}'\n").unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+    let cfg = dir.file("config.toml");
+    fs::write(&cfg, "refresh_ms = 200\n").unwrap();
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let addr = format!("127.0.0.1:{port}");
+    let path = format!("{}:{}", dir.0.display(), std::env::var("PATH").unwrap_or_default());
+    let _app = spawn(
+        Command::new(BIN)
+            .args([
+                "--serve",
+                &addr,
+                "--remote",
+                "custom-host",
+                "--remote-command",
+                "chosen-command",
+                "--config",
+            ])
+            .arg(cfg)
+            .env("PATH", path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
+    wait_until(|| {
+        scrape(&addr).is_some_and(|s| {
+            s.contains("crabmon_up{host=\"custom-host\"} 1")
+                && s.contains("crabmon_sample_stale{host=\"custom-host\"} 0")
+                && s.contains("crabmon_sample_age_seconds{host=\"custom-host\"}")
+        })
+    });
+}

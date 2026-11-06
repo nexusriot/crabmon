@@ -1,4 +1,4 @@
-.TH CRABMON 1 "2026-10-22" "crabmon 0.14.0" "User Commands"
+.TH CRABMON 1 "2026-11-06" "crabmon 0.15.0" "User Commands"
 .SH NAME
 crabmon \- terminal system monitor
 .SH SYNOPSIS
@@ -143,13 +143,15 @@ named \fBcrabmon\-<host>\-<rule>\-<unix>.jsonl\fR. Combining it with
 \fB\-\-replay\fR is an error: a recording has no \(lqnow\(rq to scrape.
 .PP
 A bare port binds to loopback; \fB:\fIPORT\fR binds to every interface. The
-per-process series carry command lines, so the difference matters. Connections
+per-process series expose process names and PIDs, so the difference matters.
+Command arguments are not exported as Prometheus labels. Connections
 are handled concurrently and capped; past the cap callers get 503.
 .TP
 .B \-\-stream
 Print one complete JSON snapshot per line, forever. Recording limits do not
-trim transport frames: remote filters and alerts need every process and its
-full command line. This is what \fB\-\-remote\fR runs on the far end, and it is
+trim transport frames: remote filters and alerts need every process. Command
+arguments follow [export] redact_commands (true by default), so remote cmd:
+filters see redacted arguments unless that setting is disabled remotely. This is what \fB\-\-remote\fR runs on the far end, and it is
 usable on its own as a collector. Samples this host only.
 .TP
 .B \-\-alerts
@@ -480,9 +482,11 @@ because it costs tens of milliseconds.
 .B dir
 is where \fBP\fR writes snapshots (empty means the working directory),
 .B format
-is \fBjson\fR or \fBcsv\fR, and
+is \fBjson\fR, \fBcsv\fR or \fBtext\fR, and
 .B top_n
 limits the process list (0 keeps every process).
+.B redact_commands
+hides common credential arguments in exports and streams (default true).
 .SS [record]
 .B top_n
 processes are kept per frame, busiest first, and real processes are preferred
@@ -491,6 +495,9 @@ over threads (default 100; 0 keeps everything, at roughly 1.5 MB a frame).
 truncates command lines (default 200) and
 .B omit_paths
 drops them, along with executable paths and working directories, entirely.
+.B redact_commands
+hides common credential arguments before truncation (default true), including
+plain, rotating and flight recordings and incident summaries.
 .PP
 .B flight
 turns on the flight recorder: that many frames of context are held in memory at
@@ -559,8 +566,8 @@ per-process series are exported by \fB\-\-serve\fR, busiest first (default
 requires every scrape of \fB/metrics\fR to present
 \fBAuthorization: Bearer <token>\fR; an empty token (the default) leaves the
 exporter open. The environment variable \fBCRABMON_SERVE_TOKEN\fR overrides
-it, which keeps the secret out of a config file. A scrape carries the argv of
-every process on the machine, which is why this exists. \fB/healthz\fR is
+it, which keeps the secret out of a config file. A scrape exposes host metrics
+and process names and PIDs; it does not include command arguments. \fB/healthz\fR is
 exempt, and the comparison is constant-time.
 .SS [audit]
 .B enabled
@@ -584,7 +591,7 @@ Values may be colour names (\fBred\fR), hex (\fB#ff8800\fR) or 256-colour
 indexes (\fB33\fR). Unknown keys and unparseable values are ignored.
 .SS [[alert]]
 Each table defines one rule:
-.IR name ", " kind ", " threshold ", " for_secs ", " below ", " target ", "
+.IR name ", " kind ", " threshold ", " hysteresis ", " for_secs ", " over_secs ", " below ", " target ", "
 .IR query ", " command " and " command_clear .
 .I kind
 is one of
@@ -725,6 +732,27 @@ Alerts \(em and so the flight recorder \(em are evaluated only by the
 interactive interface.
 .BR \-\-once ", " \-\-serve ", " \-\-stream " and " \-\-watch
 do not evaluate rules and never write a dump.
+.SH SAMPLE FRESHNESS, HYSTERESIS AND REDACTION
+Remote exporters emit crabmon_sample_age_seconds (seconds since receipt of a
+new frame) and crabmon_sample_stale (1 when connecting, failed or stale).
+Age is omitted until the first sample. Stale timeout is the larger of five
+seconds and three refresh intervals. These use the collector's monotonic clock.
+.PP
+An alert's hysteresis defaults to 0 and must be finite and nonnegative.
+For an above rule, recovery requires a
+value strictly below threshold minus hysteresis. For a below rule, recovery
+requires a value at or above threshold plus hysteresis. The margin applies
+only after firing; hold times still apply to the original threshold.
+.PP
+[export] and [record] each accept redact_commands = true (the default).
+Common credential arguments, bearer tokens and URL user/password pairs are
+hidden before truncation. Set false to retain raw command lines. This applies
+to exported snapshots, streams, plain/rotating recordings and flight dumps.
+Local live process filters and display retain the original data. Remote views
+receive the remote host's exported, possibly redacted command. Unquoted
+credential values conservatively hide the rest of the command, since joined
+argv cannot preserve argument boundaries. Positional
+secrets and unrecognized credential names cannot be detected automatically.
 .SH EXIT STATUS
 .TP
 .B 0

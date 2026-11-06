@@ -189,7 +189,8 @@ fn stream_frames(cfg: &Config, args: &Args) -> Result<()> {
         if let Some(sup) = sup.as_mut() {
             report(sup.observe(&snap));
         }
-        let line = serde_json::to_string(&snap)?;
+        let safe = export::redact_commands(&snap, cfg.export.redact_commands);
+        let line = serde_json::to_string(&safe)?;
         // A broken pipe means the reader went away; that is a normal exit here,
         // not a crash to report.
         if out.write_all(line.as_bytes()).is_err()
@@ -319,7 +320,7 @@ fn watch_for(rule: crabmon::alerts::AlertRule, cfg: &Config, args: &Args) -> Res
         let text = match (rows.is_empty(), &fired) {
             (false, _) => {
                 let snap = crabmon::Snapshot { procs: rows.clone(), ..Default::default() };
-                export::render(&snap, format)
+                export::render(&export::redact_commands(&snap, cfg.export.redact_commands), format)
             }
             (true, Some(alert)) => match format {
                 export::ExportFormat::Json => {
@@ -441,9 +442,10 @@ fn serve_fleet(addr: &str, cfg: &Config, args: &Args, spec: &str) -> Result<()> 
     let labels = crabmon::record::unique_labels(&targets);
     let mut hosts: Vec<Host> = Vec::with_capacity(targets.len());
     for (target, label) in targets.iter().zip(&labels) {
-        let remote = match cfg.remote.stream {
-            true => RemoteSource::streaming(target, cfg.refresh_ms, Vec::new()),
-            false => RemoteSource::new(target, None, Vec::new()),
+        let remote = match (&args.remote_command, cfg.remote.stream) {
+            (Some(_), _) => RemoteSource::new(target, args.remote_command.clone(), Vec::new()),
+            (None, true) => RemoteSource::streaming(target, cfg.refresh_ms, Vec::new()),
+            (None, false) => RemoteSource::new(target, None, Vec::new()),
         };
         let recordings = crabmon::record::Recordings::for_host(
             args.record.as_deref(),
@@ -469,11 +471,12 @@ fn serve_fleet(addr: &str, cfg: &Config, args: &Args, spec: &str) -> Result<()> 
             .iter_mut()
             .map(|host| {
                 let snap = host.source.snapshot(elapsed);
-                let (fresh, reachable) = host.freshness.update(
+                let (fresh, reachable) = host.freshness.update_received(
                     &snap,
                     host.source.frame_id(),
                     host.source.error().is_none(),
                     Instant::now(),
+                    host.source.received_at(),
                     host.sup.as_mut().map(|s| &mut s.alerts),
                 );
                 // Only a frame that actually arrived: re-recording the last
@@ -495,7 +498,12 @@ fn serve_fleet(addr: &str, cfg: &Config, args: &Args, spec: &str) -> Result<()> 
                 };
                 // A host that cannot be reached is not up, whatever its
                 // last good frame still says.
-                (host.name.clone(), crabmon::serve::render_host(&snap, top, &states, reachable))
+                let mut rendered = crabmon::serve::render_host(&snap, top, &states, reachable);
+                rendered.push_str(&crabmon::serve::render_freshness(
+                    host.freshness.sample_age(Instant::now()),
+                    reachable,
+                ));
+                (host.name.clone(), rendered)
             })
             .collect();
         crabmon::serve::merge_hosts(&parts)
@@ -595,6 +603,7 @@ fn print_once(cfg: &Config, args: &Args, source: &mut SysinfoSource) -> Result<(
     snap.procs.retain(|p| filter.matches(p));
     crabmon::sort::sort_rows(&mut snap.procs, cfg.sort_by, cfg.sort_desc);
     let snap = export::trim_procs(&snap, cfg.export.top_n);
+    let snap = export::redact_commands(&snap, cfg.export.redact_commands);
 
     let format = args
         .format

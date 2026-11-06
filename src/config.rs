@@ -116,6 +116,8 @@ pub struct RecordConfig {
     /// processes carry multi-kilobyte argv, which is most of a frame otherwise.
     /// 0 disables truncation.
     pub max_cmd_len: usize,
+    /// Hide credential arguments before truncating or writing frames.
+    pub redact_commands: bool,
     /// Frames of context the flight recorder keeps in memory, ready to be
     /// written out when an alert fires. 0 — the default — switches it off; a
     /// monitor that writes files unasked is not what anyone installed. At the
@@ -144,6 +146,7 @@ impl Default for RecordConfig {
             top_n: 100,
             omit_paths: false,
             max_cmd_len: 200,
+            redact_commands: true,
             flight: 0,
             flight_after: 30,
             flight_dir: String::new(),
@@ -160,6 +163,7 @@ impl RecordConfig {
             top_n: self.top_n,
             omit_paths: self.omit_paths,
             max_cmd_len: self.max_cmd_len,
+            redact_commands: self.redact_commands,
         }
     }
 }
@@ -172,8 +176,8 @@ pub struct ServeConfig {
     pub top_procs: usize,
     /// A bearer token every scrape must present, or empty for none.
     ///
-    /// The exporter publishes every command line on the machine, which is
-    /// the argv of every process including the ones people put secrets in.
+    /// The exporter exposes host metrics and process names and PIDs.
+    /// Command arguments are not included in its Prometheus series.
     /// Binding it anywhere but loopback with nothing in front of it was one
     /// flag away, and there was no way to ask for a password.
     ///
@@ -262,11 +266,12 @@ pub struct ExportConfig {
     pub format: String,
     /// 0 keeps every process.
     pub top_n: usize,
+    pub redact_commands: bool,
 }
 
 impl Default for ExportConfig {
     fn default() -> Self {
-        Self { dir: String::new(), format: "json".into(), top_n: 0 }
+        Self { dir: String::new(), format: "json".into(), top_n: 0, redact_commands: true }
     }
 }
 
@@ -365,7 +370,16 @@ impl Config {
     /// say so. A monitor whose alerts have quietly stopped existing is the
     /// worst possible failure mode for one.
     pub fn parse_checked(s: &str) -> Result<Config, String> {
-        toml::from_str(s).map_err(|e| e.message().replace('\n', " "))
+        let cfg: Config = toml::from_str(s).map_err(|e| e.message().replace('\n', " "))?;
+        for rule in &cfg.alerts {
+            if !rule.hysteresis.is_finite() || rule.hysteresis < 0.0 {
+                return Err(format!(
+                    "alert {}: hysteresis must be finite and nonnegative",
+                    rule.name
+                ));
+            }
+        }
+        Ok(cfg)
     }
 
     pub fn to_toml(&self) -> String {
@@ -744,5 +758,38 @@ mod tests {
                 assert!(t.temp_warn <= t.temp_crit, "{field}={value} inverted the temp pair");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod safety_settings_tests {
+    use super::*;
+    #[test]
+    fn new_settings_round_trip_and_invalid_hysteresis_is_rejected() {
+        let cfg = Config::parse_checked(
+            r#"
+[export]
+redact_commands = false
+[record]
+redact_commands = false
+[[alert]]
+name = "cpu"
+kind = "cpu"
+threshold = 90
+hysteresis = 5
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.export.redact_commands && !cfg.record.redact_commands);
+        assert_eq!(cfg.alerts[0].hysteresis, 5.0);
+        assert_eq!(Config::parse_checked(&cfg.to_toml()).unwrap(), cfg);
+        for width in ["-1", "nan", "inf"] {
+            let text =
+                format!("[[alert]]\nname='bad'\nkind='cpu'\nthreshold=90\nhysteresis={width}\n");
+            assert!(Config::parse_checked(&text).unwrap_err().contains("hysteresis"));
+        }
+        let defaults = Config::parse_checked("").unwrap();
+        assert!(defaults.export.redact_commands && defaults.record.redact_commands);
+        assert!(defaults.alerts.iter().all(|r| r.hysteresis == 0.0));
     }
 }

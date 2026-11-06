@@ -117,6 +117,9 @@ pub struct AlertRule {
     /// Percent for cpu/mem/swap/disk/gpu/psi/io/fd, degrees for temp, bytes
     /// per second for net, a count for proc, absolute for load.
     pub threshold: f64,
+    /// Recovery margin in the measurement's unit; zero preserves the firing boundary.
+    #[serde(default)]
+    pub hysteresis: f64,
     #[serde(default)]
     pub for_secs: u64,
     /// The window a `trend` rule measures growth over, in seconds. Ignored
@@ -370,7 +373,8 @@ impl AlertEngine {
             // much CPU" and "fewer than one nginx". Strict, so that the
             // obvious `threshold = 1` on a `proc` rule means "none left"
             // rather than firing while the one process is still running.
-            let over = if rule.below { value < rule.threshold } else { value >= rule.threshold };
+            let threshold = if st.fired { rule.recovery_threshold() } else { rule.threshold };
+            let over = if rule.below { value < threshold } else { value >= threshold };
             if !over {
                 st.over_since = None;
                 // Recovering is a transition worth reporting: an alert that
@@ -389,7 +393,7 @@ impl AlertEngine {
                                 rule.name,
                                 quantity(value, unit),
                                 if rule.below { "≥" } else { "<" },
-                                quantity(rule.threshold, unit),
+                                quantity(threshold, unit),
                             ),
                             at_unix,
                             host: String::new(),
@@ -437,13 +441,24 @@ impl AlertEngine {
             };
             // Built before the hook so the hook is told the same line the
             // status bar and the `!` popup show, subject and all.
-            let message = format!(
+            let mut message = format!(
                 "{} {} {} {}{subject}",
                 rule.name,
                 quantity(value, unit),
                 if rule.below { "<" } else { "≥" },
                 quantity(rule.threshold, unit),
             );
+            let beyond_trigger =
+                if rule.below { value < rule.threshold } else { value >= rule.threshold };
+            if !beyond_trigger {
+                message = format!(
+                    "{} {} (recovery {} {}){subject}",
+                    rule.name,
+                    quantity(value, unit),
+                    if rule.below { "≥" } else { "<" },
+                    quantity(rule.recovery_threshold(), unit)
+                );
+            }
             if just_fired && !rule.command.is_empty() {
                 self.pending_commands.push(HookCall {
                     command: rule.command.clone(),
@@ -629,6 +644,11 @@ fn proc_trend_series(rule: &AlertRule) -> Option<TrendSeries> {
 pub const DEFAULT_TREND_WINDOW: u64 = 300;
 
 impl AlertRule {
+    pub fn recovery_threshold(&self) -> f64 {
+        let width = if self.hysteresis.is_finite() { self.hysteresis.max(0.0) } else { 0.0 };
+        if self.below { self.threshold + width } else { self.threshold - width }
+    }
+
     /// The window this rule measures over.
     pub fn window(&self) -> u64 {
         match self.over_secs {
@@ -1244,6 +1264,7 @@ pub fn default_rules() -> Vec<AlertRule> {
             name: "cpu-saturated".into(),
             kind: AlertKind::Cpu,
             threshold: 90.0,
+            hysteresis: 0.0,
             for_secs: 30,
             over_secs: 0,
             below: false,
@@ -1256,6 +1277,7 @@ pub fn default_rules() -> Vec<AlertRule> {
             name: "disk-nearly-full".into(),
             kind: AlertKind::Disk,
             threshold: 95.0,
+            hysteresis: 0.0,
             for_secs: 0,
             over_secs: 0,
             below: false,
@@ -1277,6 +1299,7 @@ mod trend_tests {
             name: "leak".into(),
             kind: AlertKind::Trend,
             threshold,
+            hysteresis: 0.0,
             for_secs: 0,
             over_secs,
             below: false,
@@ -1795,6 +1818,7 @@ mod tests {
             name: name.into(),
             kind,
             threshold,
+            hysteresis: 0.0,
             for_secs,
             over_secs: 0,
             below: false,
@@ -1807,6 +1831,51 @@ mod tests {
 
     fn snap_cpu(pct: f32) -> Snapshot {
         Snapshot { cpu: CpuSample { per_core: vec![pct], freq_mhz: vec![] }, ..Default::default() }
+    }
+
+    #[test]
+    fn hysteresis_holds_firing_state_until_recovery_and_hooks_run_once() {
+        for below in [false, true] {
+            let mut r = rule("margin", AlertKind::Cpu, 50.0, 2);
+            r.below = below;
+            r.hysteresis = 10.0;
+            r.command = "fire".into();
+            r.command_clear = "clear".into();
+            let mut engine = AlertEngine::new(vec![r]);
+            let firing = if below { 40.0 } else { 60.0 };
+            let margin = if below { 55.0 } else { 45.0 };
+            let recovered = if below { 60.0 } else { 39.0 };
+            assert!(engine.evaluate(&snap_cpu(firing), 0).is_empty());
+            // The margin applies only after firing, not during the hold.
+            assert!(engine.evaluate(&snap_cpu(margin), 1).is_empty());
+            assert!(engine.evaluate(&snap_cpu(firing), 2).is_empty());
+            assert_eq!(engine.evaluate(&snap_cpu(firing), 4).len(), 1);
+            assert_eq!(commands_of(&mut engine), vec!["fire"]);
+            for t in 5..10 {
+                let active = engine.evaluate(&snap_cpu(margin), t);
+                assert_eq!(active.len(), 1);
+                assert!(active[0].message.contains("recovery"));
+            }
+            assert!(commands_of(&mut engine).is_empty());
+            assert!(engine.evaluate(&snap_cpu(recovered), 10).is_empty());
+            assert_eq!(commands_of(&mut engine), vec!["clear"]);
+            assert!(engine.evaluate(&snap_cpu(margin), 11).is_empty());
+        }
+    }
+
+    #[test]
+    fn hysteresis_recovery_boundaries_keep_the_original_comparison_semantics() {
+        let mut r = rule("margin", AlertKind::Cpu, 50.0, 0);
+        r.hysteresis = 10.0;
+        let mut e = AlertEngine::new(vec![r.clone()]);
+        e.evaluate(&snap_cpu(50.0), 0);
+        assert_eq!(e.evaluate(&snap_cpu(40.0), 1).len(), 1);
+        assert!(e.evaluate(&snap_cpu(39.9), 2).is_empty());
+        r.below = true;
+        let mut e = AlertEngine::new(vec![r]);
+        e.evaluate(&snap_cpu(49.0), 0);
+        assert_eq!(e.evaluate(&snap_cpu(59.9), 1).len(), 1);
+        assert!(e.evaluate(&snap_cpu(60.0), 2).is_empty());
     }
 
     #[test]

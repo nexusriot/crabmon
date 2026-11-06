@@ -62,6 +62,37 @@ pub fn trim_procs(snap: &Snapshot, top_n: usize) -> Snapshot {
     out
 }
 
+/// Redact common credential arguments while keeping the live snapshot untouched.
+/// Apply before truncation: truncating first can remove a closing quote or key.
+pub fn redact_commands(snap: &Snapshot, enabled: bool) -> Snapshot {
+    let mut out = snap.clone();
+    if enabled {
+        for proc in &mut out.procs {
+            proc.cmd = redact_command(&proc.cmd);
+        }
+    }
+    out
+}
+
+pub fn redact_command(command: &str) -> String {
+    use regex::Regex;
+    use std::sync::OnceLock;
+    static ARGS: OnceLock<Regex> = OnceLock::new();
+    static URL: OnceLock<Regex> = OnceLock::new();
+    static BEARER: OnceLock<Regex> = OnceLock::new();
+    let args = ARGS.get_or_init(|| Regex::new(
+        r#"(?i)((?:--?)?[\w-]*(?:password|passwd|passphrase|token|secret|api[_-]?key|access[_-]?key|credential|authorization)[\w-]*\s*(?:[=:]\s*|\s+))(?:bearer\s+)?(?:\[REDACTED\]|"[^"]*"|'[^']*'|[\s\S]+)"#
+    ).expect("credential argument regex"));
+    let url = URL.get_or_init(|| {
+        Regex::new(r"(?i)([a-z][a-z0-9+.-]*://)[^/\s@]+@").expect("URL credential regex")
+    });
+    let bearer = BEARER
+        .get_or_init(|| Regex::new(r"(?i)(\bbearer\s+)[a-z0-9._~+/=-]+").expect("bearer regex"));
+    let out = args.replace_all(command, "${1}[REDACTED]");
+    let out = url.replace_all(&out, "${1}[REDACTED]@");
+    bearer.replace_all(&out, "${1}[REDACTED]").into_owned()
+}
+
 pub fn to_json(snap: &Snapshot) -> String {
     let export = Export { crabmon_version: env!("CARGO_PKG_VERSION"), snapshot: snap };
     serde_json::to_string_pretty(&export).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
@@ -315,5 +346,51 @@ mod tests {
             export_path(Path::new("/tmp"), 1234, ExportFormat::Csv),
             PathBuf::from("/tmp/crabmon-1234.csv")
         );
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+    #[test]
+    fn credentials_are_hidden_in_common_argument_and_url_spellings() {
+        for cmd in [
+            "service --password=hunter2 --port 80",
+            "service --api-key 'hunter2 multi word' --port 80",
+            "service DB_PASSWORD=hunter2",
+            "service --token hunter2 multi word",
+            "curl https://alice:hunter2@example.org/path",
+            "curl https://hunter2@example.org/path",
+            "service --password hunter2\nsecond-line",
+            "curl -H 'Authorization: Bearer hunter2'",
+        ] {
+            let out = redact_command(cmd);
+            assert!(!out.contains("hunter2"), "{out}");
+            assert!(out.contains("[REDACTED]"), "{out}");
+            assert_eq!(redact_command(&out), out);
+        }
+        assert_eq!(
+            redact_command("service --port 80 --user alice"),
+            "service --port 80 --user alice"
+        );
+    }
+    #[test]
+    fn redaction_does_not_mutate_live_data_and_applies_to_every_export_format() {
+        let snap = Snapshot {
+            procs: vec![ProcRow {
+                pid: 1,
+                cmd: "service --password=hunter2".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let safe = redact_commands(&snap, true);
+        for format in ALL_EXPORT_FORMATS {
+            assert!(!render(&safe, format).contains("hunter2"));
+            if format != ExportFormat::Text {
+                assert!(render(&redact_commands(&snap, false), format).contains("hunter2"));
+            }
+        }
+        assert!(snap.procs[0].cmd.contains("hunter2"));
     }
 }

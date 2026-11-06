@@ -1734,6 +1734,7 @@ impl App {
         let mut snap = self.snap.clone();
         snap.procs = self.rows.clone();
         let snap = export::trim_procs(&snap, self.cfg.export.top_n);
+        let snap = export::redact_commands(&snap, self.cfg.export.redact_commands);
         let path = export::export_path(&dir, snap.taken_at_unix, format);
         match std::fs::write(&path, export::render(&snap, format)) {
             Ok(()) => self.set_status(format!("wrote {}", path.display())),

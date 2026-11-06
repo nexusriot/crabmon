@@ -157,6 +157,27 @@ pub fn ssh_args(target: &str, options: &[String], remote_command: &str) -> Vec<S
     args
 }
 
+type Frame = Result<Snapshot, String>;
+
+fn frame_channel() -> (mpsc::SyncSender<Frame>, Receiver<Frame>) {
+    mpsc::sync_channel(2)
+}
+
+// Backpressure keeps paused or slow consumers from accumulating entire snapshots
+// indefinitely. Dropping the receiver also releases a reader blocked in send.
+fn forward_frames(reader: impl BufRead, tx: mpsc::SyncSender<Result<Snapshot, String>>) {
+    for line in reader.lines().map_while(Result::ok) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let frame =
+            serde_json::from_str::<Snapshot>(&line).map_err(|e| format!("unparseable frame: {e}"));
+        if tx.send(frame).is_err() {
+            return;
+        }
+    }
+}
+
 impl RemoteSource {
     pub fn new(target: &str, remote_command: Option<String>, ssh_options: Vec<String>) -> Self {
         RemoteSource {
@@ -199,7 +220,7 @@ impl RemoteSource {
             .map_err(|e| format!("ssh: {e}"))?;
         let stdout = child.stdout.take().ok_or("ssh produced no stdout")?;
         let stderr = child.stderr.take();
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = frame_channel();
 
         // stderr is drained on its own thread: a full pipe would otherwise
         // block the far end mid-frame and stall the stream silently.
@@ -218,16 +239,7 @@ impl RemoteSource {
         });
 
         std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let frame = serde_json::from_str::<Snapshot>(&line)
-                    .map_err(|e| format!("unparseable frame: {e}"));
-                if tx.send(frame).is_err() {
-                    return; // the source was dropped
-                }
-            }
+            forward_frames(BufReader::new(stdout), tx);
         });
 
         self.stream = Some(Stream { child, frames: rx });
@@ -612,6 +624,48 @@ mod tests {
         src.drain_stream();
         let err = src.last_error.clone().expect("the failure must surface");
         assert!(err.contains("Permission denied"), "{err}");
+    }
+
+    #[test]
+    fn a_paused_stream_consumer_backpressures_the_reader_and_drop_releases_it() {
+        use std::io::{Cursor, Read};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        struct Counted {
+            input: Cursor<Vec<u8>>,
+            bytes: Arc<AtomicUsize>,
+        }
+        impl Read for Counted {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.input.read(buf)?;
+                self.bytes.fetch_add(n, Ordering::SeqCst);
+                Ok(n)
+            }
+        }
+        let line = format!("{}\n", serde_json::to_string(&Snapshot::default()).unwrap());
+        let input = line.repeat(100).into_bytes();
+        let total = input.len();
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let reader = BufReader::with_capacity(
+            1,
+            Counted { input: Cursor::new(input), bytes: Arc::clone(&bytes) },
+        );
+        let (tx, rx) = frame_channel();
+        let (done, finished) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            forward_frames(reader, tx);
+            done.send(()).unwrap();
+        });
+        // No consumer: an unbounded queue would read all 100 frames and finish.
+        let early = finished.recv_timeout(Duration::from_millis(200));
+        assert!(early.is_err(), "reader consumed the entire paused stream");
+        assert!(bytes.load(Ordering::SeqCst) < total);
+        drop(rx);
+        finished.recv_timeout(Duration::from_secs(3)).expect("reader stuck after source drop");
+        worker.join().unwrap();
     }
 
     #[test]

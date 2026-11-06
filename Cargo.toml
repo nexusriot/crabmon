@@ -1,6 +1,6 @@
 [package]
 name = "crabmon"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2024"
 # The floor is the highest any dependency asks for, not the edition's own
 # 1.85: sysinfo 0.39 wants 1.95. Declared so cargo refuses an older toolchain

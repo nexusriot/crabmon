@@ -522,6 +522,7 @@ mod tests {
         let mut cfg = Config { alerts: Vec::new(), ..Default::default() };
         cfg.procs.fds = false;
         cfg.alerts.push(crate::alerts::AlertRule {
+            hysteresis: 0.0,
             name: "descriptors".into(),
             kind: crate::alerts::AlertKind::Fd,
             threshold: 90.0,

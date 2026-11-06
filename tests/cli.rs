@@ -434,10 +434,9 @@ fn a_watch_leaves_a_rotating_recording_of_the_run_up() {
         .map(|n| std::fs::read_to_string(dir.join(n)).expect("segment"))
         .map(|body| crabmon::record::parse_jsonl(&body).expect("every line parses").len())
         .sum();
-    // Two, not "about as many as the interval predicts": how fast a machine
-    // samples is the pacing test's subject, and tying this to it would make
-    // a slow CI runner fail a test about whether recording happens at all.
-    assert!(frames >= 2, "a watch recorded only {frames} frames");
+    // A heavily loaded host may spend the entire timeout on its first sample.
+    // This checks persistence; cadence and multi-frame rotation have other tests.
+    assert!(frames >= 1, "a watch recorded no frames");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

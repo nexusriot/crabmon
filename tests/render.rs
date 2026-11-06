@@ -226,6 +226,7 @@ fn a_firing_alert_takes_over_the_status_line() {
         name: "disk-full".into(),
         kind: crabmon::alerts::AlertKind::Disk,
         threshold: 90.0,
+        hysteresis: 0.0,
         for_secs: 0,
         over_secs: 0,
         below: false,

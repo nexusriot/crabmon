@@ -103,6 +103,28 @@ fn labelled(line: &str, host: &str) -> String {
     }
 }
 
+/// Arrival-based freshness for remote hosts, independent of remote wall clocks.
+pub fn render_freshness(age: Option<f64>, reachable: bool) -> String {
+    let mut out = String::new();
+    metric(
+        &mut out,
+        "sample_stale",
+        "1 when no current remote sample is available.",
+        "gauge",
+        &plain((!reachable) as u8 as f64),
+    );
+    if let Some(age) = age {
+        metric(
+            &mut out,
+            "sample_age_seconds",
+            "Seconds since the last new remote sample arrived.",
+            "gauge",
+            &plain(age),
+        );
+    }
+    out
+}
+
 /// Escape a Prometheus label value.
 pub fn escape_label(value: &str) -> String {
     value.replace('\\', r"\\").replace('"', "\\\"").replace('\n', r"\n")
@@ -888,10 +910,20 @@ impl Conn for std::os::unix::net::UnixStream {
     }
 }
 
-fn handle<S: Conn>(mut stream: S, token: Option<&str>, body: impl FnOnce() -> String) {
+fn handle<S: Conn>(stream: S, token: Option<&str>, body: impl FnOnce() -> String) {
+    handle_with_timeout(stream, token, body, CLIENT_TIMEOUT);
+}
+
+fn handle_with_timeout<S: Conn>(
+    mut stream: S,
+    token: Option<&str>,
+    body: impl FnOnce() -> String,
+    timeout: Duration,
+) {
     // Both directions: a client that stops reading mid-response would otherwise
     // block the write just as effectively as one that never sends a request.
-    stream.set_timeouts(CLIENT_TIMEOUT);
+    stream.set_timeouts(timeout);
+    let deadline = std::time::Instant::now() + timeout;
     let mut line = String::new();
     let peer = stream.try_clone_conn();
     // `.take(MAX_REQUEST_LINE)`: an unbounded `read_line` grows a `String`
@@ -900,8 +932,8 @@ fn handle<S: Conn>(mut stream: S, token: Option<&str>, body: impl FnOnce() -> St
     // loopback that is hundreds of megabytes of resident memory per connection
     // in the process whose whole job is to make memory pressure visible, and
     // `MAX_CONNECTIONS` of them at once.
-    let reader =
-        ReadRef(peer.as_ref().unwrap_or(&stream)).take(MAX_REQUEST_LINE * MAX_HEADERS as u64);
+    let reader = ReadRef { stream: peer.as_ref().unwrap_or(&stream), deadline }
+        .take(MAX_REQUEST_LINE * MAX_HEADERS as u64);
     let mut reader = BufReader::new(reader);
     if reader.read_line(&mut line).is_err() {
         return;
@@ -922,6 +954,7 @@ fn handle<S: Conn>(mut stream: S, token: Option<&str>, body: impl FnOnce() -> St
     // Only the value anybody needs is kept; the rest is read and dropped,
     // bounded by `MAX_HEADERS` and by the `take` above.
     let mut auth: Option<String> = None;
+    let mut complete = false;
     for _ in 0..MAX_HEADERS {
         let mut header = String::new();
         match reader.read_line(&mut header) {
@@ -929,7 +962,8 @@ fn handle<S: Conn>(mut stream: S, token: Option<&str>, body: impl FnOnce() -> St
             Ok(_) => {}
             Err(_) => return,
         }
-        if header.trim().is_empty() {
+        if header == "\r\n" || header == "\n" {
+            complete = true;
             break;
         }
         if token.is_some()
@@ -944,20 +978,30 @@ fn handle<S: Conn>(mut stream: S, token: Option<&str>, body: impl FnOnce() -> St
         _ if line.len() as u64 >= MAX_REQUEST_LINE && !line.ends_with('\n') => {
             http_response("431 Request Header Fields Too Large", "text/plain", "too long\n")
         }
+        _ if !complete => http_response("400 Bad Request", "text/plain", "incomplete headers\n"),
         Some((method, path)) => route(method, path, auth.as_deref(), token, body),
         None => http_response("400 Bad Request", "text/plain", "malformed request\n"),
     };
+    stream.set_timeouts(timeout);
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
 }
 
 /// `&S` as a reader, so the request can be read through a borrowed handle
 /// while the response is written through the owned one.
-struct ReadRef<'a, S>(&'a S);
+struct ReadRef<'a, S> {
+    stream: &'a S,
+    deadline: std::time::Instant,
+}
 
 impl<S: Conn> Read for ReadRef<'_, S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.read_shared(buf)
+        let remaining = self.deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "request deadline"));
+        }
+        self.stream.set_timeouts(remaining);
+        self.stream.read_shared(buf)
     }
 }
 
@@ -970,8 +1014,8 @@ fn reject<S: Conn>(mut stream: S) {
 /// Normalise an address to something bindable.
 ///
 /// `:9100` is the conventional spelling for "every interface" and keeps meaning
-/// that. A bare `9100` binds to loopback instead: process metrics name every
-/// running command and its arguments, and the lazy spelling should not be the
+/// that. A bare `9100` binds to loopback instead: process metrics expose names
+/// and PIDs, and the lazy spelling should not be the
 /// one that publishes them to the network by accident.
 pub fn normalise_addr(addr: &str) -> String {
     let addr = addr.trim();
@@ -1936,6 +1980,56 @@ mod tests {
     }
 
     #[test]
+    fn a_trickling_client_cannot_extend_the_request_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            handle_with_timeout(
+                server,
+                None,
+                || panic!("incomplete request was routed"),
+                Duration::from_millis(200),
+            );
+            done.send(()).unwrap();
+        });
+        let sender = std::thread::spawn(move || {
+            for _ in 0..40 {
+                if client.write_all(b"G").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        });
+        let result = finished.recv_timeout(Duration::from_millis(750));
+        sender.join().unwrap();
+        worker.join().unwrap();
+        assert!(result.is_ok(), "continuous input kept the connection alive");
+    }
+
+    #[test]
+    fn truncated_or_excessive_headers_never_run_the_scrape() {
+        for request in [
+            "GET /metrics HTTP/1.1\r\n".to_string(),
+            format!("GET /metrics HTTP/1.1\r\n{}", "X: y\r\n".repeat(MAX_HEADERS)),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (server, _) = listener.accept().unwrap();
+            let worker = std::thread::spawn(move || {
+                handle(server, None, || panic!("incomplete headers were accepted"));
+            });
+            client.write_all(request.as_bytes()).unwrap();
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut response = String::new();
+            client.read_to_string(&mut response).unwrap();
+            worker.join().unwrap();
+            assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        }
+    }
+
+    #[test]
     fn responses_carry_an_accurate_content_length() {
         let body = "hello\n";
         let response = http_response("200 OK", "text/plain", body);
@@ -1949,7 +2043,7 @@ mod tests {
         assert_eq!(normalise_addr(":9100"), "0.0.0.0:9100");
         assert_eq!(normalise_addr(" :9100 "), "0.0.0.0:9100");
         // ...but a bare port stays on loopback: per-process series carry
-        // command lines, and the shortest spelling should not publish them.
+        // process names and PIDs, and the shortest spelling should not publish them.
         assert_eq!(normalise_addr("9100"), "127.0.0.1:9100");
         assert_eq!(normalise_addr("127.0.0.1:9100"), "127.0.0.1:9100");
         assert_eq!(normalise_addr("0.0.0.0:9100"), "0.0.0.0:9100");
@@ -2049,5 +2143,24 @@ mod tests {
         for (i, name) in ["p49", "p48", "p47"].iter().enumerate() {
             assert!(exported[i].contains(&format!("name=\"{name}\"")), "{:?}", exported[i]);
         }
+    }
+}
+
+#[cfg(test)]
+mod freshness_tests {
+    use super::*;
+    #[test]
+    fn unknown_stale_and_recovered_hosts_have_distinct_metrics() {
+        let unknown = render_freshness(None, false);
+        assert!(unknown.contains("crabmon_sample_stale 1"));
+        assert!(!unknown.contains("sample_age_seconds"));
+        let stale = render_freshness(Some(12.5), false);
+        assert!(stale.contains("crabmon_sample_age_seconds 12.5"));
+        assert!(stale.contains("crabmon_sample_stale 1"));
+        let live = render_freshness(Some(0.25), true);
+        assert!(live.contains("crabmon_sample_stale 0"));
+        let fleet = merge_hosts(&[("one".into(), stale), ("two".into(), live)]);
+        assert!(fleet.contains("crabmon_sample_stale{host=\"one\"} 1"));
+        assert!(fleet.contains("crabmon_sample_stale{host=\"two\"} 0"));
     }
 }

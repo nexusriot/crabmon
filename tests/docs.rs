@@ -961,3 +961,68 @@ fn the_readme_snapshot_can_be_regenerated() {
     let readme = read("README.md");
     assert!(readme.contains("<!-- snapshot:begin -->") && readme.contains("<!-- snapshot:end -->"));
 }
+
+#[test]
+fn gitignore_covers_python_helpers_and_exports_in_relative_directories() {
+    for path in [
+        "scripts/__pycache__/e2e-ssh.cpython-312.pyc",
+        "scripts/__pycache__/embed-snapshot.cpython-312.pyc",
+        "scripts/e2e-ssh.pyc",
+        "scripts/e2e-ssh.pyo",
+    ] {
+        assert_ne!(
+            git_ignores(path),
+            Some(false),
+            "generated Python bytecode is not ignored: {path}"
+        );
+    }
+    for format in crabmon::export::ALL_EXPORT_FORMATS {
+        let path =
+            crabmon::export::export_path(std::path::Path::new("exports/nested"), 100, format);
+        assert_ne!(
+            git_ignores(&path.to_string_lossy()),
+            Some(false),
+            "configured export directory is not covered"
+        );
+    }
+    for path in ["scripts/e2e-ssh.py", "scripts/embed-snapshot.py", "tests/e2e_local.rs"] {
+        assert_ne!(git_ignores(path), Some(true), "source file is hidden: {path}");
+    }
+}
+
+#[test]
+fn documented_safety_settings_and_freshness_metrics_match_the_current_config() {
+    let readme = read("README.md");
+    let sample = readme
+        .split("```toml\n")
+        .skip(1)
+        .filter_map(|block| block.split("```").next())
+        .find(|block| block.contains("[export]") && block.contains("[record]"))
+        .expect("a complete sample config");
+    let cfg = crabmon::Config::parse_checked(sample).expect("README's config must parse");
+    let defaults = crabmon::Config::default();
+    assert_eq!(cfg.export.redact_commands, defaults.export.redact_commands);
+    assert_eq!(cfg.record.redact_commands, defaults.record.redact_commands);
+    assert_eq!(cfg.alerts[0].hysteresis, defaults.alerts[0].hysteresis);
+    // Check explicitly written settings; serde defaults alone could hide omissions.
+    for section in ["export", "record"] {
+        let table =
+            sample.split(&format!("[{section}]")).nth(1).unwrap().split("\n[").next().unwrap();
+        assert!(table.contains("redact_commands = true"), "{section} omits the redaction default");
+    }
+    assert!(sample.contains("hysteresis = 0.0"));
+    let metrics = crabmon::serve::render_freshness(Some(1.0), false);
+    for path in ["README.md", "docs/crabmon.1", "docs/DESIGN.md"] {
+        let doc = read(path);
+        for name in metrics
+            .lines()
+            .filter_map(|line| line.strip_prefix("# TYPE "))
+            .filter_map(|line| line.split_whitespace().next())
+        {
+            assert!(doc.contains(name), "{path} omits {name}");
+        }
+        for setting in ["redact_commands", "hysteresis"] {
+            assert!(doc.contains(setting), "{path} omits {setting}");
+        }
+    }
+}

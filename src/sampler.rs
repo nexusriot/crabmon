@@ -25,6 +25,7 @@ struct Update {
     error: Option<String>,
     /// What the inner source calls this frame, when it has an opinion.
     id: Option<u64>,
+    received: Instant,
 }
 
 pub struct ThreadedSource {
@@ -51,6 +52,7 @@ pub struct ThreadedSource {
     local: bool,
     /// The worker died; nothing more will ever arrive.
     finished: bool,
+    received: Instant,
 }
 
 impl ThreadedSource {
@@ -62,11 +64,14 @@ impl ThreadedSource {
         let error = inner.error();
         let inner_id = inner.frame_id();
         let local = inner.is_local();
+        let received = Instant::now();
         let (req_tx, req_rx) = mpsc::channel::<()>();
         let (upd_tx, upd_rx) = mpsc::channel::<Update>();
 
         std::thread::spawn(move || {
             let mut last = Instant::now();
+            let mut last_id = inner_id;
+            let mut received = received;
             // Ends when the source is dropped and `requests` closes.
             while req_rx.recv().is_ok() {
                 let dt = last.elapsed();
@@ -75,7 +80,11 @@ impl ThreadedSource {
                 let label = inner.label();
                 let error = inner.error();
                 let id = inner.frame_id();
-                if upd_tx.send(Update { snap, label, error, id }).is_err() {
+                if id.is_none() || id != last_id {
+                    received = Instant::now();
+                }
+                last_id = id;
+                if upd_tx.send(Update { snap, label, error, id, received }).is_err() {
                     return;
                 }
             }
@@ -92,6 +101,7 @@ impl ThreadedSource {
             inner_id,
             local,
             finished: false,
+            received,
         }
     }
 
@@ -105,6 +115,7 @@ impl ThreadedSource {
                     self.label = update.label;
                     self.error = update.error;
                     self.inner_id = update.id;
+                    self.received = update.received;
                     self.frames += 1;
                     self.pending = false;
                 }
@@ -116,6 +127,11 @@ impl ThreadedSource {
                 }
             }
         }
+    }
+
+    /// Worker arrival time of the current measurement, unchanged for cached frames.
+    pub fn received_at(&self) -> Instant {
+        self.received
     }
 
     pub fn is_sampling(&self) -> bool {

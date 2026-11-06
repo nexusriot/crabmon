@@ -39,6 +39,11 @@ impl RemoteFreshness {
         }
     }
 
+    /// Seconds since this process received the last new frame; absent before first contact.
+    pub fn sample_age(&self, now: Instant) -> Option<f64> {
+        self.received.map(|at| now.saturating_duration_since(at).as_secs_f64())
+    }
+
     /// (new measurement, currently available). Clock injection keeps outage
     /// and fast-scrape regressions deterministic.
     pub fn update(
@@ -49,13 +54,27 @@ impl RemoteFreshness {
         now: Instant,
         engine: Option<&mut AlertEngine>,
     ) -> (bool, bool) {
+        self.update_received(snap, id, reachable, now, now, engine)
+    }
+
+    /// Use the worker's arrival timestamp, so delayed scrapes cannot rejuvenate old data.
+    pub fn update_received(
+        &mut self,
+        snap: &Snapshot,
+        id: Option<u64>,
+        reachable: bool,
+        now: Instant,
+        received: Instant,
+        engine: Option<&mut AlertEngine>,
+    ) -> (bool, bool) {
         // Notice the gap *before* accepting a newly delivered frame, so a
         // reconnect cannot silently complete a pre-outage hold timer.
         let expired =
             self.received.is_some_and(|at| now.saturating_duration_since(at) >= self.timeout);
         let valid = reachable && snap.taken_at_unix != 0;
         let fresh = valid && (self.received.is_none() || id.is_none() || id != self.last_id);
-        if !valid || expired || self.interrupted {
+        let delayed = now.saturating_duration_since(received) >= self.timeout;
+        if !valid || expired || delayed || self.interrupted {
             if let Some(engine) = engine {
                 engine.interrupt();
             }
@@ -63,10 +82,10 @@ impl RemoteFreshness {
         }
         if fresh {
             self.last_id = id;
-            self.received = Some(now);
-            self.interrupted = false;
+            self.received = Some(received);
+            self.interrupted = delayed;
         }
-        (fresh, valid && !self.interrupted)
+        (fresh && !self.interrupted, valid && !self.interrupted)
     }
 }
 
@@ -388,6 +407,7 @@ mod tests {
 
     fn rule(name: &str, threshold: f64, for_secs: u64, command: &str) -> AlertRule {
         AlertRule {
+            hysteresis: 0.0,
             name: name.into(),
             kind: AlertKind::Cpu,
             threshold,
@@ -721,5 +741,37 @@ mod freshness_tests {
             engine.take_commands().iter().map(|c| c.command.as_str()).collect::<Vec<_>>(),
             vec!["page"]
         );
+    }
+}
+
+#[cfg(test)]
+mod age_tests {
+    use super::*;
+    #[test]
+    fn a_delayed_scrape_cannot_make_an_old_worker_delivery_fresh() {
+        let start = Instant::now();
+        let mut gate = RemoteFreshness::new(Duration::from_millis(200));
+        let snap = Snapshot { taken_at_unix: 100, ..Default::default() };
+        let now = start + Duration::from_secs(8);
+        assert_eq!(gate.update_received(&snap, Some(1), true, now, start, None), (false, false));
+        assert_eq!(gate.sample_age(now), Some(8.0));
+        assert_eq!(gate.update_received(&snap, Some(2), true, now, now, None), (true, true));
+        assert_eq!(gate.sample_age(now), Some(0.0));
+    }
+
+    #[test]
+    fn age_increases_on_repeated_frames_and_resets_only_on_arrival() {
+        let start = Instant::now();
+        let mut gate = RemoteFreshness::new(Duration::from_millis(200));
+        assert_eq!(gate.sample_age(start), None);
+        let snap = Snapshot { taken_at_unix: u64::MAX, ..Default::default() };
+        assert_eq!(gate.update(&snap, Some(1), true, start, None), (true, true));
+        let later = start + Duration::from_secs(6);
+        assert_eq!(gate.update(&snap, Some(1), true, later, None), (false, false));
+        assert_eq!(gate.sample_age(later), Some(6.0));
+        assert_eq!(gate.update(&snap, Some(2), true, later, None), (true, true));
+        assert_eq!(gate.sample_age(later), Some(0.0));
+        gate.update(&snap, Some(2), false, later + Duration::from_secs(1), None);
+        assert_eq!(gate.sample_age(later + Duration::from_secs(1)), Some(1.0));
     }
 }
