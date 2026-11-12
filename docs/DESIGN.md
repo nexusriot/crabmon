@@ -74,6 +74,10 @@ src/
     gpu.rs           /sys/class/drm and nvidia-smi
     cgroup.rs        cgroup v1/v2 limits
     psi.rs           /proc/pressure stall information
+    kstat.rs         CPU time by mode from /proc/stat, paging from /proc/vmstat
+    netstat.rs       TCP health from /proc/net/snmp, netstat and sockstat
+    containers.rs    container names from the runtimes' own files
+    storage.rs       md RAID, ZFS pool and btrfs device health
     power.rs         batteries, mains and RAPL
     smaps.rs         proportional and unique memory per process
     kmsg.rs          OOM kills, crashes and IO errors from /dev/kmsg
@@ -235,6 +239,63 @@ counters produces a gap rather than an absurd spike.
   main task; 0.33 onwards does not, and refreshing the list is opt-in
   (`ProcessRefreshKind::with_tasks`). A live cross-check against
   `/proc/<pid>/task` is what caught both.
+- **CPU modes** — `sysinfo` reports one busy figure per core, so the mode
+  breakdown reads the aggregate `cpu` line of `/proc/stat` itself. `guest` and
+  `guest_nice` are left out of the total because the kernel already counts
+  them inside `user` and `nice`. A counter that goes backwards yields no
+  reading rather than a huge one, and a failed read keeps the previous
+  counters, so one bad read costs one sample rather than producing a rate
+  since boot. `--remote` hosts report it only once their own crabmon is new
+  enough to send it, and `None` is never drawn or exported as zero.
+- **Paging** — `pswpin`/`pswpout` in `/proc/vmstat` count *pages*, which are
+  64 KiB on some arm64 and ppc64 kernels, so the byte rate multiplies by
+  `sysconf(_SC_PAGESIZE)` rather than by 4096. `oom_kill` exists from 4.13 and
+  is `None` before then. It is the one OOM signal an unprivileged crabmon
+  always has, since `/dev/kmsg` usually needs root.
+- **Cgroup throttling and OOM kills** — `cpu.stat` already carried
+  `nr_periods` and `nr_throttled` beside the `usage_usec` it was read for, so
+  throttling is the change in one over the change in the other; no period
+  elapsed (idle, or no quota) is `None`, not 0%. `memory.events` is
+  hierarchical, so a unit's `oom_kill` includes its children's. `oomkill`
+  rules count with `Series::increase` rather than `growth`, because a kill
+  in the first minute is an event, not a slope too short to trust, and a
+  recreated cgroup whose counter restarts has risen by nothing. Each group
+  costs four more small reads (`memory.events` and three `*.pressure`),
+  still bounded by `MAX_CGROUPS`.
+- **Container names** — read from runtime files first: Docker's
+  `config.v2.json`, containers/storage's `containers.json`, and the kubelet's
+  `/var/log/containers/<pod>_<ns>_<container>-<id>.log` links, split on the
+  *last* dash because pod names are full of them. `/var/lib/docker` is
+  root-only, so a `docker` group member — the usual case — gets names from
+  one `GET /containers/json` on the Engine API socket instead: HTTP/1.0 so
+  the body is never chunked, a 500 ms timeout because it runs on the
+  sampling thread, a 1 MiB cap on the response, and a socket that refuses
+  the connection is simply skipped. A directory walk happens
+  only when an id turns up that nothing names, at most every ten seconds, and
+  known ids are never re-read. The name is display and filter only; the id
+  stays the key, so a rename or a name reused by a new container cannot merge
+  two histories.
+- **TCP health** — `/proc/net/snmp` and `/proc/net/netstat` are read by
+  column *name*, since their column sets differ between kernels; `MaxConn`
+  is `-1` and is skipped rather than breaking the line. Retransmits are a
+  share of segments sent in the interval, `None` when nothing was sent.
+  CLOSE_WAIT is counted from `/proc/net/tcp{,6}` only while `sockstat` says
+  there are under `MAX_SOCKETS_SCANNED` sockets; above that it is `None`
+  rather than megabytes of reading per sample. All of it describes the
+  namespace crabmon runs in.
+- **Storage health** — `/proc/mdstat` is parsed per array: `[n/m] [U_]` and
+  `(F)` members say degraded, `recovery`/`reshape` say rebuilding (still no
+  redundancy), and `resync`/`check`/`repair` of a complete array are upkeep,
+  shown as progress and never as trouble — otherwise every monthly scrub
+  would page someone. ZFS pools are the directories under
+  `/proc/spl/kstat/zfs` that carry a `state` file; the rest is module-wide
+  statistics. btrfs `error_stats` (5.14+) is persistent across mounts, so a
+  non-zero count is history until reset with `btrfs device stats -z`; it is
+  reported as degraded because the disk that produced it is still there.
+- **Major faults** — the `/proc/<pid>/stat` read that already confirms a
+  process's identity also carries `majflt`, so the MAJFLT column costs no
+  syscall. Rates are keyed by PID *and* start time, and threads are skipped
+  because their counters are the process's.
 - **Disk IO** — `/proc/diskstats` is keyed by kernel device name, but a
   filesystem's device may be `/dev/mapper/root_crypt`. `diskstats::resolve_device_key`
   canonicalises the symlink (`→ /dev/dm-0`) and takes the basename, which is why

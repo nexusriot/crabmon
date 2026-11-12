@@ -58,12 +58,16 @@ const PSS: Col = col("pss", SortBy::Pss, "PSS", 7);
 /// automatic list because it is blank until a process has been watched long
 /// enough to have a history.
 const GROWTH: Col = col("growth", SortBy::Growth, "GROWTH", 8);
+/// Major page faults per second. Free — it comes out of a read the sampler
+/// makes anyway — but off the automatic list because it is blank on most
+/// machines most of the time; name it in `[procs] columns` or sort by it.
+const MAJFLT: Col = col("majflt", SortBy::MajFlt, "MAJFLT", 6);
 const NAME: Col = col("name", SortBy::Name, "COMMAND", 0);
 
 /// Every column `[procs] columns` can name.
-pub const ALL_COLUMNS: [Col; 17] = [
-    MARK, PID, USER, STATE, CPU, SPARK, MEM, PSS, GROWTH, VIRT, THR, NI, FD, DISK, TIME, PORTS,
-    NAME,
+pub const ALL_COLUMNS: [Col; 18] = [
+    MARK, PID, USER, STATE, CPU, SPARK, MEM, PSS, GROWTH, MAJFLT, VIRT, THR, NI, FD, DISK, TIME,
+    PORTS, NAME,
 ];
 
 pub fn column_by_name(name: &str) -> Option<Col> {
@@ -74,8 +78,10 @@ pub fn column_by_name(name: &str) -> Option<Col> {
 /// Columns in display order, widest-first priority for what gets dropped.
 const OPTIONAL: [Col; 8] = [STATE, USER, DISK, TIME, NI, SPARK, VIRT, THR];
 /// Canonical left-to-right order, whichever subset is chosen.
-const ORDER: [Col; 16] =
-    [MARK, PID, USER, STATE, CPU, SPARK, MEM, PSS, GROWTH, VIRT, THR, NI, FD, DISK, TIME, PORTS];
+const ORDER: [Col; 17] = [
+    MARK, PID, USER, STATE, CPU, SPARK, MEM, PSS, GROWTH, MAJFLT, VIRT, THR, NI, FD, DISK, TIME,
+    PORTS,
+];
 const MIN_NAME: u16 = 10;
 
 /// Choose the columns that fit in `width`, always keeping the marker, PID,
@@ -321,6 +327,11 @@ fn field_text(key: SortBy, p: &ProcRow, name: &str, name_width: usize) -> String
         // Drawn from the app's own history, which this does not have; the
         // draw loop fills it in, as it does for TREND and PORTS.
         SortBy::Growth => String::new(),
+        SortBy::MajFlt => match p.major_faults_ps {
+            None => "-".into(),
+            Some(v) if v < 0.5 => "·".into(),
+            Some(v) => format!("{v:>5.0}"),
+        },
         SortBy::Name => truncate_fit(name, name_width),
     }
 }
@@ -587,16 +598,48 @@ fn draw_groups(f: &mut Frame<'_>, area: Rect, inner: Rect, app: &mut App) {
     // actually limited. A machine with no quotas anywhere is not given a
     // column of dashes.
     let with_limit = groups.iter().any(|g| g.cgroup_mem_ratio.is_some());
-    let titles: &[&str] = match (with_net, with_limit) {
-        (true, true) => &["GROUP", "PROCS", "CPU%", "MEM", "DISK", "NET", "LIMIT"],
-        (true, false) => &["GROUP", "PROCS", "CPU%", "MEM", "DISK", "NET"],
-        (false, true) => &["GROUP", "PROCS", "CPU%", "MEM", "DISK", "LIMIT"],
-        (false, false) => &["GROUP", "PROCS", "CPU%", "MEM", "DISK"],
-    };
-    let header = Row::new(titles.to_vec())
-        .style(Style::default().add_modifier(Modifier::BOLD).fg(app.theme.title));
-    let reserved = 34 + if with_net { 9 } else { 0 } + if with_limit { 7 } else { 0 };
+    // THROTL is the share of quota periods the group ran out in — the latency
+    // that average CPU against a quota hides — and only where some group has
+    // a quota that elapsed periods. OOM is kills inside the group, and only
+    // where one has happened: a column of zeros is a column nobody reads.
+    let with_throttle = groups.iter().any(|g| g.cgroup_throttled.is_some());
+    let with_oom = groups.iter().any(|g| g.cgroup_oom_kills.is_some_and(|n| n > 0));
+
+    let mut titles = vec!["GROUP", "PROCS", "CPU%", "MEM", "DISK"];
+    let mut widths = vec![
+        Constraint::Min(8),
+        Constraint::Length(6),
+        Constraint::Length(6),
+        Constraint::Length(8),
+        Constraint::Length(8),
+    ];
+    let mut reserved = 34;
+    for (on, title, w) in [
+        (with_net, "NET", 9),
+        (with_limit, "LIMIT", 7),
+        (with_throttle, "THROTL", 7),
+        (with_oom, "OOM", 5),
+    ] {
+        if on {
+            titles.push(title);
+            widths.push(Constraint::Length(w));
+            reserved += w;
+        }
+    }
+    let header =
+        Row::new(titles).style(Style::default().add_modifier(Modifier::BOLD).fg(app.theme.title));
     let name_w = inner.width.saturating_sub(reserved) as usize;
+    let ratio_cell = |r: Option<f64>| match r {
+        None => Cell::from("     -".to_string()),
+        Some(r) => Cell::from(Span::styled(
+            format!("{:>5.0}%", r * 100.0),
+            Style::default().fg(app.theme.usage(
+                r,
+                app.cfg.thresholds.warn,
+                app.cfg.thresholds.crit,
+            )),
+        )),
+    };
 
     let start = app.group_scroll.min(groups.len());
     let end = (start + page.max(1)).min(groups.len());
@@ -607,7 +650,7 @@ fn draw_groups(f: &mut Frame<'_>, area: Rect, inner: Rect, app: &mut App) {
             app.cfg.thresholds.crit,
         );
         let mut cells = vec![
-            Cell::from(truncate_fit(&g.name, name_w.max(8))),
+            Cell::from(truncate_fit(g.display_name(), name_w.max(8))),
             Cell::from(format!("{:>5}", g.procs)),
             Cell::from(Span::styled(format!("{:>5.1}", g.cpu), Style::default().fg(color))),
             Cell::from(format!("{:>7}", compact_bytes(g.mem))),
@@ -629,33 +672,21 @@ fn draw_groups(f: &mut Frame<'_>, area: Rect, inner: Rect, app: &mut App) {
         if with_limit {
             // The group's memory against its own limit. `-` is a group with
             // no limit, which is not the same as one with room to spare.
-            cells.push(match g.cgroup_mem_ratio {
-                None => Cell::from("     -".to_string()),
-                Some(r) => Cell::from(Span::styled(
-                    format!("{:>5.0}%", r * 100.0),
-                    Style::default().fg(app.theme.usage(
-                        r,
-                        app.cfg.thresholds.warn,
-                        app.cfg.thresholds.crit,
-                    )),
-                )),
+            cells.push(ratio_cell(g.cgroup_mem_ratio));
+        }
+        if with_throttle {
+            cells.push(ratio_cell(g.cgroup_throttled));
+        }
+        if with_oom {
+            cells.push(match g.cgroup_oom_kills {
+                Some(n) if n > 0 => {
+                    Cell::from(Span::styled(format!("{n:>4}"), Style::default().fg(app.theme.crit)))
+                }
+                _ => Cell::from("   -".to_string()),
             });
         }
         Row::new(cells)
     });
-    let mut widths = vec![
-        Constraint::Min(8),
-        Constraint::Length(6),
-        Constraint::Length(6),
-        Constraint::Length(8),
-        Constraint::Length(8),
-    ];
-    if with_net {
-        widths.push(Constraint::Length(9));
-    }
-    if with_limit {
-        widths.push(Constraint::Length(7));
-    }
     let table = Table::new(rows, widths).header(header).row_highlight_style(app.theme.selection());
     let mut state = TableState::default();
     if !groups.is_empty() {

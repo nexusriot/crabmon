@@ -7,8 +7,8 @@ use crabmon::metrics::meminfo::MemDetail;
 use crabmon::metrics::power::{Battery, PowerSample};
 use crabmon::metrics::psi::{Pressure, PressureLine, PsiSample};
 use crabmon::metrics::{
-    CgroupInfo, CpuSample, DiskRow, GpuInfo, HostInfo, MemSample, MetricSource, NetIface, ProcRow,
-    Sensor, Snapshot,
+    CgroupInfo, CpuModes, CpuSample, DiskRow, GpuInfo, HostInfo, MemSample, MetricSource, NetIface,
+    ProcRow, Sensor, Snapshot, TcpHealth, VmActivity,
 };
 
 pub struct FakeSource {
@@ -56,6 +56,8 @@ pub fn proc_row(pid: u32, ppid: Option<u32>, name: &str, cpu: f32, mem: u64) -> 
         fd_limit: None,
         service: Some(format!("{name}.service")),
         container: None,
+        container_name: None,
+        major_faults_ps: None,
         netns: None,
         cmd: format!("/usr/bin/{name} --flag"),
         pss: None,
@@ -126,6 +128,8 @@ pub fn snapshot() -> Snapshot {
                 mac: "70:08:94:87:de:ef".into(),
                 errors_rx: 0,
                 errors_tx: 0,
+                drops_rx: 0,
+                drops_tx: 0,
                 virtual_iface: false,
             },
             NetIface {
@@ -137,6 +141,8 @@ pub fn snapshot() -> Snapshot {
                 mac: "00:00:00:00:00:00".into(),
                 errors_rx: 0,
                 errors_tx: 0,
+                drops_rx: 0,
+                drops_tx: 0,
                 virtual_iface: true,
             },
         ],
@@ -247,6 +253,35 @@ pub fn snapshot() -> Snapshot {
         // report. Tests that want an event push one in.
         kernel: Vec::new(),
         kernel_unreadable: None,
+        // Shares of the interval, summing to 100: a little steal, as a VPS has.
+        cpu_time: Some(CpuModes {
+            user: 30.0,
+            nice: 0.5,
+            system: 8.0,
+            idle: 55.0,
+            iowait: 2.5,
+            irq: 0.5,
+            softirq: 0.5,
+            steal: 3.0,
+        }),
+        vm: Some(VmActivity {
+            swap_in_bps: 524_288.0,
+            swap_out_bps: 0.0,
+            major_faults_ps: 42.0,
+            oom_kills: Some(1),
+        }),
+        tcp: Some(TcpHealth {
+            established: 87,
+            time_wait: Some(40),
+            orphans: Some(0),
+            close_wait: Some(3),
+            retrans_percent: Some(2.5),
+            resets_ps: 0.5,
+            attempt_fails_ps: 0.0,
+            listen_drops_ps: Some(4.0),
+            in_errs_ps: 0.0,
+        }),
+        storage: Vec::new(),
         taken_at_unix: 1_788_297_407,
     }
 }

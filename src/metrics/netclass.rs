@@ -14,6 +14,20 @@ pub fn is_virtual(name: &str, prefixes: &[String]) -> bool {
     prefixes.iter().any(|p| !p.is_empty() && name.starts_with(p.as_str()))
 }
 
+/// One counter out of `/sys/class/net/<iface>/statistics/`. `None` off
+/// Linux, or for an interface name that would escape the directory.
+pub fn sysfs_stat(iface: &str, counter: &str) -> Option<u64> {
+    if !cfg!(target_os = "linux") || iface.is_empty() || iface.contains('/') || iface.contains("..")
+    {
+        return None;
+    }
+    std::fs::read_to_string(format!("/sys/class/net/{iface}/statistics/{counter}"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 pub fn default_prefixes() -> Vec<String> {
     DEFAULT_VIRTUAL_PREFIXES.iter().map(|s| s.to_string()).collect()
 }

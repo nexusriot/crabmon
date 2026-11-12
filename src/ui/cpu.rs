@@ -32,10 +32,30 @@ pub fn bar(pct: f32, width: usize) -> String {
 
 fn title(app: &App) -> String {
     let avg = app.snap.cpu.avg();
-    match app.snap.cpu.max_freq() {
+    let mut t = match app.snap.cpu.max_freq() {
         Some(f) => format!(" CPU {avg:>5.1}%  {}  ", human_hz_mhz(f)),
         None => format!(" CPU {avg:>5.1}%  "),
+    };
+    if let Some(m) = &app.snap.cpu_time {
+        t.push_str(&modes_summary(m));
+        t.push(' ');
     }
+    t
+}
+
+/// `usr 3.1 sys 1.2 io 0.4 st 0.2`: where the busy time went.
+///
+/// User and system are always there, so the line has a stable shape. The rest
+/// appear only once they are worth reading — on bare metal steal is always
+/// zero, and a title full of `0.0`s buries the one that is not.
+pub fn modes_summary(m: &crate::metrics::CpuModes) -> String {
+    let mut parts = vec![format!("usr {:.1}", m.user + m.nice), format!("sys {:.1}", m.system)];
+    for (label, v) in [("io", m.iowait), ("irq", m.irq + m.softirq), ("st", m.steal)] {
+        if v >= 0.1 {
+            parts.push(format!("{label} {v:.1}"));
+        }
+    }
+    parts.join(" ")
 }
 
 /// Dashboard variant: average history chart with a one-line per-core strip.
@@ -249,6 +269,20 @@ mod tests {
         let text: String =
             core_legend(&empty).spans.iter().map(|s| s.content.to_string()).collect();
         assert_eq!(text, "0 cores");
+    }
+
+    #[test]
+    fn the_mode_summary_names_only_the_modes_worth_reading() {
+        let m = crate::metrics::CpuModes {
+            user: 2.0,
+            nice: 1.0,
+            system: 1.5,
+            iowait: 0.04,
+            steal: 7.25,
+            idle: 88.21,
+            ..Default::default()
+        };
+        assert_eq!(modes_summary(&m), "usr 3.0 sys 1.5 st 7.2");
     }
 
     #[test]

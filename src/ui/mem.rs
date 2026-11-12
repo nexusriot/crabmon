@@ -7,7 +7,7 @@ use ratatui::text::Span;
 use ratatui::widgets::{Gauge, Paragraph};
 
 use crate::app::App;
-use crate::format::human_bytes;
+use crate::format::{human_bps, human_bytes};
 use crate::ui::block;
 
 pub fn memory_label(used: u64, total: u64, available: u64, buff_cache: u64) -> String {
@@ -38,6 +38,30 @@ pub fn swap_label(used: u64, total: u64) -> String {
     format!("{pct:>5.1}%  {} / {}", human_bytes(used), human_bytes(total))
 }
 
+/// The swap gauge's label with the paging rate after it. Usage alone cannot
+/// tell 800 MB of pages untouched since boot from a machine thrashing, and
+/// the rate can: `in 0 B/s out 0 B/s` is the reassuring half of that.
+pub fn swap_label_with_activity(
+    used: u64,
+    total: u64,
+    vm: Option<&crate::metrics::VmActivity>,
+) -> String {
+    let mut label = swap_label(used, total);
+    if let Some(vm) = vm {
+        if total > 0 {
+            label.push_str(&format!(
+                "  in {} out {}",
+                human_bps(vm.swap_in_bps),
+                human_bps(vm.swap_out_bps)
+            ));
+        }
+        if vm.major_faults_ps >= 1.0 {
+            label.push_str(&format!("  {:.0} majflt/s", vm.major_faults_ps));
+        }
+    }
+    label
+}
+
 fn gauge<'a>(app: &App, ratio: f64, label: String) -> Gauge<'a> {
     Gauge::default()
         .gauge_style(Style::default().fg(app.theme.usage(
@@ -63,7 +87,8 @@ pub fn draw_swap(f: &mut Frame<'_>, area: Rect, app: &App) {
     let b = block(app, " Swap ");
     let inner = b.inner(area);
     f.render_widget(b, area);
-    f.render_widget(gauge(app, m.swap_ratio(), swap_label(m.swap_used, m.swap_total)), inner);
+    let label = swap_label_with_activity(m.swap_used, m.swap_total, app.snap.vm.as_ref());
+    f.render_widget(gauge(app, m.swap_ratio(), label), inner);
 }
 
 /// Shown only when the process is actually confined by a cgroup, where the
@@ -123,6 +148,23 @@ mod tests {
     fn a_machine_with_no_swap_says_so() {
         assert_eq!(swap_label(0, 0), "no swap");
         assert_eq!(memory_label(0, 0, 0, 0), "Mem  (unknown)");
+    }
+
+    #[test]
+    fn swap_activity_follows_usage_and_major_faults_only_when_there_are_some() {
+        let vm = crate::metrics::VmActivity {
+            swap_in_bps: 2.0 * 1024.0 * 1024.0,
+            major_faults_ps: 0.4,
+            ..Default::default()
+        };
+        let l = swap_label_with_activity(1 << 30, 4 << 30, Some(&vm));
+        assert!(l.contains("in 2.0 MiB/s"), "{l}");
+        assert!(l.contains("out 0 B/s"), "{l}");
+        assert!(!l.contains("majflt"), "{l}");
+        // No swap: no swap rates, but faults from file-backed pages still count.
+        let busy = crate::metrics::VmActivity { major_faults_ps: 120.0, ..Default::default() };
+        assert_eq!(swap_label_with_activity(0, 0, Some(&busy)), "no swap  120 majflt/s");
+        assert_eq!(swap_label_with_activity(0, 0, None), "no swap");
     }
 
     #[test]

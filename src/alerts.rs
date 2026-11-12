@@ -62,12 +62,52 @@ pub enum AlertKind {
     /// leaves no level behind to measure. Memory is back to normal by the
     /// time anyone looks, which is exactly why the kill went unexplained.
     Kernel,
+    /// Share of CPU time spent in one mode, in percent. `target` names it —
+    /// `user`, `system`, `iowait`, `steal`, `irq`, `softirq`, `nice`, `idle`
+    /// — and an empty target is everything but idle.
+    ///
+    /// `cpu` cannot ask what this asks: a VPS losing 30% of its time to the
+    /// hypervisor reads as a quiet machine there, and so does one whose
+    /// processes are all waiting on a disk.
+    Cputime,
+    /// Paging, from `/proc/vmstat`. `target` is `swapin`, `swapout` or
+    /// `swap` (both; the default), in bytes per second, or `majfault`, in
+    /// faults per second.
+    ///
+    /// The rate, not the level: `swap` fires on a machine holding pages it
+    /// will never touch again, and this fires on one that is thrashing.
+    Vm,
+    /// Share of CPU-quota periods a container or unit spent throttled over
+    /// the last interval, in percent. `target` names one by id, unit or
+    /// container name; empty means whichever is throttled most.
+    ///
+    /// Average CPU against a quota cannot see this: the quota is enforced per
+    /// 100 ms period, so a service at 40% of its quota on average can still
+    /// be stalled in a third of its periods, and every stall is latency.
+    Throttle,
+    /// OOM kills within the rule's window (`over_secs`, default 300). An
+    /// empty `target` counts the whole machine, from the kernel's own
+    /// counter, which needs no root where `kernel` rules need `/dev/kmsg`;
+    /// a container or unit name counts kills inside that cgroup only — the
+    /// container killed at its own limit on a host with memory to spare.
+    OomKill,
+    /// TCP health. `target` names the figure: `retrans` (percent of
+    /// segments sent; the default), `listendrops`, `resets` or `failed` (per
+    /// second), or `closewait`, `timewait` or `estab` (counts).
+    Tcp,
+    /// How many md arrays, ZFS pools or btrfs filesystems are degraded,
+    /// rebuilding or failed. `target` names one; empty counts them all.
+    ///
+    /// A mirror that has lost a disk keeps serving everything, so no other
+    /// rule can see it — and the time until the second disk fails is the
+    /// only time anybody can act in.
+    Storage,
 }
 
 /// Every kind a rule can be, so the docs can be checked against the code
 /// rather than against a hand-maintained list — the same reason `ALL_SORTS`
 /// and `ALL_GROUPINGS` exist.
-pub const ALL_ALERT_KINDS: [AlertKind; 16] = [
+pub const ALL_ALERT_KINDS: [AlertKind; 22] = [
     AlertKind::Cpu,
     AlertKind::Mem,
     AlertKind::Swap,
@@ -84,6 +124,12 @@ pub const ALL_ALERT_KINDS: [AlertKind; 16] = [
     AlertKind::FillIn,
     AlertKind::Cgroup,
     AlertKind::Kernel,
+    AlertKind::Cputime,
+    AlertKind::Vm,
+    AlertKind::Throttle,
+    AlertKind::OomKill,
+    AlertKind::Tcp,
+    AlertKind::Storage,
 ];
 
 impl AlertKind {
@@ -106,6 +152,12 @@ impl AlertKind {
             AlertKind::FillIn => "fillin",
             AlertKind::Cgroup => "cgroup",
             AlertKind::Kernel => "kernel",
+            AlertKind::Cputime => "cputime",
+            AlertKind::Vm => "vm",
+            AlertKind::Throttle => "throttle",
+            AlertKind::OomKill => "oomkill",
+            AlertKind::Tcp => "tcp",
+            AlertKind::Storage => "storage",
         }
     }
 }
@@ -114,8 +166,10 @@ impl AlertKind {
 pub struct AlertRule {
     pub name: String,
     pub kind: AlertKind,
-    /// Percent for cpu/mem/swap/disk/gpu/psi/io/fd, degrees for temp, bytes
-    /// per second for net, a count for proc, absolute for load.
+    /// Percent for cpu/cputime/mem/swap/disk/gpu/psi/io/fd/throttle, degrees
+    /// for temp, bytes per second for net and vm (faults per second for
+    /// `vm:majfault`), a count for proc, kernel, oomkill and storage, the target's own
+    /// unit for tcp, absolute for load.
     pub threshold: f64,
     /// Recovery margin in the measurement's unit; zero preserves the firing boundary.
     #[serde(default)]
@@ -510,6 +564,7 @@ impl AlertEngine {
         // and are only kept when a rule asks for them.
         let window = windowed(AlertKind::Trend)
             .chain(windowed(AlertKind::FillIn))
+            .chain(windowed(AlertKind::OomKill))
             .max()
             .unwrap_or(DEFAULT_TREND_WINDOW);
         // Only the axes some rule actually names: keeping all three for every
@@ -682,6 +737,9 @@ pub struct TrendTracker {
     /// Bytes used per mount point, which is what turns "95% full" into "full
     /// in three hours".
     disks: HashMap<String, Series>,
+    /// Each cgroup's lifetime OOM-kill counter, by id or unit, so a rule can
+    /// count the kills inside its window.
+    ooms: HashMap<String, Series>,
     /// The per-process axes being kept, so a change of rules can drop the
     /// series nothing asks for any more.
     axes: ProcAxes,
@@ -902,6 +960,23 @@ impl Series {
     /// `None` until the series actually spans half the window: a rule that
     /// fired on two samples taken a second apart would be reporting noise as
     /// a trend.
+    /// How much a counter rose across what the series holds — at most the
+    /// window. Unlike `growth`, this needs no minimum span: an OOM kill in
+    /// the first minute is a kill, not a slope too short to trust. A counter
+    /// that went backwards (a recreated cgroup) has risen by nothing.
+    fn increase(&self, window: u64) -> Option<u64> {
+        let (last_at, last) = self.latest?;
+        // The oldest point still inside this rule's window: the series is
+        // kept for the longest window any rule asks for, and a shorter one
+        // must not count kills from before it.
+        let base = self
+            .points
+            .iter()
+            .find(|(at, _)| last_at.saturating_sub(*at) <= window)
+            .map_or(last, |(_, v)| *v);
+        Some(last.saturating_sub(base))
+    }
+
     fn growth(&self, window: u64) -> Option<(i64, u64)> {
         let (last_at, last) = self.latest?;
         let (first_at, first) = *self.points.front()?;
@@ -934,6 +1009,16 @@ impl TrendTracker {
         }
         self.disks.retain(|mount, _| snap.disks.iter().any(|d| &d.mount == mount));
 
+        if let Some(n) = snap.vm.and_then(|v| v.oom_kills) {
+            self.machine.entry("oom").or_default().push(at, n, window);
+        }
+        for c in &snap.cgroups {
+            if let Some(n) = c.oom_kills {
+                self.ooms.entry(c.name.clone()).or_default().push(at, n, window);
+            }
+        }
+        self.ooms.retain(|name, _| snap.cgroups.iter().any(|c| &c.name == name));
+
         // A series whose axis has stopped being asked for would otherwise go
         // on being read with points that stopped arriving — a slope frozen at
         // whatever it last was.
@@ -965,6 +1050,16 @@ impl TrendTracker {
     }
 
     /// Growth of a machine-wide series over its window.
+    /// OOM kills on the whole machine within the window.
+    pub fn machine_oom_kills(&self, window: u64) -> Option<u64> {
+        self.machine.get("oom")?.increase(window)
+    }
+
+    /// OOM kills inside one cgroup (by id or unit) within the window.
+    pub fn cgroup_oom_kills(&self, name: &str, window: u64) -> Option<u64> {
+        self.ooms.get(name)?.increase(window)
+    }
+
     pub fn machine_growth(&self, name: &str, window: u64) -> Option<(i64, u64)> {
         self.machine.get(name)?.growth(window)
     }
@@ -1078,6 +1173,38 @@ fn measure(
                 .map(|b| (b, "%"));
         }
         AlertKind::Psi => return psi_value(&rule.target, snap).map(|v| (v, "%")),
+        // `None` where `/proc/stat` and `/proc/vmstat` were not read, which
+        // leaves the rule quiet rather than reporting "no steal" about a host
+        // nobody measured.
+        AlertKind::Cputime => return snap.cpu_time?.get(&rule.target).map(|v| (v, "%")),
+        AlertKind::Vm => return snap.vm?.get(&rule.target),
+        AlertKind::Tcp => return snap.tcp?.get(&rule.target),
+        AlertKind::Storage => {
+            let n = crate::metrics::storage::unhealthy_count(&snap.storage, rule.target.trim());
+            return Some((n as f64, ""));
+        }
+        AlertKind::Throttle => {
+            return match rule.target.trim() {
+                "" => snap
+                    .cgroups
+                    .iter()
+                    .filter_map(|c| c.throttled_ratio)
+                    .fold(None, |acc, r| Some(acc.map_or(r, |a: f64| a.max(r)))),
+                name => snap.cgroup_named(name).and_then(|c| c.throttled_ratio),
+            }
+            .map(|r| (r * 100.0, "%"));
+        }
+        // A count over the window, like `kernel`, so a kill keeps the rule
+        // firing for the window rather than for the one sample it landed in.
+        AlertKind::OomKill => {
+            let trends = trends?;
+            let window = rule.window();
+            let n = match rule.target.trim() {
+                "" => trends.machine_oom_kills(window),
+                name => trends.cgroup_oom_kills(&snap.cgroup_named(name)?.name, window),
+            }?;
+            return Some((n as f64, ""));
+        }
         // A slope over the rule's own window, in whichever unit the series it
         // names is quoted in. `None` until the series actually spans that
         // window: a rule that fired on two samples a second apart would be
@@ -1811,6 +1938,7 @@ mod tests {
     fn commands_of(e: &mut AlertEngine) -> Vec<String> {
         e.take_commands().into_iter().map(|c| c.command).collect()
     }
+    use crate::metrics::cgroup::CgroupStat;
     use crate::metrics::{CpuSample, DiskRow, MemSample, ProcRow, Sensor};
 
     fn rule(name: &str, kind: AlertKind, threshold: f64, for_secs: u64) -> AlertRule {
@@ -2140,6 +2268,180 @@ mod tests {
         // than falling back to `some`, which measures something else.
         assert!(!fires("cpu.full", 0.0));
         assert!(!fires("nonsense", 0.0));
+    }
+
+    #[test]
+    fn a_cputime_rule_sees_steal_that_the_busy_percentage_hides() {
+        use crate::metrics::CpuModes;
+        // 8% busy by the gauge, and a third of the machine handed elsewhere.
+        let snap = Snapshot {
+            cpu: CpuSample { per_core: vec![8.0], freq_mhz: vec![] },
+            cpu_time: Some(CpuModes {
+                user: 6.0,
+                system: 2.0,
+                steal: 33.0,
+                iowait: 4.0,
+                idle: 55.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let fires = |target: &str, threshold: f64| {
+            let mut r = rule("st", AlertKind::Cputime, threshold, 0);
+            r.target = target.into();
+            !AlertEngine::new(vec![r]).evaluate(&snap, 0).is_empty()
+        };
+        assert!(fires("steal", 20.0));
+        assert!(!fires("iowait", 20.0));
+        assert!(fires("", 40.0), "untargeted is everything but idle: 45%");
+        assert!(
+            AlertEngine::new(vec![rule("c", AlertKind::Cpu, 20.0, 0)])
+                .evaluate(&snap, 0)
+                .is_empty(),
+            "the busy gauge reads 8% and sees none of it"
+        );
+        // Not measured is not zero: a `below` rule must not fire on it.
+        let mut below = rule("st", AlertKind::Cputime, 50.0, 0);
+        below.target = "idle".into();
+        below.below = true;
+        assert!(AlertEngine::new(vec![below]).evaluate(&Snapshot::default(), 0).is_empty());
+    }
+
+    #[test]
+    fn a_throttle_rule_finds_a_container_by_name_or_takes_the_worst() {
+        let snap = Snapshot {
+            cgroups: vec![
+                CgroupStat {
+                    name: "3f9a1c2b4d5e".into(),
+                    container: true,
+                    container_name: Some("api".into()),
+                    throttled_ratio: Some(0.35),
+                    ..Default::default()
+                },
+                CgroupStat {
+                    name: "db.service".into(),
+                    throttled_ratio: Some(0.02),
+                    ..Default::default()
+                },
+                // No quota: no ratio, which must not read as "never throttled"
+                // and pull a `below` rule into firing.
+                CgroupStat { name: "cron.service".into(), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let fires = |target: &str, threshold: f64, below: bool| {
+            let mut r = rule("t", AlertKind::Throttle, threshold, 0);
+            r.target = target.into();
+            r.below = below;
+            !AlertEngine::new(vec![r]).evaluate(&snap, 0).is_empty()
+        };
+        assert!(fires("", 25.0, false), "the worst group is 35%");
+        assert!(fires("api", 25.0, false), "by container name");
+        assert!(fires("3f9a1c2b4d5e", 25.0, false), "by id");
+        assert!(!fires("db.service", 25.0, false));
+        assert!(!fires("cron.service", 1.0, true));
+    }
+
+    #[test]
+    fn an_oomkill_rule_counts_kills_in_its_window_and_then_clears() {
+        let at = |t: u64, host: u64, api: u64| Snapshot {
+            taken_at_unix: 1_000 + t,
+            vm: Some(crate::metrics::VmActivity { oom_kills: Some(host), ..Default::default() }),
+            cgroups: vec![CgroupStat {
+                name: "3f9a1c2b4d5e".into(),
+                container: true,
+                container_name: Some("api".into()),
+                oom_kills: Some(api),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut host = rule("host-oom", AlertKind::OomKill, 1.0, 0);
+        host.over_secs = 60;
+        let mut api = rule("api-oom", AlertKind::OomKill, 1.0, 0);
+        api.target = "api".into();
+        api.over_secs = 60;
+        let mut e = AlertEngine::new(vec![host, api]);
+        // Kills from before crabmon started are history, not an alert.
+        assert!(e.evaluate(&at(0, 14, 2), 0).is_empty());
+        assert!(e.evaluate(&at(10, 14, 2), 10).is_empty());
+        // One kill inside the container, which the host counter also sees.
+        let firing = e.evaluate(&at(20, 15, 3), 20);
+        assert_eq!(firing.len(), 2, "{firing:?}");
+        // Still inside the window.
+        assert_eq!(e.evaluate(&at(50, 15, 3), 50).len(), 2);
+        // Past it: cleared.
+        assert!(e.evaluate(&at(100, 15, 3), 100).is_empty());
+    }
+
+    #[test]
+    fn a_tcp_rule_reads_the_figure_its_target_names() {
+        let snap = Snapshot {
+            tcp: Some(crate::metrics::TcpHealth {
+                retrans_percent: Some(4.0),
+                listen_drops_ps: Some(12.0),
+                close_wait: Some(900),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let fires = |target: &str, threshold: f64| {
+            let mut r = rule("tcp", AlertKind::Tcp, threshold, 0);
+            r.target = target.into();
+            !AlertEngine::new(vec![r]).evaluate(&snap, 0).is_empty()
+        };
+        assert!(fires("", 2.0), "untargeted is retransmits");
+        assert!(fires("listendrops", 1.0));
+        assert!(fires("closewait", 500.0));
+        assert!(!fires("resets", 1.0));
+        assert!(
+            AlertEngine::new(vec![rule("t", AlertKind::Tcp, 0.0, 0)])
+                .evaluate(&Snapshot::default(), 0)
+                .is_empty(),
+            "not measured is not zero"
+        );
+    }
+
+    #[test]
+    fn a_storage_rule_fires_on_a_lost_mirror_and_not_on_a_routine_check() {
+        use crate::metrics::storage::parse_mdstat;
+        let degraded = Snapshot {
+            storage: parse_mdstat("md0 : active raid1 sda1[0]\n      1000 blocks [2/1] [U_]\n"),
+            ..Default::default()
+        };
+        let checking = Snapshot {
+            storage: parse_mdstat(
+                "md0 : active raid1 sdb1[1] sda1[0]\n      1000 blocks [2/2] [UU]\n      [==>...]  check = 5.0% (1/2) finish=1min\n",
+            ),
+            ..Default::default()
+        };
+        let fires = |snap: &Snapshot, target: &str| {
+            let mut r = rule("raid", AlertKind::Storage, 1.0, 0);
+            r.target = target.into();
+            !AlertEngine::new(vec![r]).evaluate(snap, 0).is_empty()
+        };
+        assert!(fires(&degraded, ""));
+        assert!(fires(&degraded, "md0"));
+        assert!(!fires(&degraded, "md1"));
+        assert!(!fires(&checking, ""), "a scrub of a whole array is upkeep");
+    }
+
+    #[test]
+    fn a_vm_rule_fires_on_swap_traffic_not_swap_held() {
+        use crate::metrics::VmActivity;
+        let mut snap = Snapshot {
+            mem: MemSample { swap_total: 1 << 30, swap_used: 900 << 20, ..Default::default() },
+            vm: Some(VmActivity::default()),
+            ..Default::default()
+        };
+        let mut r = rule("thrash", AlertKind::Vm, (1 << 20) as f64, 0);
+        r.target = "swapin".into();
+        assert!(AlertEngine::new(vec![r.clone()]).evaluate(&snap, 0).is_empty());
+        snap.vm = Some(VmActivity { swap_in_bps: (8 << 20) as f64, ..Default::default() });
+        assert!(!AlertEngine::new(vec![r]).evaluate(&snap, 0).is_empty());
+        let mut f = rule("faults", AlertKind::Vm, 100.0, 0);
+        f.target = "majfault".into();
+        assert!(AlertEngine::new(vec![f]).evaluate(&snap, 0).is_empty());
     }
 
     #[test]

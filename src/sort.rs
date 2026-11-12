@@ -28,9 +28,11 @@ pub enum SortBy {
     /// Resident-memory growth over the trend window. Always `-` unless a
     /// `trend` rule is keeping per-process series.
     Growth,
+    /// Major page faults per second.
+    MajFlt,
 }
 
-pub const ALL_SORTS: [SortBy; 14] = [
+pub const ALL_SORTS: [SortBy; 15] = [
     SortBy::Pid,
     SortBy::Name,
     SortBy::Cpu,
@@ -45,6 +47,7 @@ pub const ALL_SORTS: [SortBy; 14] = [
     SortBy::Fds,
     SortBy::Pss,
     SortBy::Growth,
+    SortBy::MajFlt,
 ];
 
 impl SortBy {
@@ -64,6 +67,7 @@ impl SortBy {
             SortBy::Fds => "FD",
             SortBy::Pss => "PSS",
             SortBy::Growth => "GROWTH",
+            SortBy::MajFlt => "MAJFLT",
         }
     }
 
@@ -91,6 +95,7 @@ impl SortBy {
             SortBy::Fds => "fds",
             SortBy::Pss => "pss",
             SortBy::Growth => "growth",
+            SortBy::MajFlt => "majflt",
         }
     }
 
@@ -129,6 +134,11 @@ pub fn compare(a: &ProcRow, b: &ProcRow, key: SortBy, desc: bool) -> Ordering {
         // the memory the row does carry. `App::rebuild_view` sorts by the
         // real figure before this is ever reached.
         SortBy::Growth => a.mem_share().cmp(&b.mem_share()),
+        SortBy::MajFlt => a
+            .major_faults_ps
+            .unwrap_or(-1.0)
+            .partial_cmp(&b.major_faults_ps.unwrap_or(-1.0))
+            .unwrap_or(Ordering::Equal),
     };
     let primary = if desc { primary.reverse() } else { primary };
     primary.then_with(|| a.pid.cmp(&b.pid))

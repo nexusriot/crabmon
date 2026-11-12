@@ -179,7 +179,7 @@ fn a_process_that_execs_is_reported_as_what_it_became() {
         snap.procs.iter().find(|p| p.pid == pid).map(|p| (p.name.clone(), p.cmd.clone()))
     };
 
-    let mut source = SysinfoSource::new(Vec::new(), false);
+    let mut source = SysinfoSource::new(Vec::new(), false).unwrap();
     // The first sample must see the wrapper, or the test proves nothing: it
     // would pass just as well on a sampler that never caches anything.
     let first = source.snapshot(Duration::ZERO);
@@ -220,7 +220,7 @@ fn app_for_child(child: &Sacrifice) -> crabmon::App {
             self.0.clone()
         }
     }
-    let mut source = SysinfoSource::new(Vec::new(), false);
+    let mut source = SysinfoSource::new(Vec::new(), false).unwrap();
     let mut snap = source.snapshot(Duration::ZERO);
     snap.procs.retain(|p| p.pid == child.pid());
     assert_eq!(snap.procs.len(), 1);

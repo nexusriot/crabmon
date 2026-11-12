@@ -13,8 +13,8 @@ use super::fds::LimitCache;
 use super::procgroup::CgroupPaths;
 use super::{
     CpuSample, DiskRow, GpuInfo, HostInfo, MemSample, MetricSource, NetIface, ProcRow, Sensor,
-    Snapshot, cgroup, fds, gpu, identity, kmsg, meminfo, netclass, netns, power, procgroup, psi,
-    rate, smaps,
+    Snapshot, cgroup, containers, fds, gpu, identity, kmsg, kstat, meminfo, netclass, netns,
+    netstat, power, procgroup, psi, rate, smaps, storage,
 };
 
 /// Device lists (mounted filesystems, interfaces, sensors) are rescanned on this
@@ -28,10 +28,11 @@ pub const MIN_REFRESH: Duration = Duration::from_millis(200);
 
 pub struct SysinfoSource {
     sys: System,
-    networks: Networks,
-    disks: Disks,
-    components: Components,
-    users: Users,
+    /// `None` where the platform cannot list them; everything else still works.
+    networks: Option<Networks>,
+    disks: Option<Disks>,
+    components: Option<Components>,
+    users: Option<Users>,
     last_relist: Instant,
 
     prev_net: BTreeMap<String, (u64, u64)>,
@@ -62,13 +63,19 @@ pub struct SysinfoSource {
     /// reported as another container's.
     host_netns: Option<u64>,
     prev_rapl_uj: Option<u64>,
+    /// `/proc/stat` and `/proc/vmstat`, kept for the next sample's deltas.
+    kstat: kstat::KstatReader,
+    /// `/proc/net/snmp` and friends, kept for the next sample's deltas.
+    tcp: netstat::TcpReader,
     /// Follows `/dev/kmsg`. Opened once and drained per sample: the device
     /// replays the whole ring on open, which is what makes an OOM kill from
     /// twenty minutes ago visible the moment crabmon starts.
     kmsg: kmsg::KmsgReader,
     /// Last `usage_usec` per cgroup, so its CPU reads as a rate rather than
     /// as a total since the container started.
-    prev_cgroup_usage: HashMap<String, u64>,
+    prev_cgroup_usage: HashMap<String, cgroup::CgroupCounters>,
+    /// Container id → name, from the runtimes' own files.
+    container_names: containers::ContainerNames,
 
     virtual_prefixes: Vec<String>,
     use_nvidia_smi: bool,
@@ -80,6 +87,9 @@ pub struct SysinfoSource {
     read_pss: bool,
     host: HostInfo,
     sample_ticks: HashMap<u32, u64>,
+    /// Each process's major-fault counter at the last sample, with the start
+    /// time it belonged to, so a recycled PID starts a fresh rate.
+    prev_majflt: HashMap<u32, (u64, u64)>,
 }
 
 fn process_refresh_kind() -> ProcessRefreshKind {
@@ -103,7 +113,7 @@ fn process_refresh_kind() -> ProcessRefreshKind {
 
 fn refresh_kind() -> RefreshKind {
     RefreshKind::nothing()
-        .with_cpu(CpuRefreshKind::nothing().with_cpu_usage().with_frequency())
+        .with_cpu(CpuRefreshKind::nothing().with_usage().with_frequency())
         .with_memory(MemoryRefreshKind::nothing().with_ram().with_swap())
         .with_processes(process_refresh_kind())
 }
@@ -160,18 +170,28 @@ fn now_unix() -> u64 {
 }
 
 impl SysinfoSource {
-    pub fn new(virtual_prefixes: Vec<String>, use_nvidia_smi: bool) -> Self {
-        let mut sys = System::new_with_specifics(refresh_kind());
+    /// Fails only where sysinfo cannot read this platform at all, which since
+    /// 0.40 it reports as an error rather than a `System` full of zeros.
+    pub fn new(virtual_prefixes: Vec<String>, use_nvidia_smi: bool) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        let unsupported = "this platform cannot be monitored";
+        let mut sys = System::new_with_specifics(refresh_kind()).context(unsupported)?;
         sys.refresh_specifics(refresh_kind());
 
-        let networks = Networks::new_with_refreshed_list();
-        let disks = Disks::new_with_refreshed_list();
-        let components = Components::new_with_refreshed_list();
-        let users = Users::new_with_refreshed_list();
+        // The device lists are optional extras: a platform without networks
+        // or sensors (sysinfo marks iOS networks unsupported, for one) still
+        // has a process table worth showing.
+        let networks = Networks::new_with_refreshed_list().ok();
+        let disks = Disks::new_with_refreshed_list().ok();
+        let components = Components::new_with_refreshed_list().ok();
+        let users = Users::new_with_refreshed_list().ok();
 
         let prev_net = networks
             .iter()
-            .map(|(n, d)| (n.to_string(), (d.total_received(), d.total_transmitted())))
+            .flat_map(|n| n.iter())
+            .map(|(n, d)| {
+                (n.to_string_lossy().to_string(), (d.total_received(), d.total_transmitted()))
+            })
             .collect();
         let prev_proc_io = sys
             .processes()
@@ -183,19 +203,19 @@ impl SysinfoSource {
             .collect();
 
         let host = HostInfo {
-            hostname: System::host_name().unwrap_or_else(|| "unknown".into()),
-            os: System::long_os_version().unwrap_or_else(|| System::name().unwrap_or_default()),
+            hostname: System::host_name().unwrap_or_else(|_| "unknown".into()),
+            os: System::long_os_version().or_else(|_| System::name()).unwrap_or_default(),
             kernel: System::kernel_version().unwrap_or_default(),
             arch: System::cpu_arch(),
             cpu_brand: sys.cpus().first().map(|c| c.brand().trim().to_string()).unwrap_or_default(),
             logical_cores: sys.cpus().len(),
-            physical_cores: System::physical_core_count(),
-            uptime_secs: System::uptime(),
-            boot_time_unix: System::boot_time(),
+            physical_cores: System::physical_core_count().ok(),
+            uptime_secs: System::uptime().unwrap_or(0),
+            boot_time_unix: System::boot_time().unwrap_or(0),
             load: [0.0; 3],
         };
 
-        Self {
+        Ok(Self {
             sys,
             networks,
             disks,
@@ -214,15 +234,19 @@ impl SysinfoSource {
             netns: netns::NetnsRates::default(),
             host_netns: netns::id_of(std::process::id()),
             prev_rapl_uj: None,
+            kstat: kstat::KstatReader::new(),
+            tcp: netstat::TcpReader::new(),
             kmsg: kmsg::KmsgReader::open(),
             prev_cgroup_usage: HashMap::new(),
+            container_names: containers::ContainerNames::default(),
             virtual_prefixes,
             use_nvidia_smi,
             count_fds: false,
             read_pss: false,
             host,
             sample_ticks: HashMap::new(),
-        }
+            prev_majflt: HashMap::new(),
+        })
     }
 
     /// Ask for the FD column's data. A builder rather than a constructor
@@ -247,10 +271,10 @@ impl SysinfoSource {
         }
         self.last_relist = Instant::now();
         // Picks up hot-plugged disks, new veth/tun interfaces and new sensors.
-        self.networks.refresh(true);
-        self.disks.refresh(true);
-        self.components.refresh(true);
-        self.users.refresh();
+        self.refresh_lists(true);
+        if let Some(u) = &mut self.users {
+            u.refresh();
+        }
         self.dev_key_cache.clear();
         // Picks up nice values changed by anything other than crabmon.
         self.nice_cache.clear();
@@ -283,7 +307,7 @@ impl SysinfoSource {
 
             let user = p
                 .user_id()
-                .and_then(|uid| self.users.get_user_by_id(uid))
+                .and_then(|uid| self.users.as_ref()?.get_user_by_id(uid))
                 .map(|u| u.name().to_string());
 
             let start_time = p.start_time();
@@ -316,6 +340,18 @@ impl SysinfoSource {
             let cgroup_path = self.cgroup_paths.get(pid_u, start_time).map(str::to_string);
             let service = cgroup_path.as_deref().and_then(procgroup::service_of);
             let container = cgroup_path.as_deref().and_then(procgroup::container_of);
+
+            // One read of /proc/<pid>/stat answers both "is this still the
+            // process we sampled?" and "how many major faults has it taken?".
+            // Threads are skipped: their counters are the process's again.
+            let now_stat = super::control::stat_counters(pid_u);
+            let major_faults_ps = match now_stat.filter(|_| is_process) {
+                Some((ticks, faults)) => match self.prev_majflt.insert(pid_u, (ticks, faults)) {
+                    Some((seen, prev)) if seen == ticks => Some(rate(prev, faults, secs)),
+                    _ => None,
+                },
+                None => None,
+            };
 
             // What the process is running *now*. `exec` keeps the PID and the
             // start time, and sysinfo reads a process's name only when it
@@ -357,7 +393,8 @@ impl SysinfoSource {
                     .sample_ticks
                     .get(&pid_u)
                     .copied()
-                    .filter(|ticks| super::control::start_ticks(pid_u) == Some(*ticks)),
+                    .filter(|ticks| now_stat.map(|(t, _)| t) == Some(*ticks)),
+                major_faults_ps,
                 // `+ 1` for the main thread: sysinfo's `tasks()` is the set
                 // of *sub*tasks, so a single-threaded process reports an
                 // empty set and every other one is short by itself. Without
@@ -372,6 +409,7 @@ impl SysinfoSource {
                 fd_limit,
                 service,
                 container,
+                container_name: None,
                 netns,
                 cmd,
                 exe,
@@ -387,6 +425,7 @@ impl SysinfoSource {
         self.fd_limits.retain_live(&|pid| seen.contains(&pid));
         self.execs.retain_live(&|pid| seen.contains(&pid));
         self.netns_of.retain(|pid, _| seen.contains(pid));
+        self.prev_majflt.retain(|pid, _| seen.contains(pid));
         rows
     }
 
@@ -411,10 +450,47 @@ impl SysinfoSource {
         self.netns.collect(&members, self.host_netns, secs, netns::counters_of)
     }
 
+    /// Attach a name to every container id the runtimes' files can name.
+    fn name_containers(&mut self, procs: &mut [ProcRow], cgroups: &mut [cgroup::CgroupStat]) {
+        let live: HashSet<String> = procs.iter().filter_map(|p| p.container.clone()).collect();
+        if live.is_empty() {
+            return;
+        }
+        self.container_names.resolve(&live);
+        for p in procs.iter_mut() {
+            p.container_name = p
+                .container
+                .as_deref()
+                .and_then(|id| self.container_names.get(id))
+                .map(String::from);
+        }
+        for c in cgroups.iter_mut().filter(|c| c.container) {
+            c.container_name = self.container_names.get(&c.name).map(String::from);
+        }
+    }
+
+    /// Refresh whichever device lists this platform has. `relist` also
+    /// discovers new entries, which costs a directory walk each.
+    fn refresh_lists(&mut self, relist: bool) {
+        if let Some(n) = &mut self.networks {
+            n.refresh(relist);
+        }
+        if let Some(d) = &mut self.disks {
+            d.refresh(relist);
+        }
+        if let Some(c) = &mut self.components {
+            c.refresh(relist);
+        }
+    }
+
     fn collect_nets(&mut self, secs: f64) -> Vec<NetIface> {
         let mut out = Vec::new();
         let mut next = BTreeMap::new();
-        for (name, d) in self.networks.iter() {
+        for (name, d) in self.networks.iter().flat_map(|n| n.iter()) {
+            // Interface names are `OsString` since sysinfo 0.40; Linux ones
+            // are ASCII in practice, and a lossy one still keys consistently.
+            let name = name.to_string_lossy();
+            let name = name.as_ref();
             let (rx, tx) = (d.total_received(), d.total_transmitted());
             let (rx_bps, tx_bps) = match self.prev_net.get(name) {
                 Some(&(prx, ptx)) => (rate(prx, rx, secs), rate(ptx, tx, secs)),
@@ -430,6 +506,8 @@ impl SysinfoSource {
                 mac: d.mac_address().to_string(),
                 errors_rx: d.total_errors_on_received(),
                 errors_tx: d.total_errors_on_transmitted(),
+                drops_rx: netclass::sysfs_stat(name, "rx_dropped").unwrap_or(0),
+                drops_tx: netclass::sysfs_stat(name, "tx_dropped").unwrap_or(0),
                 virtual_iface: netclass::is_virtual(name, &self.virtual_prefixes),
             });
         }
@@ -461,6 +539,7 @@ impl SysinfoSource {
         let listed: Vec<(String, String, String, String, bool, u64, u64)> = self
             .disks
             .iter()
+            .flat_map(|d| d.iter())
             .map(|d| {
                 (
                     d.mount_point().to_string_lossy().to_string(),
@@ -530,13 +609,12 @@ impl SysinfoSource {
         }
 
         let mut out = Vec::with_capacity(paths.len());
-        let mut usage: HashMap<String, u64> = HashMap::with_capacity(paths.len());
+        let mut usage: HashMap<String, cgroup::CgroupCounters> =
+            HashMap::with_capacity(paths.len());
         for path in paths {
             let prev = self.prev_cgroup_usage.get(&path).copied();
             let Some((stat, now)) = cgroup::read_stat(&path, prev, secs) else { continue };
-            if let Some(now) = now {
-                usage.insert(path.clone(), now);
-            }
+            usage.insert(path.clone(), now);
             if stat.is_interesting() {
                 out.push(stat);
             }
@@ -552,6 +630,7 @@ impl SysinfoSource {
         let mut out: Vec<Sensor> = self
             .components
             .iter()
+            .flat_map(|c| c.iter())
             .filter_map(|c| {
                 Some(Sensor {
                     label: c.label().to_string(),
@@ -587,18 +666,16 @@ impl MetricSource for SysinfoSource {
             })
             .collect();
         self.sys.refresh_specifics(refresh_kind());
-        self.networks.refresh(false);
-        self.disks.refresh(false);
-        self.components.refresh(false);
+        self.refresh_lists(false);
 
-        let load = System::load_average();
         let mut host = self.host.clone();
-        host.uptime_secs = System::uptime();
-        host.load = [load.one, load.five, load.fifteen];
+        host.uptime_secs = System::uptime().unwrap_or(host.uptime_secs);
+        // Windows has no load average and says so since sysinfo 0.40.
+        host.load = System::load_average().map_or([0.0; 3], |l| [l.one, l.five, l.fifteen]);
         host.logical_cores = self.sys.cpus().len();
 
         let cpu = CpuSample {
-            per_core: self.sys.cpus().iter().map(|c| c.cpu_usage().clamp(0.0, 100.0)).collect(),
+            per_core: self.sys.cpus().iter().map(|c| c.usage().clamp(0.0, 100.0)).collect(),
             freq_mhz: self.sys.cpus().iter().map(|c| c.frequency()).collect(),
         };
 
@@ -612,15 +689,19 @@ impl MetricSource for SysinfoSource {
             detail: meminfo::read(),
         };
 
-        let procs = self.collect_procs(secs);
+        let (cpu_time, vm) = self.kstat.sample(secs);
+        let tcp = self.tcp.sample(secs);
+        let mut procs = self.collect_procs(secs);
         let netns = self.collect_netns(&procs, secs);
+        let mut cgroups = self.collect_cgroups(secs);
+        self.name_containers(&mut procs, &mut cgroups);
 
         Snapshot {
             host,
             cpu,
             mem,
             cgroup: cgroup::read().filter(|c| c.is_interesting()),
-            cgroups: self.collect_cgroups(secs),
+            cgroups,
             procs,
             nets: self.collect_nets(secs),
             disks: self.collect_disks(secs),
@@ -631,6 +712,10 @@ impl MetricSource for SysinfoSource {
             netns,
             kernel: self.kmsg.events().to_vec(),
             kernel_unreadable: self.kmsg.error.clone(),
+            cpu_time,
+            vm,
+            tcp,
+            storage: storage::read(),
             taken_at_unix: now_unix(),
         }
     }
@@ -789,7 +874,7 @@ mod tests {
     fn the_thread_count_matches_what_proc_says() {
         use crate::metrics::MetricSource;
 
-        let mut source = SysinfoSource::new(Vec::new(), false);
+        let mut source = SysinfoSource::new(Vec::new(), false).unwrap();
         let snap = source.snapshot(Duration::from_millis(1));
 
         let mut checked = 0;

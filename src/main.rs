@@ -89,7 +89,7 @@ fn main() -> Result<()> {
         return watch_for(rule, &cfg, &args).or_else(|e| fail_watch(&e.to_string()));
     }
     if args.once {
-        let mut source = live_source(&cfg);
+        let mut source = live_source(&cfg)?;
         return print_once(&cfg, &args, &mut source);
     }
 
@@ -97,10 +97,13 @@ fn main() -> Result<()> {
     run_tui(cfg, source, &args, path, cfg_error.is_none())
 }
 
-fn live_source(cfg: &Config) -> SysinfoSource {
-    SysinfoSource::new(cfg.virtual_iface_prefixes.clone(), cfg.gpu.enabled && cfg.gpu.nvidia_smi)
-        .with_fds(cfg.procs.fds)
-        .with_pss(cfg.procs.pss)
+fn live_source(cfg: &Config) -> Result<SysinfoSource> {
+    Ok(SysinfoSource::new(
+        cfg.virtual_iface_prefixes.clone(),
+        cfg.gpu.enabled && cfg.gpu.nvidia_smi,
+    )?
+    .with_fds(cfg.procs.fds)
+    .with_pss(cfg.procs.pss))
 }
 
 /// Where snapshots come from: a recording, another host, or this one.
@@ -137,7 +140,7 @@ fn build_source(cfg: &Config, args: &Args) -> Result<Box<dyn MetricSource>> {
             }
         };
     }
-    Ok(Box::new(ThreadedSource::new(Box::new(live_source(cfg)))))
+    Ok(Box::new(ThreadedSource::new(Box::new(live_source(cfg)?))))
 }
 
 /// Open whatever `--record`, `--record-rotate` and `[record]` between them
@@ -172,7 +175,7 @@ fn open_recordings(cfg: &Config, args: &Args) -> Result<crabmon::record::Recordi
 /// disk is trimmed by `[record]` like any other recording, so a long-running
 /// stream does not fill the disk to say what it has already said.
 fn stream_frames(cfg: &Config, args: &Args) -> Result<()> {
-    let mut source = live_source(cfg);
+    let mut source = live_source(cfg)?;
     source.snapshot(Duration::ZERO);
     // The interval the rates are divided by has to be the one that actually
     // passed, not the one that was asked for — see `Pacer`.
@@ -273,7 +276,7 @@ fn watch_for(rule: crabmon::alerts::AlertRule, cfg: &Config, args: &Args) -> Res
     let timeout = args.watch_timeout.unwrap_or(0);
     let interval = crabmon::watch::interval(cfg.refresh_ms);
 
-    let mut source = live_source(cfg);
+    let mut source = live_source(cfg)?;
     source.snapshot(Duration::ZERO);
     let started = Instant::now();
     let mut pacer = Pacer::new(interval);
@@ -370,7 +373,7 @@ fn serve_metrics(addr: &str, cfg: &Config, args: &Args) -> Result<()> {
     if let Some(spec) = &args.remote {
         return serve_fleet(addr, cfg, args, spec);
     }
-    let mut source = live_source(cfg);
+    let mut source = live_source(cfg)?;
     let interval = Duration::from_millis(cfg.refresh_ms);
     // Prime the counters so the first scrape carries real rates.
     source.snapshot(Duration::ZERO);

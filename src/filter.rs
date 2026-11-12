@@ -11,7 +11,7 @@
 //! pid:1234           exact pid       ppid:1  exact parent
 //! state:R            process state letter
 //! service:sshd       systemd unit contains "sshd"
-//! container:abc123   container id contains "abc123"
+//! container:abc123   container id or name contains "abc123"
 //! cmd:--headless     substring of the full command line
 //! re:^chrom(e|ium)$  regex over the name
 //! cpu>5  mem>100M    numeric comparisons (> >= < <= =)
@@ -165,7 +165,14 @@ impl Term {
             Term::Ppid(pid) => p.ppid == Some(*pid),
             Term::State(s) => p.state.eq_ignore_ascii_case(s),
             Term::Service(v) => field_matches(p.service.as_deref(), v),
-            Term::Container(v) => field_matches(p.container.as_deref(), v),
+            // The id or the name: `container:postgres` is how people think
+            // of it, and `container:3f9a1c` is what drilling into a group
+            // writes. `container:-` still means "in none", which only the id
+            // can say.
+            Term::Container(v) => {
+                field_matches(p.container.as_deref(), v)
+                    || (v != "-" && field_matches(p.container_name.as_deref(), v))
+            }
             Term::Regex(re) => re.is_match(&p.name),
             Term::Cpu(c, v) => c.test(p.cpu as f64, *v),
             Term::Mem(c, v) => c.test(p.mem as f64, *v),
@@ -399,6 +406,10 @@ mod tests {
         assert!(parse("service:docker.service").unwrap().matches(&p));
         assert!(parse("service:DOCKER").unwrap().matches(&p));
         assert!(parse("container:abc123def456").unwrap().matches(&p));
+        p.container_name = Some("Postgres".into());
+        assert!(parse("container:postgres").unwrap().matches(&p), "by name, any case");
+        assert!(parse("container:abc123").unwrap().matches(&p), "still by id");
+        assert!(!parse("container:-").unwrap().matches(&p));
         assert!(!parse("service:sshd").unwrap().matches(&p));
 
         // `-` is what the grouped view calls "no value", so it has to filter

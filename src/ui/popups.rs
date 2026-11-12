@@ -295,7 +295,14 @@ pub fn detail(f: &mut Frame<'_>, area: Rect, app: &mut App) {
         field("Cgroup", elsewhere(app.detail_cgroup.clone().unwrap_or_else(|| "-".into()))),
         field("Env vars", elsewhere(env_summary(app.detail_env.as_deref()))),
         field("Service", p.service.clone().unwrap_or_else(|| "-".into())),
-        field("Container", p.container.clone().unwrap_or_else(|| "-".into())),
+        field(
+            "Container",
+            match (&p.container_name, &p.container) {
+                (Some(name), Some(id)) => format!("{name} ({id})"),
+                (None, Some(id)) => id.clone(),
+                _ => "-".into(),
+            },
+        ),
         field("Exe", if p.exe.is_empty() { "-".into() } else { p.exe.clone() }),
         field("Cwd", if p.cwd.is_empty() { "-".into() } else { p.cwd.clone() }),
         field(

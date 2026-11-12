@@ -13,13 +13,13 @@ _crabmon() {
 
     case "$prev" in
         -s|--sort)
-            COMPREPLY=($(compgen -W "pid name cpu mem virt disk time user state threads nice fds pss growth" -- "$cur"))
+            COMPREPLY=($(compgen -W "pid name cpu mem virt disk time user state threads nice fds pss growth majflt" -- "$cur"))
             return 0 ;;
         -g|--group)
             COMPREPLY=($(compgen -W "none service container user" -- "$cur"))
             return 0 ;;
         --columns)
-            COMPREPLY=($(compgen -W "mark pid user state cpu trend mem pss growth virt thr ni fd disk time ports name" -- "$cur"))
+            COMPREPLY=($(compgen -W "mark pid user state cpu trend mem pss growth majflt virt thr ni fd disk time ports name" -- "$cur"))
             return 0 ;;
         --record|--replay|--diff)
             COMPREPLY=($(compgen -f -- "$cur"))

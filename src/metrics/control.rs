@@ -14,6 +14,27 @@ pub fn start_ticks(_pid: u32) -> Option<u64> {
     None
 }
 
+/// `(start time in ticks, major faults)` out of one `/proc/<pid>/stat`, so
+/// the identity check the sampler already makes per process also yields the
+/// fault counter, at no extra read.
+pub fn parse_stat_counters(stat: &str) -> Option<(u64, u64)> {
+    // comm is parenthesised and may itself contain spaces or parentheses, so
+    // fields are counted from after the *last* `)`: index 0 is the state
+    // (field 3), majflt is field 12 and starttime field 22.
+    let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+    Some((fields.get(19)?.parse().ok()?, fields.get(9)?.parse().ok()?))
+}
+
+#[cfg(target_os = "linux")]
+pub fn stat_counters(pid: u32) -> Option<(u64, u64)> {
+    parse_stat_counters(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn stat_counters(_pid: u32) -> Option<(u64, u64)> {
+    None
+}
+
 fn gone() -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, "process is gone or its identity changed")
 }
@@ -80,7 +101,10 @@ impl LiveProcess {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let mut sys = sysinfo::System::new();
+            // A platform that cannot be read cannot vouch for the PID, and
+            // acting on an unvouched PID is the one thing this guard exists
+            // to refuse.
+            let mut sys = sysinfo::System::new().map_err(|_| gone())?;
             let pid = sysinfo::Pid::from_u32(self.pid);
             sys.refresh_processes_specifics(
                 sysinfo::ProcessesToUpdate::Some(&[pid]),
@@ -119,5 +143,27 @@ impl LiveProcess {
         }
         #[cfg(not(target_os = "linux"))]
         super::sysinfo_source::send_signal(self.pid, signal)
+    }
+}
+
+#[cfg(test)]
+mod stat_tests {
+    use super::parse_stat_counters;
+
+    #[test]
+    fn fault_and_start_counters_survive_a_command_name_full_of_parentheses() {
+        // Field 12 (majflt) is 37 and field 22 (starttime) is 8765; the comm
+        // contains ") (" to make a naive split land on the wrong field.
+        let stat = "4242 (evil) (name) S 1 4242 4242 0 -1 4194560 1500 0 37 0 \
+                    10 5 0 0 20 0 1 0 8765 12345678 900 18446744073709551615";
+        assert_eq!(parse_stat_counters(stat), Some((8765, 37)));
+        assert_eq!(parse_stat_counters("4242 (short) S 1"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn this_process_reads_its_own_counters() {
+        let (ticks, _) = super::stat_counters(std::process::id()).unwrap();
+        assert_eq!(Some(ticks), super::start_ticks(std::process::id()));
     }
 }

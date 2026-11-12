@@ -128,7 +128,9 @@ pub fn parse_rule(expr: &str, for_secs: u64) -> Result<AlertRule, String> {
         AlertKind::FillIn => crate::format::parse_duration(value)
             .map(|v| v as f64)
             .ok_or_else(|| format!("bad duration: {value}"))?,
-        AlertKind::Net | AlertKind::Trend => crate::format::parse_size(value)
+        // `vm` is a byte rate too, except `vm:majfault`, where a bare number
+        // still parses as itself.
+        AlertKind::Net | AlertKind::Trend | AlertKind::Vm => crate::format::parse_size(value)
             .map(|v| v as f64)
             .ok_or_else(|| format!("bad size: {value}"))?,
         _ => value.parse::<f64>().map_err(|_| format!("bad number: {value}"))?,
@@ -145,6 +147,28 @@ pub fn parse_rule(expr: &str, for_secs: u64) -> Result<AlertRule, String> {
         return Err(format!(
             "unknown pressure resource: {target}\nknown resources: {} (each also .some/.full)",
             crate::alerts::PSI_RESOURCES.join(", ")
+        ));
+    }
+
+    if kind == AlertKind::Cputime && !crate::metrics::kstat::cpu_mode_is_known(target) {
+        return Err(format!(
+            "unknown cpu mode: {target}\nknown modes: {}",
+            crate::metrics::kstat::CPU_MODES.join(", ")
+        ));
+    }
+    if kind == AlertKind::Tcp
+        && !crate::metrics::netstat::TCP_SERIES.contains(&target)
+        && !target.is_empty()
+    {
+        return Err(format!(
+            "unknown tcp figure: {target}\nknown figures: {}",
+            crate::metrics::netstat::TCP_SERIES.join(", ")
+        ));
+    }
+    if kind == AlertKind::Vm && !crate::metrics::kstat::vm_target_is_known(target) {
+        return Err(format!(
+            "unknown vm series: {target}\nknown series: {}",
+            crate::metrics::kstat::VM_SERIES.join(", ")
         ));
     }
 
@@ -485,6 +509,27 @@ mod tests {
     fn an_operator_no_alert_rule_has_is_refused_rather_than_approximated() {
         let err = parse_rule("cpu<=90", 0).unwrap_err();
         assert!(err.contains("use <"), "{err}");
+    }
+
+    #[test]
+    fn cpu_mode_and_vm_rules_check_their_target_and_take_rate_suffixes() {
+        let r = parse_rule("cputime:steal>=20", 0).unwrap();
+        assert_eq!((r.kind, r.target.as_str(), r.threshold), (AlertKind::Cputime, "steal", 20.0));
+        let err = parse_rule("cputime:stael>20", 0).unwrap_err();
+        assert!(err.contains("steal") && err.contains("iowait"), "{err}");
+        let r = parse_rule("vm:swapin>1M", 0).unwrap();
+        assert_eq!(r.threshold, (1 << 20) as f64);
+        assert_eq!(parse_rule("vm:majfault>200", 0).unwrap().threshold, 200.0);
+        assert!(parse_rule("vm:swpin>1M", 0).unwrap_err().contains("swapin"));
+    }
+
+    #[test]
+    fn tcp_rules_check_their_figure_and_container_rules_take_any_name() {
+        assert_eq!(parse_rule("tcp:listendrops>0", 0).unwrap().target, "listendrops");
+        assert_eq!(parse_rule("tcp>2", 0).unwrap().kind, AlertKind::Tcp);
+        assert!(parse_rule("tcp:retrains>2", 0).unwrap_err().contains("closewait"));
+        assert_eq!(parse_rule("throttle:api>=25", 0).unwrap().target, "api");
+        assert_eq!(parse_rule("oomkill:api>=1", 0).unwrap().kind, AlertKind::OomKill);
     }
 
     #[test]

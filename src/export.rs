@@ -216,8 +216,13 @@ pub fn to_text_with(snap: &Snapshot, columns: &[String], width: u16) -> String {
         snap.host.load[1],
         snap.host.load[2],
     ));
+    let modes = snap
+        .cpu_time
+        .as_ref()
+        .map(|m| format!(" ({})", crate::ui::cpu::modes_summary(m)))
+        .unwrap_or_default();
     out.push_str(&format!(
-        "cpu {:>5.1}%   mem {} / {} ({} cache)",
+        "cpu {:>5.1}%{modes}   mem {} / {} ({} cache)",
         snap.cpu.avg(),
         human_bytes(snap.mem.used),
         human_bytes(snap.mem.total),
@@ -229,6 +234,13 @@ pub fn to_text_with(snap: &Snapshot, columns: &[String], width: u16) -> String {
             human_bytes(snap.mem.swap_used),
             human_bytes(snap.mem.swap_total)
         ));
+        if let Some(vm) = &snap.vm {
+            out.push_str(&format!(
+                " (in {} out {})",
+                human_bps(vm.swap_in_bps),
+                human_bps(vm.swap_out_bps)
+            ));
+        }
     }
     let (rx, tx) = snap.net_totals(false);
     if rx > 0.0 || tx > 0.0 {

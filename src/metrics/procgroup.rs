@@ -61,8 +61,12 @@ pub fn service_of(cgroup_path: &str) -> Option<String> {
         .or_else(|| cgroup_path.rsplit('/').find(|c| c.ends_with(".slice")).map(String::from))
 }
 
+/// A full container id: 64 hex characters, which is what Docker, containerd,
+/// CRI-O and Podman all use. Accepting anything shorter took the last group of
+/// a UUID — GNOME Terminal's `vte-spawn-<uuid>.scope` — for a container, so
+/// every terminal tab on a desktop was "a container" in the grouped view.
 fn is_hex_id(s: &str) -> bool {
-    s.len() >= 12 && s.chars().all(|c| c.is_ascii_hexdigit())
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// The container a cgroup path belongs to, as a short id.
@@ -165,7 +169,7 @@ mod tests {
 
     #[test]
     fn container_ids_are_found_in_every_common_layout() {
-        let id = "3fa8c9d2e1b7a4f60c5d8e9a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
+        let id = "3fa8c9d2e1b7a4f60c5d8e9a1b2c3d4e5f60718293a4b5c6d7e8f90123456789";
         // cgroup v2, systemd driver
         assert_eq!(
             container_of(&format!("/system.slice/docker-{id}.scope")).as_deref(),
@@ -183,6 +187,14 @@ mod tests {
             container_of(&format!("/machine.slice/libpod-{id}.scope")).as_deref(),
             Some(&id[..12])
         );
+        // kubernetes, systemd driver
+        assert_eq!(
+            container_of(&format!(
+                "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1a2b.slice/cri-containerd-{id}.scope"
+            ))
+            .as_deref(),
+            Some(&id[..12])
+        );
     }
 
     #[test]
@@ -193,13 +205,23 @@ mod tests {
             None
         );
         assert_eq!(container_of("/"), None);
+        // A UUID's last group is twelve hex digits; a terminal tab is not a
+        // container.
+        assert_eq!(
+            container_of(
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/\
+                 app-org.gnome.Terminal.slice/vte-spawn-b6ab1cb2-7c32-49f2-8afd-184606acfcae.scope"
+            ),
+            None
+        );
     }
 
     #[test]
     fn short_hex_strings_are_not_mistaken_for_container_ids() {
         assert!(!is_hex_id("abc"));
         assert!(!is_hex_id("app-foo.scope"));
-        assert!(is_hex_id("3fa8c9d2e1b7"));
+        assert!(!is_hex_id("3fa8c9d2e1b7"), "a short id is how a UUID group looks");
+        assert!(is_hex_id(&"a".repeat(64)));
     }
 
     #[test]

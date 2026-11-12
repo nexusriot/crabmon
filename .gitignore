@@ -13,6 +13,8 @@
 *.swp
 .DS_Store
 
+.serena/
+
 # Snapshots written by the `P` key. With `[export] dir` unset — the default —
 # these land in the working directory, which is the checkout while developing.
 # Unanchored to cover a configured relative export directory too.

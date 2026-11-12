@@ -425,6 +425,15 @@ fn alert_rules(cfg: &crate::config::Config) -> Check {
             AlertKind::Fd if !cfg.procs.fds => Some("[procs] fds is off"),
             AlertKind::Psi if !readable("/proc/pressure/cpu") => Some("no pressure stall"),
             AlertKind::Kernel if !readable("/dev/kmsg") => Some("/dev/kmsg is unreadable"),
+            AlertKind::Cputime if !readable("/proc/stat") => Some("/proc/stat is unreadable"),
+            AlertKind::Vm if !readable("/proc/vmstat") => Some("/proc/vmstat is unreadable"),
+            AlertKind::Tcp if !readable("/proc/net/snmp") => Some("/proc/net/snmp is unreadable"),
+            AlertKind::Storage if crate::metrics::storage::read().is_empty() => {
+                Some("no md, ZFS or btrfs volumes")
+            }
+            AlertKind::OomKill if rule.target.is_empty() && !readable("/proc/vmstat") => {
+                Some("/proc/vmstat is unreadable")
+            }
             _ => None,
         };
         if needs.is_some() {

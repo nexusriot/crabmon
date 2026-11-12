@@ -70,6 +70,21 @@ pub fn disk_label_with_eta(d: &DiskRow, mount_width: usize, eta_secs: Option<u64
     )
 }
 
+/// `md0 raid1 rebuilding [2/1] [U_] recovery 12.6%`.
+pub fn array_label(a: &crate::metrics::storage::StorageArray) -> String {
+    let mut parts = vec![a.name.clone()];
+    // The level says more than the kind where there is one.
+    parts.push(if a.level.is_empty() { a.kind.clone() } else { a.level.clone() });
+    parts.push(a.state.label().to_string());
+    if !a.detail.is_empty() {
+        parts.push(a.detail.clone());
+    }
+    if let (Some(what), Some(pct)) = (&a.activity, a.progress) {
+        parts.push(format!("{what} {pct:.1}%"));
+    }
+    parts.join(" ")
+}
+
 pub fn draw(f: &mut Frame<'_>, area: Rect, app: &App) {
     let (r, w) = app.snap.disk_io_totals();
     let title = if r + w < 1.0 {
@@ -84,6 +99,19 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &App) {
         };
         format!(" Disks  R {}  W {}{busy} ", human_bps(r), human_bps(w))
     };
+    // A lost mirror changes nothing else on screen, so it goes in the title,
+    // where it cannot be scrolled past or cut off by a short panel.
+    let unhealthy: Vec<String> = app
+        .snap
+        .storage
+        .iter()
+        .filter(|a| a.state.is_unhealthy())
+        .map(|a| format!("{} {}", a.name, a.state.label()))
+        .collect();
+    let title = match unhealthy.is_empty() {
+        true => title,
+        false => format!("{}! {} ", title, unhealthy.join(", ")),
+    };
     let b = block(app, title);
     let inner = b.inner(area);
     f.render_widget(b, area);
@@ -91,7 +119,7 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
-    if app.snap.disks.is_empty() {
+    if app.snap.disks.is_empty() && app.snap.storage.is_empty() {
         f.render_widget(
             Paragraph::new(Span::styled("no disks", Style::default().fg(app.theme.dim))),
             inner,
@@ -99,11 +127,26 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
-    let shown = (inner.height as usize).min(app.snap.disks.len());
+    // Arrays first, worst first: they are few, and the one that has lost a
+    // disk is the row that matters most on the panel.
+    let arrays = app.snap.storage.len().min(inner.height as usize);
+    let shown = (inner.height as usize - arrays).min(app.snap.disks.len());
     let slots = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(vec![Constraint::Length(1); shown])
+        .constraints(vec![Constraint::Length(1); arrays + shown])
         .split(inner);
+    for (a, slot) in app.snap.storage.iter().take(arrays).zip(slots.iter()) {
+        let color = match a.state {
+            crate::metrics::storage::ArrayState::Healthy => app.theme.ok,
+            crate::metrics::storage::ArrayState::Rebuilding => app.theme.warn,
+            _ => app.theme.crit,
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(array_label(a), Style::default().fg(color))),
+            *slot,
+        );
+    }
+    let slots = &slots[arrays..];
 
     let mount_width = (inner.width as usize / 3).clamp(6, 24);
     for (d, slot) in app.snap.disks.iter().take(shown).zip(slots.iter()) {

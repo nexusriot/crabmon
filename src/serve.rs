@@ -266,6 +266,20 @@ pub fn render_host(
             .map(|(i, v)| (format!("core=\"{i}\""), *v as f64))
             .collect::<Vec<_>>(),
     );
+    // Absent rather than zero where `/proc/stat` was not read: a scrape
+    // saying "no steal" about a host it could not see is worse than silence.
+    if let Some(m) = &snap.cpu_time {
+        metric(
+            &mut out,
+            "cpu_mode_percent",
+            "Share of all CPU time spent in each mode over the last interval.",
+            "gauge",
+            &crate::metrics::kstat::CPU_MODES
+                .iter()
+                .filter_map(|mode| m.get(mode).map(|v| (format!("mode=\"{mode}\""), v)))
+                .collect::<Vec<_>>(),
+        );
+    }
     metric(&mut out, "load1", "One-minute load average.", "gauge", &plain(snap.host.load[0]));
     metric(
         &mut out,
@@ -299,6 +313,38 @@ pub fn render_host(
         &plain(snap.mem.swap_total as f64),
     );
     metric(&mut out, "swap_used_bytes", "Used swap.", "gauge", &plain(snap.mem.swap_used as f64));
+    if let Some(vm) = &snap.vm {
+        metric(
+            &mut out,
+            "swap_in_bytes_per_second",
+            "Bytes read back in from swap per second.",
+            "gauge",
+            &plain(vm.swap_in_bps),
+        );
+        metric(
+            &mut out,
+            "swap_out_bytes_per_second",
+            "Bytes written out to swap per second.",
+            "gauge",
+            &plain(vm.swap_out_bps),
+        );
+        metric(
+            &mut out,
+            "major_faults_per_second",
+            "Page faults that had to wait for disk or swap, per second.",
+            "gauge",
+            &plain(vm.major_faults_ps),
+        );
+        if let Some(n) = vm.oom_kills {
+            metric(
+                &mut out,
+                "oom_kills_total",
+                "OOM kills since boot, from the kernel's own counter.",
+                "counter",
+                &plain(n as f64),
+            );
+        }
+    }
 
     // Per-container and per-unit accounting, from each cgroup's own files.
     // The limit is the series that matters: a container at 98% of a 512 MB
@@ -336,6 +382,108 @@ pub fn render_host(
             .cgroups
             .iter()
             .filter_map(|c| c.cpu_cores.map(|v| (cg_label(c), v)))
+            .collect::<Vec<_>>(),
+    );
+    metric(
+        &mut out,
+        "cgroup_cpu_throttled_ratio",
+        "Share of CPU-quota periods in the last interval in which the cgroup was throttled.",
+        "gauge",
+        &snap
+            .cgroups
+            .iter()
+            .filter_map(|c| c.throttled_ratio.map(|v| (cg_label(c), v)))
+            .collect::<Vec<_>>(),
+    );
+    metric(
+        &mut out,
+        "cgroup_oom_kills_total",
+        "OOM kills inside a cgroup over its lifetime, from memory.events.",
+        "counter",
+        &snap
+            .cgroups
+            .iter()
+            .filter_map(|c| c.oom_kills.map(|n| (cg_label(c), n as f64)))
+            .collect::<Vec<_>>(),
+    );
+    // One family, the resource as a label, for the same reason as the host's
+    // pressure series: a repeated HELP line makes Prometheus drop the scrape.
+    let cg_psi: Vec<(String, f64)> = snap
+        .cgroups
+        .iter()
+        .flat_map(|c| {
+            [("cpu", c.psi.cpu), ("memory", c.psi.memory), ("io", c.psi.io)].into_iter().filter_map(
+                move |(r, p)| {
+                    p.map(|p| (format!("{},resource=\"{r}\"", cg_label(c)), p.some.avg10 / 100.0))
+                },
+            )
+        })
+        .collect();
+    metric(
+        &mut out,
+        "cgroup_pressure_some_ratio",
+        "Share of time a cgroup had at least one task stalled, 10s average.",
+        "gauge",
+        &cg_psi,
+    );
+    // Names as an info series rather than a label on every cgroup series:
+    // adding a label would change the identity of series people already
+    // graph, and a rename would split one container's history in two.
+    metric(
+        &mut out,
+        "container_info",
+        "A container id's name, from the runtime's own files. Join on `name`.",
+        "gauge",
+        &snap
+            .cgroups
+            .iter()
+            .filter_map(|c| {
+                c.container_name.as_ref().map(|n| {
+                    (format!("{},container_name=\"{}\"", cg_label(c), escape_label(n)), 1.0)
+                })
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    // Storage health: 1 for an array without full redundancy, so
+    // `crabmon_storage_degraded == 1` is the whole alerting expression.
+    let arr = |a: &crate::metrics::storage::StorageArray| {
+        format!("kind=\"{}\",name=\"{}\"", escape_label(&a.kind), escape_label(&a.name))
+    };
+    metric(
+        &mut out,
+        "storage_degraded",
+        "1 when an md array, ZFS pool or btrfs filesystem is degraded, rebuilding or failed.",
+        "gauge",
+        &snap
+            .storage
+            .iter()
+            .map(|a| (arr(a), a.state.is_unhealthy() as u8 as f64))
+            .collect::<Vec<_>>(),
+    );
+    metric(
+        &mut out,
+        "storage_sync_percent",
+        "Progress of a running resync, rebuild, reshape or check.",
+        "gauge",
+        &snap
+            .storage
+            .iter()
+            .filter_map(|a| {
+                let what = a.activity.as_deref()?;
+                a.progress.map(|p| (format!("{},activity=\"{what}\"", arr(a)), p))
+            })
+            .collect::<Vec<_>>(),
+    );
+    metric(
+        &mut out,
+        "storage_device_errors_total",
+        "btrfs device errors (read, write, flush, corruption, generation) since last reset.",
+        "counter",
+        &snap
+            .storage
+            .iter()
+            .filter_map(|a| a.errors.map(|e| (arr(a), e as f64)))
             .collect::<Vec<_>>(),
     );
 
@@ -460,6 +608,63 @@ pub fn render_host(
         "counter",
         &snap.nets.iter().map(|n| (iface(n), n.errors_tx as f64)).collect::<Vec<_>>(),
     );
+    metric(
+        &mut out,
+        "network_receive_drops_total",
+        "Received packets dropped since boot.",
+        "counter",
+        &snap.nets.iter().map(|n| (iface(n), n.drops_rx as f64)).collect::<Vec<_>>(),
+    );
+    metric(
+        &mut out,
+        "network_transmit_drops_total",
+        "Transmitted packets dropped since boot.",
+        "counter",
+        &snap.nets.iter().map(|n| (iface(n), n.drops_tx as f64)).collect::<Vec<_>>(),
+    );
+    // TCP health. Each is absent where it was not measured rather than 0: no
+    // segments sent is no retransmit percentage, not a perfect one.
+    if let Some(t) = &snap.tcp {
+        let opt = |v: Option<f64>| v.map(plain).unwrap_or_default();
+        metric(
+            &mut out,
+            "tcp_retransmit_percent",
+            "Retransmitted segments as a percentage of segments sent over the last interval.",
+            "gauge",
+            &opt(t.retrans_percent),
+        );
+        metric(
+            &mut out,
+            "tcp_listen_drops_per_second",
+            "Incoming connections dropped at a listener, e.g. a full accept queue.",
+            "gauge",
+            &opt(t.listen_drops_ps),
+        );
+        metric(
+            &mut out,
+            "tcp_resets_per_second",
+            "Established connections reset per second.",
+            "gauge",
+            &plain(t.resets_ps),
+        );
+        metric(
+            &mut out,
+            "tcp_failed_connects_per_second",
+            "Connection attempts that failed per second.",
+            "gauge",
+            &plain(t.attempt_fails_ps),
+        );
+        let states: Vec<(String, f64)> = [
+            ("established", Some(t.established)),
+            ("time_wait", t.time_wait),
+            ("close_wait", t.close_wait),
+            ("orphan", t.orphans),
+        ]
+        .into_iter()
+        .filter_map(|(k, v)| v.map(|v| (format!("state=\"{k}\""), v as f64)))
+        .collect();
+        metric(&mut out, "tcp_connections", "TCP sockets by state.", "gauge", &states);
+    }
     metric(
         &mut out,
         "network_receive_bytes_total",
@@ -1595,6 +1800,66 @@ mod tests {
         });
         let text = render(&s, 0);
         assert!(text.contains("crabmon_pressure_some_ratio{resource=\"io\"} 0.0255"), "{text}");
+    }
+
+    #[test]
+    fn storage_health_is_exported_per_array() {
+        let mut s = snap();
+        s.storage = crate::metrics::storage::parse_mdstat(
+            "md0 : active raid1 sdc1[2] sda1[0]\n      1000 blocks [2/1] [U_]\n      [=>..]  recovery = 12.6% (1/8)\nmd1 : active raid1 sdd1[1] sde1[0]\n      1000 blocks [2/2] [UU]\n",
+        );
+        let text = render(&s, 0);
+        for line in [
+            "crabmon_storage_degraded{kind=\"md\",name=\"md0\"} 1",
+            "crabmon_storage_degraded{kind=\"md\",name=\"md1\"} 0",
+            "crabmon_storage_sync_percent{kind=\"md\",name=\"md0\",activity=\"recovery\"} 12.6",
+        ] {
+            assert!(text.contains(line), "{line} missing:\n{text}");
+        }
+        assert!(!text.contains("storage_device_errors_total"), "md has no error counters");
+    }
+
+    #[test]
+    fn container_throttling_ooms_names_and_tcp_health_are_exported_once_each() {
+        use crate::metrics::cgroup::CgroupStat;
+        use crate::metrics::psi::{Pressure, PressureLine, PsiSample};
+        let p =
+            Some(Pressure { some: PressureLine { avg10: 12.5, ..Default::default() }, full: None });
+        let mut s = snap();
+        s.cgroups = (0..2)
+            .map(|i| CgroupStat {
+                name: format!("abc12300000{i}"),
+                container: true,
+                container_name: (i == 0).then(|| "api".to_string()),
+                throttled_ratio: Some(0.25),
+                oom_kills: Some(i),
+                psi: PsiSample { cpu: p, memory: p, io: None },
+                ..Default::default()
+            })
+            .collect();
+        s.tcp = Some(crate::metrics::TcpHealth {
+            established: 87,
+            close_wait: Some(3),
+            retrans_percent: None,
+            listen_drops_ps: Some(4.0),
+            ..Default::default()
+        });
+        let text = render(&s, 0);
+        for line in [
+            "crabmon_cgroup_cpu_throttled_ratio{name=\"abc123000000\"} 0.25",
+            "crabmon_cgroup_oom_kills_total{name=\"abc123000001\"} 1",
+            "crabmon_cgroup_pressure_some_ratio{name=\"abc123000000\",resource=\"memory\"} 0.125",
+            "crabmon_container_info{name=\"abc123000000\",container_name=\"api\"} 1",
+            "crabmon_tcp_listen_drops_per_second 4",
+            "crabmon_tcp_connections{state=\"close_wait\"} 3",
+        ] {
+            assert!(text.contains(line), "{line} missing:\n{text}");
+        }
+        assert!(!text.contains("container_name=\"\""), "an unnamed container has no info series");
+        assert!(!text.contains("crabmon_tcp_retransmit_percent"), "nothing sent is not 0%");
+        for family in ["cgroup_pressure_some_ratio", "container_info", "tcp_connections"] {
+            assert_eq!(text.matches(&format!("# HELP crabmon_{family} ")).count(), 1, "{family}");
+        }
     }
 
     /// No port, no network, and the filesystem does the access control.

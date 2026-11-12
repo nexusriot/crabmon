@@ -3,6 +3,79 @@
 Notable changes to crabmon. Versions follow [semantic versioning](https://semver.org),
 with the usual 0.x caveat that minor releases may change behaviour.
 
+## 0.16.0 — unreleased
+
+The numbers behind the headline figures: what the busy CPU time was spent
+on, whether a machine using swap is actually paging, whether TCP is healthy
+rather than merely busy, and what a container is called, how often its quota
+stalls it and whether it has been OOM-killed at its own limit.
+
+### Added
+
+- **CPU time by mode.** The CPU panel title shows user, system and — once
+  they are worth reading — iowait, irq and steal, from `/proc/stat`. A busy
+  percentage cannot show a VPS losing a third of its time to the hypervisor,
+  or a machine that feels frozen while its CPU sits idle waiting on disks.
+  Also in `--once --format text`, in JSON exports and recordings as
+  `cpu_time`, and exported as `crabmon_cpu_mode_percent{mode=...}`.
+- **Paging activity.** The swap gauge shows swap-in and swap-out rates, and
+  major faults per second once there are any, from `/proc/vmstat`. Exported
+  as `crabmon_swap_in_bytes_per_second`, `crabmon_swap_out_bytes_per_second`,
+  `crabmon_major_faults_per_second` and `crabmon_oom_kills_total`, the
+  kernel's own OOM counter, which needs no root where `/dev/kmsg` does.
+- **TCP health.** A line under the network table — established,
+  TIME_WAIT and CLOSE_WAIT sockets, retransmit percentage, listen-queue drops
+  and resets — from `/proc/net/snmp`, `/proc/net/netstat` and
+  `/proc/net/sockstat`. Exported as `crabmon_tcp_*`, with interface packet
+  drops as `crabmon_network_{receive,transmit}_drops_total` and a drop column
+  in the IO layout.
+- **Container names.** `postgres` instead of `3f9a1c2b4d5e` in the grouped
+  view, the detail pane and `container:` filters, read from Docker, Podman
+  and kubelet files, or from one read-only request to the Docker/Podman API
+  socket for a `docker` group member who cannot read `/var/lib/docker`. Exported as
+  `crabmon_container_info`; the id stays every series' label.
+- **Container throttling, OOM kills and pressure.** THROTL and OOM columns in
+  the grouped view, from `cpu.stat` and `memory.events`, and each cgroup's
+  own pressure stall. Exported as `crabmon_cgroup_cpu_throttled_ratio`,
+  `crabmon_cgroup_oom_kills_total` and `crabmon_cgroup_pressure_some_ratio`.
+- **`throttle`, `oomkill` and `tcp` alert kinds**: `throttle:api>=25`,
+  `oomkill:api>=1` (kills within the window; no target counts the whole
+  machine, without root), `tcp:listendrops>0`.
+- **Storage health.** md RAID arrays, ZFS pools and btrfs filesystems lead
+  the Disks panel, worst first, and any that is degraded, rebuilding or
+  failed is named in the panel title. A rebuild shows its progress; a
+  routine check of a whole array is not trouble. From `/proc/mdstat`, ZFS
+  pool `state` and btrfs `error_stats`/`missing`, without root. Exported as
+  `crabmon_storage_degraded`, `crabmon_storage_sync_percent` and
+  `crabmon_storage_device_errors_total`, with a `storage` alert kind.
+- **MAJFLT column and sort key**: major page faults per second per process,
+  from the `/proc/<pid>/stat` read the sampler already makes, so which
+  process the machine's paging is hurting is a key press away.
+- **`cputime` and `vm` alert kinds**, with `--watch-rule` support:
+  `cputime:steal>=20`, `vm:swapin>10M`, `vm:majfault>500`. Unknown modes and
+  series are refused when the rule is parsed rather than measuring nothing,
+  and `--doctor` reports them as inert when the files cannot be read.
+
+### Changed
+
+- **sysinfo 0.40.** Its constructors and host queries now return errors
+  instead of zeros, so a platform it cannot read fails at startup with a
+  sentence rather than drawing an empty machine, and the networks, disks,
+  sensors and users lists are each optional — a platform missing one still
+  gets everything else. Windows, which has no load average, reports zeros
+  as before. The non-Linux process-identity guard refuses to act when it
+  cannot read the process table. All other dependencies are at their newest
+  compatible releases (`cargo update`); `libc` stays pinned at
+  `1.0.0-alpha.5`, still the newest.
+
+### Fixed
+
+- **Every GNOME Terminal tab was a "container".** A container id was any
+  run of twelve or more hex digits in a cgroup path, and the last group of a
+  UUID is exactly twelve, so `vte-spawn-<uuid>.scope` — one per terminal tab
+  — showed up in the container grouping and as a container on its
+  processes. An id is now the full 64 hex characters every runtime uses.
+
 ## 0.15.0 — 2026-11-06
 
 - Added per-host remote sample age and stale-state Prometheus metrics, based

@@ -106,9 +106,44 @@ pub struct CgroupStat {
     pub cpu_cores: Option<f64>,
     /// `None` when unlimited.
     pub cpu_quota_cores: Option<f64>,
+    /// What the container is called — `postgres`, `web/nginx` — when the
+    /// runtime's own files say. `name` stays the id, which is the identity.
+    pub container_name: Option<String>,
+    /// Share of CPU-quota periods in the last interval in which the group ran
+    /// out of quota and was made to wait, 0..=1. `None` without a quota, or
+    /// when no period elapsed.
+    ///
+    /// The figure average usage hides: a container using 40% of its quota on
+    /// average can still be throttled in a third of its periods, because the
+    /// quota is enforced per 100 ms, and every throttled period is latency.
+    pub throttled_ratio: Option<f64>,
+    /// OOM kills inside the group over its lifetime, from `memory.events`.
+    /// The host can be fine while a container is killed at its own limit.
+    pub oom_kills: Option<u64>,
+    /// The group's own pressure stall, from its `*.pressure` files.
+    pub psi: crate::metrics::psi::PsiSample,
+}
+
+/// The cumulative counters a group's rates are computed from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CgroupCounters {
+    pub usage_usec: Option<u64>,
+    pub nr_periods: Option<u64>,
+    pub nr_throttled: Option<u64>,
 }
 
 impl CgroupStat {
+    /// What to call the group on screen: the container's name where it is
+    /// known, otherwise the id or unit.
+    pub fn label(&self) -> &str {
+        self.container_name.as_deref().unwrap_or(&self.name)
+    }
+
+    /// Whether `name` refers to this group, by id, unit or container name.
+    pub fn is_named(&self, name: &str) -> bool {
+        self.name == name || self.container_name.as_deref() == Some(name)
+    }
+
     /// How close the group is to its own memory limit, 0..=1. `None` when it
     /// has no limit, which is not the same as having room.
     pub fn mem_ratio(&self) -> Option<f64> {
@@ -132,12 +167,37 @@ impl CgroupStat {
     }
 }
 
-/// `usage_usec 1234567` out of `cpu.stat`.
-pub fn parse_cpu_usage_usec(content: &str) -> Option<u64> {
+/// One `key value` line out of a flat-keyed cgroup file such as `cpu.stat`
+/// or `memory.events`.
+pub fn flat_key(content: &str, key: &str) -> Option<u64> {
     content.lines().find_map(|l| {
         let mut it = l.split_whitespace();
-        (it.next()? == "usage_usec").then(|| it.next()?.parse().ok())?
+        (it.next()? == key).then(|| it.next()?.parse().ok())?
     })
+}
+
+/// `usage_usec 1234567` out of `cpu.stat`.
+pub fn parse_cpu_usage_usec(content: &str) -> Option<u64> {
+    flat_key(content, "usage_usec")
+}
+
+/// The counters `cpu.stat` carries. `nr_periods` and `nr_throttled` are only
+/// there when the cpu controller is enabled for the group.
+pub fn parse_cpu_counters(content: &str) -> CgroupCounters {
+    CgroupCounters {
+        usage_usec: flat_key(content, "usage_usec"),
+        nr_periods: flat_key(content, "nr_periods"),
+        nr_throttled: flat_key(content, "nr_throttled"),
+    }
+}
+
+/// Throttled periods as a share of the periods that elapsed between two
+/// readings. `None` when no period elapsed — an idle group, or one with no
+/// quota, whose period counter never moves — rather than a meaningless 0/0.
+pub fn throttled_ratio(prev: &CgroupCounters, cur: &CgroupCounters) -> Option<f64> {
+    let periods = cur.nr_periods?.checked_sub(prev.nr_periods?)?;
+    let throttled = cur.nr_throttled?.checked_sub(prev.nr_throttled?)?;
+    (periods > 0).then(|| (throttled as f64 / periods as f64).clamp(0.0, 1.0))
 }
 
 /// Cgroups read per sample. A machine running hundreds of containers would
@@ -148,9 +208,9 @@ pub const MAX_CGROUPS: usize = 128;
 /// CPU figure can be a rate rather than a total since boot.
 pub fn read_stat(
     path: &str,
-    prev_usage: Option<u64>,
+    prev: Option<CgroupCounters>,
     secs: f64,
-) -> Option<(CgroupStat, Option<u64>)> {
+) -> Option<(CgroupStat, CgroupCounters)> {
     if !cfg!(target_os = "linux") {
         return None;
     }
@@ -160,8 +220,9 @@ pub fn read_stat(
     }
     let read = |name: &str| fs::read_to_string(base.join(name)).ok();
 
-    let usage = read("cpu.stat").as_deref().and_then(parse_cpu_usage_usec);
-    let cpu_cores = match (prev_usage, usage) {
+    let counters = read("cpu.stat").as_deref().map(parse_cpu_counters).unwrap_or_default();
+    let usage = counters.usage_usec;
+    let cpu_cores = match (prev.and_then(|p| p.usage_usec), usage) {
         // Microseconds of CPU per second of wall clock is cores.
         (Some(prev), Some(now)) if secs > 0.0 && now >= prev => {
             Some((now - prev) as f64 / 1_000_000.0 / secs)
@@ -183,8 +244,16 @@ pub fn read_stat(
         mem_max: read("memory.max").and_then(|s| parse_mem_max(&s)),
         cpu_cores,
         cpu_quota_cores: read("cpu.max").and_then(|s| parse_cpu_max(&s)),
+        container_name: None,
+        throttled_ratio: prev.and_then(|p| throttled_ratio(&p, &counters)),
+        oom_kills: read("memory.events").and_then(|s| flat_key(&s, "oom_kill")),
+        psi: crate::metrics::psi::PsiSample {
+            cpu: read("cpu.pressure").and_then(|s| crate::metrics::psi::parse_pressure(&s)),
+            memory: read("memory.pressure").and_then(|s| crate::metrics::psi::parse_pressure(&s)),
+            io: read("io.pressure").and_then(|s| crate::metrics::psi::parse_pressure(&s)),
+        },
     };
-    Some((stat, usage))
+    Some((stat, counters))
 }
 
 /// Read the calling process's cgroup. Linux only; `None` elsewhere.
@@ -227,6 +296,50 @@ mod tests {
     }
 
     /// The question per-process sums cannot answer.
+    // cpu.stat of a throttled container, cgroup v2.
+    const CPU_STAT: &str = "usage_usec 12345678
+user_usec 10000000
+system_usec 2345678
+nr_periods 1000
+nr_throttled 120
+throttled_usec 4567890
+";
+
+    #[test]
+    fn throttling_is_a_share_of_the_periods_in_the_interval() {
+        let a = parse_cpu_counters(CPU_STAT);
+        assert_eq!((a.nr_periods, a.nr_throttled), (Some(1000), Some(120)));
+        let b =
+            CgroupCounters { usage_usec: Some(0), nr_periods: Some(1010), nr_throttled: Some(124) };
+        assert_eq!(throttled_ratio(&a, &b), Some(0.4));
+        // No period elapsed: idle, or no quota. Not "never throttled".
+        assert_eq!(throttled_ratio(&a, &a), None);
+        // No cpu controller: the counters are absent, and so is the ratio.
+        let bare = parse_cpu_counters("usage_usec 5\n");
+        assert_eq!(throttled_ratio(&bare, &bare), None);
+    }
+
+    #[test]
+    fn oom_kills_are_read_out_of_memory_events() {
+        let events = "low 0\nhigh 14\nmax 3\noom 2\noom_kill 2\noom_group_kill 0\n";
+        assert_eq!(flat_key(events, "oom_kill"), Some(2));
+        // `oom` must not match `oom_kill`'s line or the other way round.
+        assert_eq!(flat_key("oom_kill 7\n", "oom"), None);
+    }
+
+    #[test]
+    fn a_container_is_found_by_its_id_or_its_name() {
+        let s = CgroupStat {
+            name: "3f9a1c2b4d5e".into(),
+            container_name: Some("postgres".into()),
+            ..Default::default()
+        };
+        assert!(s.is_named("3f9a1c2b4d5e") && s.is_named("postgres"));
+        assert!(!s.is_named("postgre"));
+        assert_eq!(s.label(), "postgres");
+        assert_eq!(CgroupStat { name: "sshd".into(), ..Default::default() }.label(), "sshd");
+    }
+
     #[test]
     fn a_group_reports_how_close_it_is_to_its_own_limits() {
         let s = CgroupStat {

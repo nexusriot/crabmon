@@ -1,9 +1,9 @@
 [package]
 name = "crabmon"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2024"
 # The floor is the highest any dependency asks for, not the edition's own
-# 1.85: sysinfo 0.39 wants 1.95. Declared so cargo refuses an older toolchain
+# 1.85: sysinfo 0.40 wants 1.95. Declared so cargo refuses an older toolchain
 # with a sentence naming the package, which is how the e2e image's pinned
 # rust 1.90 announced itself rather than failing somewhere in a build log.
 rust-version = "1.95"
@@ -22,7 +22,7 @@ path = "src/main.rs"
 [dependencies]
 crossterm = "0.29"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
-sysinfo = "0.39"
+sysinfo = "0.40"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -38,7 +38,8 @@ nix = { version = "0.31", default-features = false, features = ["signal", "sched
 # a routine `cargo update` could swap the libc under this crate's `unsafe`
 # syscalls for one with different definitions. Every call here —
 # `setpriority`, `getpriority` with `__errno_location`, `SYS_ioprio_get`,
-# `SYS_ioprio_set`, `statvfs`, `O_NONBLOCK`, `_exit` — was checked against a
+# `SYS_ioprio_set`, `statvfs`, `O_NONBLOCK`, `_exit`, `sysconf(_SC_PAGESIZE)`
+# — was checked against a
 # live host on alpha.5 specifically.
 #
 # Note this leaves two libc crates in the tree: nix, mio, dirs-sys and

@@ -2,6 +2,7 @@
 //! app can be driven from a fixture in tests instead of the live host.
 
 pub mod cgroup;
+pub mod containers;
 pub mod control;
 pub mod diskstats;
 pub mod fds;
@@ -9,15 +10,18 @@ pub mod gpu;
 pub mod identity;
 pub mod ioprio;
 pub mod kmsg;
+pub mod kstat;
 pub mod meminfo;
 pub mod netclass;
 pub mod netns;
+pub mod netstat;
 pub mod power;
 pub mod procdetail;
 pub mod procgroup;
 pub mod psi;
 pub mod smaps;
 pub mod sockets;
+pub mod storage;
 pub mod sysinfo_source;
 
 use serde::{Deserialize, Serialize};
@@ -25,8 +29,10 @@ use serde::{Deserialize, Serialize};
 pub use crate::fleet::FleetHost;
 pub use cgroup::CgroupInfo;
 pub use gpu::GpuInfo;
+pub use kstat::{CpuModes, VmActivity};
 pub use meminfo::MemDetail;
 pub use netns::NetNamespace;
+pub use netstat::TcpHealth;
 pub use power::PowerSample;
 pub use procgroup::GroupBy;
 pub use psi::PsiSample;
@@ -145,6 +151,17 @@ pub struct ProcRow {
     /// Short container id, when the process lives in one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container: Option<String>,
+    /// Major page faults per second: pages this process had to wait for disk
+    /// or swap to supply. `None` for threads, on the first sample, and off
+    /// Linux. Which process the machine's paging is hurting, where `vm`
+    /// says only that something is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub major_faults_ps: Option<f64>,
+    /// What the container is called, where the runtime's files say —
+    /// `postgres`, or `pod/container` under Kubernetes. Display and
+    /// filtering only; `container` stays the identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
     /// The network namespace this process is in. Bytes are accounted to a
     /// namespace rather than to a process, so this is what joins a process to
     /// the traffic its container moved.
@@ -207,6 +224,11 @@ pub struct NetIface {
     pub mac: String,
     pub errors_rx: u64,
     pub errors_tx: u64,
+    /// Packets the interface or its driver dropped since boot, from sysfs.
+    /// Some background count is normal — frames for protocols nobody is
+    /// listening for — and a climbing one is a ring buffer overflowing.
+    pub drops_rx: u64,
+    pub drops_tx: u64,
     /// True for loopback, bridges, veth pairs, tunnels — excluded from the
     /// aggregate by default so VPN traffic is not counted twice.
     pub virtual_iface: bool,
@@ -367,13 +389,26 @@ pub struct Snapshot {
     pub kernel: Vec<kmsg::KernelEvent>,
     /// Why the kernel log is not being read, when it is not.
     pub kernel_unreadable: Option<String>,
+    /// Where the CPU time went — user, system, iowait, steal and the rest —
+    /// from `/proc/stat`. `None` off Linux, on the first sample of a source
+    /// with nothing to subtract, and in recordings that predate it.
+    pub cpu_time: Option<CpuModes>,
+    /// Swap traffic and major faults from `/proc/vmstat`: how hard memory is
+    /// paging, which swap *usage* cannot say.
+    pub vm: Option<VmActivity>,
+    /// Retransmits, listen-queue drops, resets and connection states for
+    /// crabmon's own network namespace — what throughput cannot show.
+    pub tcp: Option<TcpHealth>,
+    /// md arrays, ZFS pools and btrfs filesystems, worst first. Empty on a
+    /// machine with none, which is most of them.
+    pub storage: Vec<storage::StorageArray>,
     pub taken_at_unix: u64,
 }
 
 impl Snapshot {
     /// A group's own accounting, by container id or unit name.
     pub fn cgroup_named(&self, name: &str) -> Option<&cgroup::CgroupStat> {
-        self.cgroups.iter().find(|c| c.name == name)
+        self.cgroups.iter().find(|c| c.is_named(name))
     }
 
     /// The newest kernel event of a kind, which is what a panel row and an

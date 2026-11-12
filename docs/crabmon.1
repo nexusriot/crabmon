@@ -1,4 +1,4 @@
-.TH CRABMON 1 "2026-11-06" "crabmon 0.15.0" "User Commands"
+.TH CRABMON 1 "2026-11-12" "crabmon 0.16.0" "User Commands"
 .SH NAME
 crabmon \- terminal system monitor
 .SH SYNOPSIS
@@ -28,7 +28,7 @@ percentages to mean anything.
 .BR \-s ", " \-\-sort " " \fIKEY\fR
 Initial sort column: \fBpid\fR, \fBname\fR, \fBcpu\fR, \fBmem\fR, \fBvirt\fR,
 \fBdisk\fR, \fBtime\fR, \fBuser\fR, \fBstate\fR, \fBthreads\fR, \fBnice\fR,
-\fBfds\fR, \fBpss\fR or \fBgrowth\fR.
+\fBfds\fR, \fBpss\fR, \fBgrowth\fR or \fBmajflt\fR.
 .TP
 .BR \-a ", " \-\-ascending
 Sort ascending.
@@ -374,7 +374,7 @@ pid:1234           exact PID
 ppid:1             exact parent PID
 state:R            process state letter
 service:sshd       systemd unit; service:\- means "no unit"
-container:abc123   container id; container:\- means "not in one"
+container:abc123   container id or name; container:\- means "not in one"
 cmd:\-\-headless     substring of the full command line
 re:^chrom(e|ium)$  regular expression over the process name
 cpu>5              CPU percentage comparison (> >= < <= =)
@@ -412,7 +412,7 @@ Refresh interval in milliseconds, clamped to 200\-10000. Default 800.
 .B sort_by
 Sort column: \fBpid\fR, \fBname\fR, \fBcpu\fR, \fBmem\fR, \fBvirt\fR,
 \fBdisk\fR, \fBtime\fR, \fBuser\fR, \fBstate\fR, \fBthreads\fR, \fBnice\fR,
-\fBfds\fR, \fBpss\fR, \fBgrowth\fR. Default \fBcpu\fR.
+\fBfds\fR, \fBpss\fR, \fBgrowth\fR, \fBmajflt\fR. Default \fBcpu\fR.
 .TP
 .B sort_desc
 Sort descending. Default true.
@@ -534,7 +534,7 @@ is where segments go when the flag names no directory.
 .B columns
 fixes the column order instead of fitting the terminal width. Names are
 \fBmark\fR, \fBpid\fR, \fBuser\fR, \fBstate\fR, \fBcpu\fR, \fBtrend\fR,
-\fBmem\fR, \fBpss\fR, \fBgrowth\fR, \fBvirt\fR, \fBthr\fR, \fBni\fR,
+\fBmem\fR, \fBpss\fR, \fBgrowth\fR, \fBmajflt\fR, \fBvirt\fR, \fBthr\fR, \fBni\fR,
 \fBfd\fR, \fBdisk\fR, \fBtime\fR, \fBports\fR and \fBname\fR; COMMAND is always drawn last and
 unknown names are ignored. Empty (the default) fits as many as will go.
 .B pss
@@ -596,8 +596,40 @@ Each table defines one rule:
 .I kind
 is one of
 .IR cpu ", " mem ", " swap ", " load ", " disk ", " temp ", " gpu ", " psi ", "
-.IR io ", " net ", " fd ", " proc ", " trend ", " fillin ", " cgroup " or "
-.IR kernel .
+.IR io ", " net ", " fd ", " proc ", " trend ", " fillin ", " cgroup ", "
+.IR kernel ", " cputime ", " vm ", " throttle ", " oomkill ", " tcp " or " storage .
+.I storage
+counts md arrays, ZFS pools and btrfs filesystems that are degraded,
+rebuilding or failed;
+.I target
+names one (\fBmd0\fR, a pool, a btrfs label) and an empty target counts all
+of them.
+.I throttle
+is the share of CPU-quota periods a container or unit spent throttled, in
+percent;
+.I target
+names one by id, unit or container name, and an empty target takes the
+worst.
+.I oomkill
+counts OOM kills within \fIover_secs\fR (default 300): inside the named
+container or unit, or, with an empty target, on the whole machine from
+\fI/proc/vmstat\fR, which needs no root.
+.I tcp
+reads the figure its target names: \fBretrans\fR (percent of segments
+sent, the default), \fBlistendrops\fR, \fBresets\fR or \fBfailed\fR
+(per second), or \fBclosewait\fR, \fBtimewait\fR or \fBestab\fR
+(counts).
+.I cputime
+is the share of CPU time spent in the mode
+.I target
+names \(em \fBuser\fR, \fBnice\fR, \fBsystem\fR, \fBiowait\fR,
+\fBirq\fR, \fBsoftirq\fR, \fBsteal\fR or \fBidle\fR \(em in percent,
+from \fI/proc/stat\fR; an empty target is everything but idle.
+.I vm
+is the paging rate from \fI/proc/vmstat\fR: \fBswapin\fR, \fBswapout\fR
+or \fBswap\fR (both, the default) in bytes per second, or \fBmajfault\fR
+in major faults per second. Unlike \fIswap\fR, which is how much is held,
+it fires on a machine that is thrashing.
 .I cgroup
 is a container's or unit's memory against its own cgroup limit, which the
 host's gauges cannot see;

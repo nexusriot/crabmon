@@ -1918,6 +1918,19 @@ pub struct GroupRow {
     pub cgroup_mem: Option<u64>,
     pub cgroup_mem_ratio: Option<f64>,
     pub cgroup_cpu_ratio: Option<f64>,
+    /// Share of the last interval's quota periods the group was throttled in.
+    pub cgroup_throttled: Option<f64>,
+    /// OOM kills inside the group over its lifetime.
+    pub cgroup_oom_kills: Option<u64>,
+    /// What to draw instead of `name`: a container's name, where known.
+    /// `name` stays the key, so opening the group filters by id.
+    pub label: Option<String>,
+}
+
+impl GroupRow {
+    pub fn display_name(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.name)
+    }
 }
 
 /// Aggregate processes by systemd unit, container or user.
@@ -1958,8 +1971,14 @@ pub fn group_rows(rows: &[ProcRow], by: GroupBy, snap: &Snapshot) -> Vec<GroupRo
                 cgroup_mem: None,
                 cgroup_mem_ratio: None,
                 cgroup_cpu_ratio: None,
+                cgroup_throttled: None,
+                cgroup_oom_kills: None,
+                label: None,
             }
         });
+        if by == GroupBy::Container && entry.label.is_none() {
+            entry.label = p.container_name.clone();
+        }
         entry.procs += 1;
         entry.cpu += p.cpu;
         entry.mem = entry.mem.saturating_add(p.mem);
@@ -1979,6 +1998,11 @@ pub fn group_rows(rows: &[ProcRow], by: GroupBy, snap: &Snapshot) -> Vec<GroupRo
             entry.cgroup_mem = stat.mem_current;
             entry.cgroup_mem_ratio = stat.mem_ratio();
             entry.cgroup_cpu_ratio = stat.cpu_ratio();
+            entry.cgroup_throttled = stat.throttled_ratio;
+            entry.cgroup_oom_kills = stat.oom_kills;
+            if entry.label.is_none() {
+                entry.label = stat.container_name.clone();
+            }
         }
     }
     let mut out: Vec<GroupRow> = order.into_iter().filter_map(|k| acc.remove(&k)).collect();

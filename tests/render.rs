@@ -45,6 +45,26 @@ fn the_dashboard_shows_every_panel() {
 }
 
 #[test]
+fn the_cpu_title_says_where_the_time_went_and_swap_says_whether_it_is_paging() {
+    let mut a = app();
+    a.tick();
+    let s = screen(&mut a, 160, 48);
+    assert!(s.contains("usr 30.5 sys 8.0 io 2.5 irq 1.0 st 3.0"), "no CPU mode summary:\n{s}");
+    assert!(s.contains("in 512.0 KiB/s out 0 B/s"), "no swap rate:\n{s}");
+    assert!(s.contains("42 majflt/s"), "no major-fault rate:\n{s}");
+}
+
+#[test]
+fn a_source_without_cpu_modes_draws_the_old_title_rather_than_zeros() {
+    let snap = crabmon::metrics::Snapshot { cpu_time: None, vm: None, ..snapshot() };
+    let mut a = crabmon::App::new(common::config(), Box::new(FakeSource::single(snap)));
+    a.tick();
+    let s = screen(&mut a, 160, 48);
+    assert!(!s.contains("usr "), "a missing breakdown was drawn:\n{s}");
+    assert!(!s.contains("majflt"), "a missing paging rate was drawn:\n{s}");
+}
+
+#[test]
 fn memory_is_rendered_in_gibibytes_not_a_thousand_times_too_large() {
     // The bug that started the rewrite: 16 GB of RAM used to render as
     // "15292.6 GiB" because sysinfo bytes were treated as KiB.
@@ -463,6 +483,99 @@ fn the_grouped_view_shows_container_network_only_when_there_is_some() {
     assert!(s.contains("abc123def456"), "{s}");
     // 3 MiB/s across the namespace, counted once rather than once per process.
     assert!(s.contains("3.0M"), "{s}");
+}
+
+#[test]
+fn a_container_group_is_drawn_by_name_with_its_throttling_and_oom_kills() {
+    use crabmon::metrics::cgroup::CgroupStat;
+
+    let mut snap = common::snapshot();
+    for p in &mut snap.procs {
+        p.container = Some("abc123def456".into());
+        p.container_name = Some("payments-api".into());
+    }
+    snap.cgroups = vec![CgroupStat {
+        path: "/system.slice/docker-abc123def456.scope".into(),
+        name: "abc123def456".into(),
+        container: true,
+        container_name: Some("payments-api".into()),
+        mem_current: Some(400 << 20),
+        mem_max: Some(512 << 20),
+        throttled_ratio: Some(0.42),
+        oom_kills: Some(3),
+        ..Default::default()
+    }];
+    let mut a = crabmon::App::new(
+        common::config(),
+        Box::new(crabmon::record::ReplaySource::from_frames(vec![snap], "t")),
+    );
+    a.cfg.group_by = crabmon::metrics::GroupBy::Container;
+    let s = screen(&mut a, 160, 48);
+    assert!(s.contains("payments-api"), "the name, not the id:\n{s}");
+    assert!(!s.contains("abc123def456"), "the id stands behind the name:\n{s}");
+    for needle in ["THROTL", "42%", "OOM"] {
+        assert!(s.contains(needle), "{needle} missing:\n{s}");
+    }
+}
+
+#[test]
+fn a_machine_with_no_quotas_and_no_kills_gets_no_throttle_or_oom_columns() {
+    let mut a = app();
+    a.cfg.group_by = crabmon::metrics::GroupBy::Service;
+    a.tick();
+    let s = screen(&mut a, 160, 48);
+    assert!(!s.contains("THROTL") && !s.contains("OOM"), "{s}");
+}
+
+#[test]
+fn the_network_panel_says_how_tcp_is_doing_not_just_how_much_moved() {
+    let mut a = app();
+    a.tick();
+    let s = screen(&mut a, 160, 48);
+    assert!(
+        s.contains("tcp 87 est 40 tw 3 cw · retr 2.5% · drop 4.0/s · rst 0.5/s"),
+        "no TCP health line:\n{s}"
+    );
+}
+
+#[test]
+fn a_degraded_array_is_named_in_the_disks_title_and_listed_first() {
+    use crabmon::metrics::storage::{ArrayState, StorageArray};
+    let mut snap = snapshot();
+    snap.storage = vec![
+        StorageArray {
+            kind: "md".into(),
+            name: "md0".into(),
+            level: "raid1".into(),
+            state: ArrayState::Rebuilding,
+            detail: "[2/1] [U_]".into(),
+            progress: Some(12.6),
+            activity: Some("recovery".into()),
+            errors: None,
+        },
+        StorageArray {
+            kind: "zfs".into(),
+            name: "tank".into(),
+            state: ArrayState::Healthy,
+            detail: "ONLINE".into(),
+            ..Default::default()
+        },
+    ];
+    let mut a = crabmon::App::new(common::config(), Box::new(FakeSource::single(snap)));
+    a.tick();
+    let s = screen(&mut a, 160, 48);
+    assert!(s.contains("! md0 rebuilding"), "no warning in the title:\n{s}");
+    assert!(s.contains("md0 raid1 rebuilding [2/1] [U_] recovery 12.6%"), "{s}");
+    assert!(s.contains("tank zfs ok ONLINE"), "{s}");
+    assert!(!s.contains("tank ok,"), "a healthy pool is not in the warning:\n{s}");
+}
+
+#[test]
+fn a_machine_without_arrays_draws_the_disks_panel_as_before() {
+    let mut a = app();
+    a.tick();
+    let s = screen(&mut a, 160, 48);
+    assert!(!s.contains("! "), "no warning without arrays:\n{s}");
 }
 
 /// A fleet row has to answer "which machine" before anyone has picked one,

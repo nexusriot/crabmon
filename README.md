@@ -53,7 +53,12 @@ interface as drawn rather than a description of it:
 ## Features
 
 - **CPU** — average-usage history chart plus a per-core strip, and a dedicated
-  full-screen layout with one bar per core and live clock speeds.
+  full-screen layout with one bar per core and live clock speeds. The panel
+  title says where the busy time went — `usr 3.1 sys 1.2 io 0.4 st 7.2` — from
+  `/proc/stat`, because a busy percentage cannot tell you that a VPS is losing
+  a third of its time to the hypervisor (*steal*), or that a machine feeling
+  frozen with an idle CPU graph is waiting on its disks (*iowait*). Modes that
+  are idle are left out, so the one that is not stands out.
 - **Memory & swap** — usage gauges colour-coded green → yellow → red, with the
   reclaimable buffers/cache share spelled out so a scary "used" figure has its
   context. Per process, `[procs] pss` adds **PSS** — the process's private
@@ -62,7 +67,14 @@ interface as drawn rather than a description of it:
   can exceed the memory the machine has. On this machine the two differ by
   almost half. A **GROWTH** column sorts by what each process has gained over
   the window the trend charts cover, so a leak is found by pressing a key
-  rather than by writing a rule and waiting.
+  rather than by writing a rule and waiting. A **MAJFLT** column (name it in
+  `[procs] columns`, or sort with `-s majflt`) is each process's major page
+  faults per second — which process the paging is hurting — taken from the
+  `/proc/<pid>/stat` read the sampler already makes. The swap gauge carries the
+  *paging rate* — `in 0 B/s out 0 B/s` — and major faults per second, from
+  `/proc/vmstat`: 800 MB of swap holding pages untouched since boot and a
+  machine thrashing at 50 MB/s read the same on a usage gauge, and only the
+  rate tells them apart.
 - **Processes** — PID, user, state, CPU%, a CPU sparkline, RSS, virtual size,
   thread count, nice, disk IO, run time, listening ports and command, sortable on
   every column (keyboard or by clicking the header), with a tree view, a query
@@ -91,13 +103,39 @@ interface as drawn rather than a description of it:
   there.
 - **Network** — per-interface rates and totals with an RX/TX history chart.
   Loopback, bridges, veth pairs and VPN tunnels are excluded from the aggregate
-  by default so the same bytes are not counted twice.
+  by default so the same bytes are not counted twice. Under the table, a line
+  of **TCP health** — `tcp 87 est 40 tw 3 cw · retr 2.5% · drop 4.0/s ·
+  rst 0.5/s` — from the kernel's own counters: established, TIME_WAIT and
+  CLOSE_WAIT sockets, the share of segments retransmitted, connections
+  dropped at a full accept queue, and resets. Throughput cannot show any of
+  them, and a listener dropping connections looks, on a bandwidth chart,
+  exactly like a quiet afternoon. Rates appear once they are non-zero.
+  Per-interface packet drops sit beside errors in the IO layout.
 - **Per-container accounting** — each container's and unit's own cgroup is
   read directly (`memory.current`, `memory.max`, `cpu.stat`, `cpu.max`)
   rather than summed from its processes. A sum misses kernel memory, page
   cache and anything charged to the group rather than a task, and it cannot
   see the *limit* at all — so the grouped view carries a LIMIT column, and
-  `crabmon_cgroup_memory_bytes` and friends are exported.
+  `crabmon_cgroup_memory_bytes` and friends are exported. A **THROTL** column
+  is the share of CPU-quota periods the group ran out of quota in: a
+  container at 40% of its quota on average can still be stalled in a third
+  of its quota periods (a tenth of a second each, by default), which is latency no average shows. An **OOM** column
+  appears once any group has had a process OOM-killed inside it — the
+  container killed at its own limit on a host with memory to spare. Each
+  group's own pressure stall is exported too.
+- **Container names** — the grouped view, the detail pane and the filter
+  language say `postgres` rather than `3f9a1c2b4d5e`. Names come from the
+  files each runtime already writes — Docker's `config.v2.json` (root, or
+  rootless Docker under `$HOME`), Podman's `containers.json` (rootless
+  Podman's is your own, so it always resolves), and the kubelet's
+  `/var/log/containers` links, which are world-readable and give
+  `pod/container` — and, when those cannot be read, from one read-only
+  `GET /containers/json` on the Docker or Podman API socket. That is the
+  ordinary `docker` group member's case: `docker ps` works and
+  `/var/lib/docker` does not, and the socket needs exactly the access
+  `docker ps` already has. An id nothing names stays an id.
+  The id remains the identity — grouping, alert targets and exporter labels
+  key on it — and `crabmon_container_info` joins the two in Prometheus.
 - **Per-container network** — the kernel accounts bytes to a network
   namespace rather than to a PID, and every process in a container shares one,
   so the grouped view carries each container's throughput and `--serve`
@@ -111,6 +149,16 @@ interface as drawn rather than a description of it:
   out of inodes rather than bytes. Busy devices are labelled with their
   utilisation and mean request latency: an NVMe serving small random reads is
   pinned at a few MB/s, and a throughput figure draws that as very nearly idle.
+- **Storage health** — md RAID arrays, ZFS pools and btrfs filesystems lead
+  the Disks panel, worst first: `md0 raid1 rebuilding [2/1] [U_] recovery
+  12.6%`. A mirror that has lost a disk keeps serving every read and write,
+  so nothing else on the dashboard changes until the second disk goes — any
+  array that is degraded, rebuilding or failed is therefore also named in
+  the panel title, where a short panel cannot cut it off. Read from
+  `/proc/mdstat`, ZFS's per-pool `state` and btrfs's per-device
+  `error_stats` and `missing`, none of which needs root. A routine check or
+  scrub of a complete array is shown as progress, not trouble. SMART is out
+  of reach without root; block-layer IO errors are in the kernel panel.
 - **Kernel events** — OOM kills, segfaults, kernel oopses and block-IO
   errors, read from `/dev/kmsg`. The dashboard shows memory *now*, and the
   process the OOM killer chose is by definition no longer in the table, so
@@ -171,8 +219,11 @@ interface as drawn rather than a description of it:
   waits on any measurement an alert can, including `proc:nginx<1` for "it has
   stopped". Both are alert rules underneath, so a condition means the same
   thing in a script, in the config file and in the exporter.
-- **Prometheus** — `--serve :9100` runs headless and exposes CPU, memory, swap,
-  load, disks, interfaces, sensors, pressure, power and GPU, plus the busiest
+- **Prometheus** — `--serve :9100` runs headless and exposes CPU (including
+  time per mode, `crabmon_cpu_mode_percent{mode="steal"}`), memory, swap and
+  its paging rate, the kernel's OOM-kill counter, TCP health, storage
+  health (`crabmon_storage_degraded`), per-container
+  throttling, OOM kills and pressure, load, disks, interfaces, sensors, pressure, power and GPU, plus the busiest
   processes (capped, and configurable), including per-device utilisation and
   request latency and, where `[procs] fds` is on, per-process descriptor counts
   against their limits. A scrape carries every command line on the machine, so
@@ -269,7 +320,7 @@ run of stuck workers.
 | Option | Meaning |
 | --- | --- |
 | `-r`, `--refresh <MS>` | Refresh interval, 200–10000 ms |
-| `-s`, `--sort <KEY>` | `pid`, `name`, `cpu`, `mem`, `virt`, `disk`, `time`, `user`, `state`, `threads`, `nice`, `fds`, `pss`, `growth` |
+| `-s`, `--sort <KEY>` | `pid`, `name`, `cpu`, `mem`, `virt`, `disk`, `time`, `user`, `state`, `threads`, `nice`, `fds`, `pss`, `growth`, `majflt` |
 | `-a`, `--ascending` | Sort ascending |
 | `-d`, `--descending` | Sort descending (the default) |
 | `-f`, `--filter <QUERY>` | Initial process filter |
@@ -394,7 +445,7 @@ user:vlad          user name contains "vlad"
 pid:1234           exact PID          ppid:1  exact parent PID
 state:R            process state letter
 service:sshd       systemd unit; service:- means "no unit"
-container:abc123   container id; container:- means "not in one"
+container:abc123   container id or name; container:- means "not in one"
 cmd:--headless     substring of the full command line
 re:^chrom(e|ium)$  regular expression over the process name
 cpu>5              CPU comparison, with > >= < <= =
@@ -701,7 +752,7 @@ are clamped rather than rejected.
 
 ```toml
 refresh_ms = 800            # clamped to 200..=10000
-sort_by = "cpu"             # pid|name|cpu|mem|virt|disk|time|user|state|threads|nice|fds|pss|growth
+sort_by = "cpu"             # pid|name|cpu|mem|virt|disk|time|user|state|threads|nice|fds|pss|growth|majflt
 sort_desc = true
 filter = ""                 # initial filter query
 tree = false
@@ -742,7 +793,7 @@ kernel = true               # OOM kills, segfaults, oopses and block-IO
 
 [procs]
 # Fixed column order; empty means fit as many as the terminal is wide enough
-# for. Names: mark pid user state cpu trend mem pss growth virt thr ni fd disk
+# for. Names: mark pid user state cpu trend mem pss growth majflt virt thr ni fd disk
 # time ports name. COMMAND is always drawn last, and unknown names are ignored.
 columns = []
 pss = false                 # read /proc/<pid>/smaps_rollup for proportional
@@ -817,9 +868,10 @@ crit = "#ff5555"
 
 [[alert]]
 name = "cpu-saturated"
-kind = "cpu"                # cpu mem swap load disk temp gpu psi io net fd proc trend fillin cgroup kernel
-threshold = 90.0            # % for most kinds; °C for temp, B/s for net,
-                            # a count for proc and kernel, absolute for load
+kind = "cpu"                # cpu mem swap load disk temp gpu psi io net fd proc trend fillin cgroup kernel cputime vm throttle oomkill tcp storage
+threshold = 90.0            # % for most kinds; °C for temp, B/s for net and
+                            # vm (faults/s for vm:majfault), a count for proc
+                            # kernel and oomkill, absolute for load
 hysteresis = 0.0            # recovery margin in the measurement's unit
 for_secs = 30               # must hold this long before firing
 over_secs = 0               # trend rules: the window growth is measured
@@ -828,6 +880,13 @@ below = false               # fire when strictly *under* the threshold instead
 target = ""                 # mount point, sensor prefix, GPU or interface
                             # name, psi resource (cpu|mem|io[.full]), a
                             # kernel event (oom|segfault|io-error|oops), a
+                            # cpu mode for cputime (user|system|iowait|steal|
+                            # irq|softirq|nice|idle; empty = not idle), a vm
+                            # series (swap|swapin|swapout|majfault), a
+                            # container (id or name) or unit for cgroup,
+                            # throttle and oomkill, a tcp figure (retrans|
+                            # listendrops|resets|failed|closewait|timewait|
+                            # estab), an array or pool for storage, a
                             # process name for fd rules, or — for a trend
                             # rule with a query — which series of those
                             # processes to follow: rss (default)|cpu|io
@@ -851,6 +910,70 @@ below = true
 for_secs = 10               # ...and it stayed gone, rather than restarting
 command = "notify-send 'nginx is gone'"
 command_clear = "notify-send 'nginx is back'"
+```
+
+`kind = "cputime"` and `kind = "vm"` watch what `cpu` and `swap` cannot: the
+share of time in one CPU mode, and the paging *rate*. The first pair below is
+the VPS whose provider is overselling it; the second is a machine that is
+thrashing rather than merely holding swap:
+
+```toml
+[[alert]]
+name = "noisy-neighbour"
+kind = "cputime"
+target = "steal"
+threshold = 20.0            # % of all CPU time handed to other guests
+for_secs = 120
+
+[[alert]]
+name = "thrashing"
+kind = "vm"
+target = "swapin"           # or swapout, swap (both), majfault (per second)
+threshold = 1.0e7           # bytes per second read back from swap
+for_secs = 30
+```
+
+`kind = "throttle"`, `kind = "oomkill"` and `kind = "tcp"` are the
+container and network questions: a service stalled by its own CPU quota, a
+container killed at its own memory limit, and a listener refusing
+connections. `oomkill` counts kills inside its `over_secs` window, so it
+fires on a kill and clears once the window has passed it; with no target it
+counts the whole machine from the kernel's counter, which, unlike
+`kind = "kernel"`, needs no root:
+
+```toml
+[[alert]]
+name = "api-throttled"
+kind = "throttle"
+target = "payments-api"     # container name or id, or a unit; empty = worst
+threshold = 25.0            # % of quota periods spent throttled
+for_secs = 60
+
+[[alert]]
+name = "api-oom"
+kind = "oomkill"
+target = "payments-api"
+threshold = 1
+over_secs = 600             # any kill in the last ten minutes
+
+[[alert]]
+name = "accept-queue-full"
+kind = "tcp"
+target = "listendrops"      # connections dropped at a listener, per second
+threshold = 1
+```
+
+`kind = "storage"` counts md arrays, ZFS pools and btrfs filesystems that are
+degraded, rebuilding or failed — the one failure that leaves every other
+gauge looking fine:
+
+```toml
+[[alert]]
+name = "raid-degraded"
+kind = "storage"
+target = ""                 # md0, a pool or btrfs label; empty = any
+threshold = 1
+command = "page-oncall"
 ```
 
 `kind = "trend"` measures a *slope* rather than a level, which is the shape a
