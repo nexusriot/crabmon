@@ -125,6 +125,25 @@ pub fn render_freshness(age: Option<f64>, reachable: bool) -> String {
     out
 }
 
+/// What a fleet exports for a host that has never delivered a frame: that it
+/// is not up, and nothing else.
+///
+/// Its snapshot is a default one, all zeros, and rendering that exported a
+/// machine with no memory, no load, no OOM kills and no failed services —
+/// every one of them an answer to a question nobody had asked it. An absent
+/// series is what Prometheus means by "unknown"; `up` already says why.
+pub fn render_never_sampled() -> String {
+    let mut out = String::new();
+    metric(
+        &mut out,
+        "up",
+        "1 when this host's metrics are a live sample of it.",
+        "gauge",
+        &plain(0.0),
+    );
+    out
+}
+
 /// Escape a Prometheus label value.
 pub fn escape_label(value: &str) -> String {
     value.replace('\\', r"\\").replace('"', "\\\"").replace('\n', r"\n")
@@ -486,6 +505,55 @@ pub fn render_host(
             .filter_map(|a| a.errors.map(|e| (arr(a), e as f64)))
             .collect::<Vec<_>>(),
     );
+
+    // systemd units. The two counts are always exported where systemd was
+    // read — zero is the healthy answer — and never where it was not, which
+    // would claim the machine is healthy. Per unit, only those with something
+    // to say: the snapshot already leaves out the hundred that have not.
+    if snap.units_unreadable.is_none() {
+        use crate::metrics::units::UnitState;
+        metric(
+            &mut out,
+            "systemd_units_failed",
+            "systemd services in the failed state.",
+            "gauge",
+            &[(String::new(), snap.units_in(UnitState::Failed) as f64)],
+        );
+        metric(
+            &mut out,
+            "systemd_units_crashlooping",
+            "systemd services restarting in a loop ([units] crash_loop restarts within window_secs).",
+            "gauge",
+            &[(String::new(), snap.units_in(UnitState::CrashLoop) as f64)],
+        );
+        let unit =
+            |u: &crate::metrics::units::UnitHealth| format!("unit=\"{}\"", escape_label(&u.name));
+        metric(
+            &mut out,
+            "systemd_unit_restarts_total",
+            "Automatic restarts since the unit was last started by hand (NRestarts).",
+            "counter",
+            &snap.units.iter().map(|u| (unit(u), u.restarts as f64)).collect::<Vec<_>>(),
+        );
+        metric(
+            &mut out,
+            "systemd_unit_state",
+            "1 for the state crabmon puts a unit in: failed, crashloop or restarting.",
+            "gauge",
+            &snap
+                .units
+                .iter()
+                .filter(|u| u.state != UnitState::Ok)
+                .map(|u| {
+                    let state = serde_json::to_value(u.state)
+                        .ok()
+                        .and_then(|v| v.as_str().map(String::from))
+                        .unwrap_or_default();
+                    (format!("{},state=\"{state}\"", unit(u)), 1.0)
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
 
     // Kernel events as a gauge per kind: `crabmon_kernel_events{kind="oom"}`
     // is the shape that makes "page me if anything was OOM-killed" a
@@ -1315,6 +1383,24 @@ pub fn unix_socket_path(addr: &str) -> Option<&str> {
     (addr.starts_with('/') || addr.starts_with("./")).then_some(addr)
 }
 
+/// A socket path the kernel refuses for its length says so with "path must
+/// be shorter than SUN_LEN", which names neither the path nor the limit.
+#[cfg(unix)]
+fn unix_bind_error(path: &str, e: std::io::Error) -> std::io::Error {
+    // `sun_path` is 108 bytes on Linux and 104 on the BSDs, NUL included.
+    const LIMIT: usize = if cfg!(target_os = "linux") { 107 } else { 103 };
+    if path.len() > LIMIT {
+        return std::io::Error::new(
+            e.kind(),
+            format!(
+                "unix socket path is {} bytes, longer than the {LIMIT} a socket address holds: {path}",
+                path.len()
+            ),
+        );
+    }
+    std::io::Error::new(e.kind(), format!("{path}: {e}"))
+}
+
 /// Serve over a Unix socket: no port, no network, and the filesystem does
 /// the access control.
 #[cfg(unix)]
@@ -1333,7 +1419,7 @@ fn serve_unix(
     {
         let _ = std::fs::remove_file(path);
     }
-    let listener = UnixListener::bind(path)?;
+    let listener = UnixListener::bind(path).map_err(|e| unix_bind_error(path, e))?;
     // Not the umask's business: a scrape carries every command line on the
     // machine, and a permissive umask would hand that to everyone.
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660));
@@ -1456,6 +1542,20 @@ mod tests {
 
     /// `crabmon_up{host="db-1"} 1` for a machine nobody can reach reads as
     /// "db-1 is fine", which is the opposite of what happened.
+    /// A host that has never answered exported a full set of zeros — no
+    /// memory, no failed units, no OOM kills — with only `up` to say none of
+    /// it was measured. Found against a real unreachable host.
+    #[test]
+    fn a_host_that_never_answered_exports_up_and_nothing_else() {
+        let text = merge_hosts(&[
+            ("db-9".into(), render_never_sampled()),
+            ("web-1".into(), render(&snap(), 0)),
+        ]);
+        let db9: Vec<&str> = text.lines().filter(|l| l.contains("host=\"db-9\"")).collect();
+        assert_eq!(db9, ["crabmon_up{host=\"db-9\"} 0"], "{text}");
+        assert_eq!(text.matches("# HELP crabmon_up ").count(), 1, "one family, both hosts");
+    }
+
     #[test]
     fn an_unreachable_host_in_a_fleet_is_not_up() {
         let down = render_host(&Snapshot::default(), 0, &[], false);
@@ -1803,6 +1903,35 @@ mod tests {
     }
 
     #[test]
+    fn unit_health_is_exported_and_absent_where_systemd_was_not_read() {
+        use crate::metrics::units::{UnitHealth, UnitState};
+        let mut s = snap();
+        s.units = vec![
+            UnitHealth {
+                name: "api.service".into(),
+                restarts: 9,
+                state: UnitState::CrashLoop,
+                ..Default::default()
+            },
+            UnitHealth { name: "old.service".into(), restarts: 2, ..Default::default() },
+        ];
+        let text = render(&s, 0);
+        for line in [
+            "crabmon_systemd_units_failed 0",
+            "crabmon_systemd_units_crashlooping 1",
+            "crabmon_systemd_unit_restarts_total{unit=\"api.service\"} 9",
+            "crabmon_systemd_unit_restarts_total{unit=\"old.service\"} 2",
+            "crabmon_systemd_unit_state{unit=\"api.service\",state=\"crashloop\"} 1",
+        ] {
+            assert!(text.contains(line), "{line} missing:\n{text}");
+        }
+        assert!(!text.contains("unit_state{unit=\"old.service\""), "a healthy unit has no state");
+
+        s.units_unreadable = Some("no systemd".into());
+        assert!(!render(&s, 0).contains("crabmon_systemd_"), "unread is not healthy");
+    }
+
+    #[test]
     fn storage_health_is_exported_per_array() {
         let mut s = snap();
         s.storage = crate::metrics::storage::parse_mdstat(
@@ -1944,6 +2073,18 @@ mod tests {
     #[test]
     fn an_address_says_whether_it_is_a_socket_or_a_port() {
         assert_eq!(unix_socket_path("unix:/run/crabmon.sock"), Some("/run/crabmon.sock"));
+        // Found with a long scratch directory: the kernel's own message names
+        // neither the path nor the limit.
+        #[cfg(unix)]
+        {
+            let long = format!("/tmp/{}/m.sock", "d".repeat(120));
+            let e =
+                unix_bind_error(&long, std::io::Error::other("path must be shorter than SUN_LEN"));
+            assert!(
+                e.to_string().contains("longer than the") && e.to_string().contains(&long),
+                "{e}"
+            );
+        }
         assert_eq!(unix_socket_path("/run/crabmon.sock"), Some("/run/crabmon.sock"));
         assert_eq!(unix_socket_path("./crabmon.sock"), Some("./crabmon.sock"));
         assert_eq!(unix_socket_path(":9100"), None);

@@ -14,7 +14,7 @@ use super::procgroup::CgroupPaths;
 use super::{
     CpuSample, DiskRow, GpuInfo, HostInfo, MemSample, MetricSource, NetIface, ProcRow, Sensor,
     Snapshot, cgroup, containers, fds, gpu, identity, kmsg, kstat, meminfo, netclass, netns,
-    netstat, power, procgroup, psi, rate, smaps, storage,
+    netstat, power, procgroup, psi, rate, smaps, storage, units,
 };
 
 /// Device lists (mounted filesystems, interfaces, sensors) are rescanned on this
@@ -78,7 +78,9 @@ pub struct SysinfoSource {
     container_names: containers::ContainerNames,
 
     virtual_prefixes: Vec<String>,
-    use_nvidia_smi: bool,
+    nvidia_smi: Option<gpu::NvidiaSmi>,
+    /// `systemctl show`, on its own thread, when `[units]` is on.
+    units: Option<units::UnitWatcher>,
     /// Count each process's open descriptors. Off by default: it is a
     /// `getdents` sweep per process per sample.
     count_fds: bool,
@@ -240,7 +242,8 @@ impl SysinfoSource {
             prev_cgroup_usage: HashMap::new(),
             container_names: containers::ContainerNames::default(),
             virtual_prefixes,
-            use_nvidia_smi,
+            nvidia_smi: use_nvidia_smi.then(gpu::NvidiaSmi::spawn),
+            units: None,
             count_fds: false,
             read_pss: false,
             host,
@@ -251,6 +254,15 @@ impl SysinfoSource {
 
     /// Ask for the FD column's data. A builder rather than a constructor
     /// argument so every existing caller keeps the cheap behaviour.
+    /// Watch systemd units for failures and restart loops. Linux only: there
+    /// is no systemd anywhere else.
+    pub fn with_units(mut self, settings: Option<units::UnitSettings>) -> SysinfoSource {
+        if cfg!(target_os = "linux") {
+            self.units = settings.map(units::UnitWatcher::spawn);
+        }
+        self
+    }
+
     pub fn with_pss(mut self, read_pss: bool) -> SysinfoSource {
         self.read_pss = read_pss;
         self
@@ -647,7 +659,7 @@ impl SysinfoSource {
     }
 
     fn collect_gpus(&self) -> Vec<GpuInfo> {
-        gpu::read_all(self.use_nvidia_smi)
+        gpu::read_all(self.nvidia_smi.as_ref())
     }
 }
 
@@ -696,6 +708,16 @@ impl MetricSource for SysinfoSource {
         let mut cgroups = self.collect_cgroups(secs);
         self.name_containers(&mut procs, &mut cgroups);
 
+        // Not watched is said as such, so a `unit` rule stays quiet and the
+        // exporter leaves the series out rather than reporting zero failures
+        // about units nobody looked at.
+        let units_now = match &self.units {
+            Some(w) => w.latest(),
+            None if cfg!(target_os = "linux") => {
+                (Vec::new(), Some("[units] enabled is off".into()))
+            }
+            None => (Vec::new(), Some("systemd is Linux-only".into())),
+        };
         Snapshot {
             host,
             cpu,
@@ -716,6 +738,8 @@ impl MetricSource for SysinfoSource {
             vm,
             tcp,
             storage: storage::read(),
+            units: units_now.0,
+            units_unreadable: units_now.1,
             taken_at_unix: now_unix(),
         }
     }

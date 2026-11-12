@@ -19,6 +19,7 @@ pub mod format;
 pub mod history;
 pub mod incident;
 pub mod metrics;
+pub mod notify;
 pub mod record;
 pub mod remote;
 pub mod sampler;

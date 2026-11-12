@@ -576,6 +576,11 @@ fn gitignore_covers_the_files_crabmon_writes_into_the_working_directory() {
     }
 
     // The audit log, when pointed somewhere relative.
+    // ...and the generation it rotates to, named by the code that rotates it.
+    let rotated = crabmon::audit::rotated_path(std::path::Path::new("actions.log"));
+    if git_ignores(&rotated.display().to_string()) == Some(false) {
+        panic!("the rotated action log ({}) would be committed", rotated.display());
+    }
     if git_ignores("actions.log") == Some(false) {
         panic!("the action log would be committed");
     }

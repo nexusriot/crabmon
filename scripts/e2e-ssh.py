@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Opt-in real-host checks. Run with --target user@host and --binary path.
 Only creates a private remote /tmp directory and temporary test processes.
+--units additionally needs root on the target: it starts transient systemd
+units (stopped and reset afterwards) to check failure and crash-loop
+detection end to end.
 """
 import argparse
 import json
@@ -77,16 +80,89 @@ finally:
 '''
 
 
+UNITS_TEST = r'''
+import json, pathlib, subprocess, sys, time
+root = pathlib.Path(sys.argv[1])
+binary = str(root / "crabmon")
+tag = sys.argv[2]
+loop, fail = "cm-e2e-loop-" + tag, "cm-e2e-fail-" + tag
+
+def run(*args, **kw):
+    return subprocess.run(list(args), check=True, text=True, capture_output=True, **kw).stdout
+
+try:
+    run("systemd-run", "--quiet", "--unit=" + loop, "-p", "Restart=always", "-p", "RestartSec=1",
+        "-p", "StartLimitIntervalSec=0", "/bin/sh", "-c", "sleep 0.2; exit 1")
+    run("systemd-run", "--quiet", "--unit=" + fail, "/bin/sh", "-c", "exit 3")
+    time.sleep(2)
+    units = {u["name"]: u for u in json.loads(run(binary, "--once"))["units"]}
+    assert units[fail + ".service"]["state"] == "failed", units
+    assert units[fail + ".service"]["exit_status"] == 3, units
+    assert units[loop + ".service"]["state"] in ("restarting", "crashloop"), units
+    # The loop is promoted once crabmon has watched it restart three times.
+    out = subprocess.run([binary, "--watch-rule", "unit:crashloop:" + loop + ">=1",
+                          "--watch-timeout", "60", "--format", "text"],
+                         text=True, capture_output=True, timeout=90)
+    assert out.returncode == 1, "crash loop never detected: " + out.stdout + out.stderr
+    # A unit alert names the units it is about, and recovers when they do.
+    hooks = root / "unit-hooks"
+    cfg = root / "units.toml"
+    cfg.write_text('refresh_ms=500\n[[alert]]\nname="failed"\nkind="unit"\ntarget="failed"\nquery=' + json.dumps(fail)
+        + '\nthreshold=1\ncommand=' + json.dumps('echo "$CRABMON_STATE|$CRABMON_MESSAGE" >> ' + str(hooks))
+        + '\ncommand_clear=' + json.dumps('echo "$CRABMON_STATE|$CRABMON_MESSAGE" >> ' + str(hooks)) + '\n')
+    stream = subprocess.Popen([binary, "--stream", "--alerts", "--config", str(cfg)],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        end = time.monotonic() + 30
+        while time.monotonic() < end and not (hooks.exists() and "firing" in hooks.read_text()):
+            time.sleep(.2)
+        assert fail in hooks.read_text(), "the firing hook does not name the unit"
+        run("systemctl", "reset-failed", fail + ".service")
+        end = time.monotonic() + 30
+        while time.monotonic() < end and "cleared" not in hooks.read_text():
+            time.sleep(.2)
+        assert "cleared" in hooks.read_text(), "no recovery once the unit was reset"
+    finally:
+        stream.terminate(); stream.wait(timeout=5)
+    # An OOM kill at a unit's own MemoryMax: the unit is failed with the
+    # reason, `oomkill:<unit>` counts it although the cgroup is gone by the
+    # next sample, and the kernel log yields one kill, not a kill and an oops.
+    oom = "cm-e2e-oom-" + tag
+    seqs = {e["seq"] for e in json.loads(run(binary, "--once"))["kernel"]}
+    run("systemd-run", "--quiet", "--unit=" + oom, "-p", "MemoryMax=30M", "-p", "MemorySwapMax=0",
+        "python3", "-c", "a = bytearray(200 << 20)")
+    end = time.monotonic() + 20
+    while time.monotonic() < end and "failed" not in run("systemctl", "show", "-p", "ActiveState", oom + ".service"):
+        time.sleep(.2)
+    snap = json.loads(run(binary, "--once"))
+    unit = next(u for u in snap["units"] if u["name"] == oom + ".service")
+    assert (unit["state"], unit["result"]) == ("failed", "oom-kill"), unit
+    out = subprocess.run([binary, "--watch-rule", "oomkill:" + oom + ">=1", "--watch-timeout", "10"],
+                         text=True, capture_output=True, timeout=30)
+    assert out.returncode == 1, "oomkill:<unit> missed the kill: " + out.stdout + out.stderr
+    if snap.get("kernel_unreadable") is None:
+        new = [e for e in snap["kernel"] if e["seq"] not in seqs]
+        assert [e["kind"] for e in new] == ["oomkill"], new
+    print(json.dumps({"units": "passed", "checks": ["failed", "exit-status", "crash-loop", "named-in-alert", "recovery", "oom-kill"]}))
+finally:
+    for unit in (loop, fail, "cm-e2e-oom-" + tag):
+        subprocess.run(["systemctl", "stop", unit + ".service"], capture_output=True)
+        subprocess.run(["systemctl", "reset-failed", unit + ".service"], capture_output=True)
+'''
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", required=True)
     parser.add_argument("--binary", type=Path, default=Path("target/release/crabmon"))
+    parser.add_argument("--units", action="store_true",
+                        help="also check systemd unit detection (needs root on the target)")
     args = parser.parse_args()
     ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", args.target]
 
     def remote(command, data=None):
         result = subprocess.run(ssh + [command], input=data, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, timeout=90)
+                                stderr=subprocess.PIPE, timeout=180)
         if result.returncode:
             raise RuntimeError("remote check failed: " + result.stderr.decode(errors="replace"))
         return result.stdout
@@ -98,6 +174,11 @@ def main():
         remote("chmod 700 " + shlex.quote(root + "/crabmon"))
         remote("cat > " + shlex.quote(root + "/test.py"), REMOTE_TEST.encode())
         print(remote("python3 " + shlex.quote(root + "/test.py") + " " + shlex.quote(root)).decode().strip())
+        if args.units:
+            remote("cat > " + shlex.quote(root + "/units.py"), UNITS_TEST.encode())
+            tag = root.rsplit(".", 1)[-1].lower()
+            print(remote("python3 " + shlex.quote(root + "/units.py") + " " + shlex.quote(root)
+                         + " " + shlex.quote(tag)).decode().strip())
         with tempfile.TemporaryDirectory(prefix="crabmon-ssh-") as local:
             cfg = Path(local) / "config.toml"
             cfg.write_text('refresh_ms=200\n')
@@ -141,6 +222,27 @@ def main():
                 remote("rm " + shlex.quote(root + "/failed"))
                 wait_metric("up", 1)
                 print(json.dumps({"ssh_collector": "passed", "checks": ["custom-command", "sample-age", "stalled-host", "failed-host", "recovery"]}))
+
+            # A host that has never answered exports that it is not up, and
+            # no zeros dressed as measurements: it once claimed no memory, no
+            # load and no failed services.
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                port = sock.getsockname()[1]
+            addr = "127.0.0.1:" + str(port)
+            never = subprocess.Popen([str(args.binary.resolve()), "--serve", addr,
+                "--remote", args.target, "--remote-command", "false", "--config", str(cfg)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                time.sleep(6)
+                body = scrape()
+                series = sorted({line.split("{")[0] for line in body.splitlines()
+                                 if line.startswith("crabmon_")})
+                assert series == ["crabmon_sample_stale", "crabmon_up"], series
+                assert value(body, "up") == 0, body
+            finally:
+                never.terminate(); never.wait(timeout=10)
+            print(json.dumps({"never_sampled": "passed", "checks": ["up-only"]}))
     finally:
         if exporter is not None:
             exporter.terminate()

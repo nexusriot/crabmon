@@ -55,6 +55,12 @@ fn main() -> Result<()> {
     if args.doctor {
         return print_doctor(&cfg, &args);
     }
+    // A notification target that cannot deliver is refused here, by name,
+    // rather than discovered by the alert it failed to send.
+    if let Err(e) = crabmon::notify::validate(&cfg.notify) {
+        eprintln!("crabmon: {}: {e}", path.display());
+        std::process::exit(2);
+    }
     // The headless modes. `cli::parse` refuses to combine any of them with
     // `--remote` or `--replay`, so each one here samples this host.
     if let Some((a, b)) = &args.diff {
@@ -103,7 +109,8 @@ fn live_source(cfg: &Config) -> Result<SysinfoSource> {
         cfg.gpu.enabled && cfg.gpu.nvidia_smi,
     )?
     .with_fds(cfg.procs.fds)
-    .with_pss(cfg.procs.pss))
+    .with_pss(cfg.procs.pss)
+    .with_units(cfg.units.settings()))
 }
 
 /// Where snapshots come from: a recording, another host, or this one.
@@ -119,12 +126,14 @@ fn build_source(cfg: &Config, args: &Args) -> Result<Box<dyn MetricSource>> {
         return Ok(Box::new(source));
     }
     if let Some(spec) = &args.remote {
-        let targets = crabmon::fleet::parse_targets(spec);
+        let targets = crabmon::fleet::expand_targets(spec, &cfg.fleet_groups)
+            .map_err(|e| anyhow::anyhow!("--remote: {e}"))?;
+        let ssh = ssh_options(cfg, args)?;
         let one = |target: &str| -> Box<dyn MetricSource> {
             let remote = match (&args.remote_command, cfg.remote.stream) {
-                (Some(_), _) => RemoteSource::new(target, args.remote_command.clone(), Vec::new()),
-                (None, true) => RemoteSource::streaming(target, cfg.refresh_ms, Vec::new()),
-                (None, false) => RemoteSource::new(target, None, Vec::new()),
+                (Some(_), _) => RemoteSource::new(target, args.remote_command.clone(), ssh.clone()),
+                (None, true) => RemoteSource::streaming(target, cfg.refresh_ms, ssh.clone()),
+                (None, false) => RemoteSource::new(target, None, ssh.clone()),
             };
             Box::new(ThreadedSource::new(Box::new(remote)))
         };
@@ -148,6 +157,15 @@ fn build_source(cfg: &Config, args: &Args) -> Result<Box<dyn MetricSource>> {
 ///
 /// stderr because `--stream`'s stdout is a frame per line that something else
 /// is parsing, and the same call serves every headless mode.
+/// `--ssh-option` then `[remote] ssh_options`, as `ssh` arguments: ssh keeps
+/// the first value it gets, so the command line overrides the config. A config
+/// entry that is not an option fails here, naming the setting, rather than
+/// as an `ssh` usage message on every connection attempt.
+fn ssh_options(cfg: &Config, args: &Args) -> Result<Vec<String>> {
+    crabmon::remote::ssh_option_args(args.ssh_options.iter().chain(&cfg.remote.ssh_options))
+        .map_err(|e| anyhow::anyhow!("[remote] ssh_options: {e}"))
+}
+
 fn open_recordings(cfg: &Config, args: &Args) -> Result<crabmon::record::Recordings> {
     let recordings = crabmon::record::Recordings::open(
         args.record.as_deref(),
@@ -190,7 +208,7 @@ fn stream_frames(cfg: &Config, args: &Args) -> Result<()> {
             eprintln!("crabmon: {note}");
         }
         if let Some(sup) = sup.as_mut() {
-            report(sup.observe(&snap));
+            report(sup.observe(&snap), &cfg.notify);
         }
         let safe = export::redact_commands(&snap, cfg.export.redact_commands);
         let line = serde_json::to_string(&safe)?;
@@ -248,6 +266,7 @@ fn print_diff(a: &str, b: Option<&str>, args: &Args) -> Result<()> {
     let diff = crabmon::diff::compare(&before, &after);
     let text = match args.format {
         Some(export::ExportFormat::Json) => diff.to_json(),
+        Some(export::ExportFormat::Csv) => diff.to_csv(),
         _ => diff.to_text(),
     };
     print!("{text}");
@@ -277,7 +296,13 @@ fn watch_for(rule: crabmon::alerts::AlertRule, cfg: &Config, args: &Args) -> Res
     let interval = crabmon::watch::interval(cfg.refresh_ms);
 
     let mut source = live_source(cfg)?;
-    source.snapshot(Duration::ZERO);
+    let first = source.snapshot(Duration::ZERO);
+    // A rule about a filesystem crabmon does not measure measures nothing,
+    // and a watch on nothing timed out with exit 0 — "it never filled" —
+    // about a tmpfs nobody was reading. Found on a real host.
+    if let Some(e) = crabmon::watch::unmeasured_mount(&rule, &first) {
+        fail_watch(&e);
+    }
     let started = Instant::now();
     let mut pacer = Pacer::new(interval);
     let mut engine = crabmon::alerts::AlertEngine::new(vec![rule]);
@@ -287,7 +312,7 @@ fn watch_for(rule: crabmon::alerts::AlertRule, cfg: &Config, args: &Args) -> Res
     // leaves the minutes before the stall on disk.
     let mut recordings = open_recordings(cfg, args)?;
 
-    let (outcome, fired) = loop {
+    let (outcome, fired, last) = loop {
         let dt = pacer.wait();
         let snap = source.snapshot(dt);
         for note in recordings.write(&snap) {
@@ -302,10 +327,10 @@ fn watch_for(rule: crabmon::alerts::AlertRule, cfg: &Config, args: &Args) -> Res
                 Some(f) => snap.procs.iter().filter(|p| f.matches(p)).cloned().collect(),
                 None => Vec::new(),
             };
-            break (crabmon::watch::Outcome::Matched(rows), Some(alert));
+            break (crabmon::watch::Outcome::Matched(rows), Some(alert), snap);
         }
         if crabmon::watch::timed_out(started, timeout, now) {
-            break (crabmon::watch::Outcome::TimedOut, None);
+            break (crabmon::watch::Outcome::TimedOut, None, snap);
         }
     };
 
@@ -322,7 +347,10 @@ fn watch_for(rule: crabmon::alerts::AlertRule, cfg: &Config, args: &Args) -> Res
         // the condition that actually fired.
         let text = match (rows.is_empty(), &fired) {
             (false, _) => {
-                let snap = crabmon::Snapshot { procs: rows.clone(), ..Default::default() };
+                // The machine as it was when the rule fired, with only the
+                // processes that matched: a default snapshot around the rows
+                // printed `localhost up 00:00 … mem 0 B / 0 B` above them.
+                let snap = crabmon::Snapshot { procs: rows.clone(), ..last };
                 export::render(&export::redact_commands(&snap, cfg.export.redact_commands), format)
             }
             (true, Some(alert)) => match format {
@@ -393,6 +421,7 @@ fn serve_metrics(addr: &str, cfg: &Config, args: &Args) -> Result<()> {
     }
     // `serve` measures the gap between scrapes and hands it over; the rates are
     // deltas over that interval, not over the configured refresh.
+    let notify = cfg.notify.clone();
     crabmon::serve::serve_rendered(addr, cfg.serve_token(), move |elapsed| {
         let snap = source.snapshot(elapsed);
         for note in recordings.write(&snap) {
@@ -401,7 +430,7 @@ fn serve_metrics(addr: &str, cfg: &Config, args: &Args) -> Result<()> {
         let states = match sup.as_mut() {
             None => Vec::new(),
             Some(sup) => {
-                report(sup.observe(&snap));
+                report(sup.observe(&snap), &notify);
                 sup.alerts.states(&snap)
             }
         };
@@ -420,10 +449,12 @@ fn serve_metrics(addr: &str, cfg: &Config, args: &Args) -> Result<()> {
 /// between them and page about whichever host sampled last.
 fn serve_fleet(addr: &str, cfg: &Config, args: &Args, spec: &str) -> Result<()> {
     let alerts = args.alerts;
-    let targets = crabmon::fleet::parse_targets(spec);
+    let targets = crabmon::fleet::expand_targets(spec, &cfg.fleet_groups)
+        .map_err(|e| anyhow::anyhow!("--remote: {e}"))?;
     if targets.is_empty() {
         return Err(anyhow::anyhow!("--remote names no hosts"));
     }
+    let ssh = ssh_options(cfg, args)?;
     let top = cfg.serve.top_procs;
     eprintln!("crabmon: exporting {} hosts: {}", targets.len(), targets.join(", "));
     if alerts {
@@ -446,9 +477,9 @@ fn serve_fleet(addr: &str, cfg: &Config, args: &Args, spec: &str) -> Result<()> 
     let mut hosts: Vec<Host> = Vec::with_capacity(targets.len());
     for (target, label) in targets.iter().zip(&labels) {
         let remote = match (&args.remote_command, cfg.remote.stream) {
-            (Some(_), _) => RemoteSource::new(target, args.remote_command.clone(), Vec::new()),
-            (None, true) => RemoteSource::streaming(target, cfg.refresh_ms, Vec::new()),
-            (None, false) => RemoteSource::new(target, None, Vec::new()),
+            (Some(_), _) => RemoteSource::new(target, args.remote_command.clone(), ssh.clone()),
+            (None, true) => RemoteSource::streaming(target, cfg.refresh_ms, ssh.clone()),
+            (None, false) => RemoteSource::new(target, None, ssh.clone()),
         };
         let recordings = crabmon::record::Recordings::for_host(
             args.record.as_deref(),
@@ -469,6 +500,7 @@ fn serve_fleet(addr: &str, cfg: &Config, args: &Args, spec: &str) -> Result<()> 
         });
     }
 
+    let notify = cfg.notify.clone();
     crabmon::serve::serve_rendered(addr, cfg.serve_token(), move |elapsed| {
         let parts: Vec<(String, String)> = hosts
             .iter_mut()
@@ -494,18 +526,20 @@ fn serve_fleet(addr: &str, cfg: &Config, args: &Args, spec: &str) -> Result<()> 
                     None => Vec::new(),
                     Some(sup) => {
                         if fresh {
-                            report(sup.observe(&snap));
+                            report(sup.observe(&snap), &notify);
                         }
                         if reachable { sup.alerts.states(&snap) } else { Vec::new() }
                     }
                 };
                 // A host that cannot be reached is not up, whatever its
-                // last good frame still says.
-                let mut rendered = crabmon::serve::render_host(&snap, top, &states, reachable);
-                rendered.push_str(&crabmon::serve::render_freshness(
-                    host.freshness.sample_age(Instant::now()),
-                    reachable,
-                ));
+                // last good frame still says; one that has never answered has
+                // no frame at all, only zeros, and exports none of them.
+                let age = host.freshness.sample_age(Instant::now());
+                let mut rendered = match age {
+                    None => crabmon::serve::render_never_sampled(),
+                    Some(_) => crabmon::serve::render_host(&snap, top, &states, reachable),
+                };
+                rendered.push_str(&crabmon::serve::render_freshness(age, reachable));
                 (host.name.clone(), rendered)
             })
             .collect();
@@ -529,7 +563,7 @@ struct Host {
 /// stderr, not stdout: `--stream`'s stdout is a frame per line that something
 /// else is parsing, and a recording notice in the middle of it would break the
 /// reader on the far end of an SSH pipe.
-fn report(obs: crabmon::supervisor::Observation) {
+fn report(obs: crabmon::supervisor::Observation, notify: &[crabmon::notify::NotifyTarget]) {
     for note in obs.notes {
         eprintln!("crabmon: {note}");
     }
@@ -537,6 +571,9 @@ fn report(obs: crabmon::supervisor::Observation) {
         eprintln!("crabmon: {name}");
     }
     for err in supervisor::spawn_hooks(&obs.commands) {
+        eprintln!("crabmon: {err}");
+    }
+    for err in crabmon::notify::send(notify, &obs.notices) {
         eprintln!("crabmon: {err}");
     }
 }
@@ -667,6 +704,9 @@ fn run_tui(
         app.set_status("config could not be parsed; defaults in use and not saving");
     }
     app.audit_path = audit_path(&app.cfg);
+    if let Some(path) = &args.replay {
+        app.scan_replay(std::path::PathBuf::from(path));
+    }
 
     // The same resolution every headless mode does, through the same type:
     // an explicit `--record` file, plus a rotating set from

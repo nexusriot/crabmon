@@ -61,7 +61,8 @@ src/
   doctor.rs          what this host lets crabmon measure, for `--doctor`
   watch.rs           the headless wait-for-a-condition mode
   supervisor.rs      alert rules and the flight recorder, outside the TUI
-  fleet.rs           several hosts behind one metric source
+  fleet.rs           several hosts behind one metric source, host groups, sorting
+  notify.rs          `[[notify]]`: alert transitions posted via curl
   serve.rs           the Prometheus exporter
   incident.rs        the readable summary written beside a flight dump
   audit.rs           the local log of actions taken
@@ -78,6 +79,7 @@ src/
     netstat.rs       TCP health from /proc/net/snmp, netstat and sockstat
     containers.rs    container names from the runtimes' own files
     storage.rs       md RAID, ZFS pool and btrfs device health
+    units.rs         systemd failures and restart loops, via `systemctl show`
     power.rs         batteries, mains and RAPL
     smaps.rs         proportional and unique memory per process
     kmsg.rs          OOM kills, crashes and IO errors from /dev/kmsg
@@ -186,8 +188,9 @@ Two details matter:
 | `IoPriority` | `I` | IO class and level prompt |
 | `Detail` | `Enter` | process detail |
 | `Help` | `?` | key bindings |
-| `Alerts` | `!` | rule list and state |
+| `Alerts` | `!` | rules, transitions and delivery notes |
 | `AuditLog` | `L` | the local record of actions taken |
+| `Seek` | `:` in a replay | frame or time prompt |
 
 Sending a signal is two-step by construction: `SignalMenu` → `ConfirmKill`.
 Every action that targets a process — signal, renice, affinity and IO priority
@@ -367,7 +370,21 @@ counters produces a gap rather than an absurd spike.
 - **GPU** — amdgpu exposes `gpu_busy_percent` and VRAM counters; i915/xe expose
   clocks but no busy counter, so the clock ratio is shown prefixed with `~` to
   make clear it is not utilisation. NVIDIA needs `nvidia-smi`, which is opt-in
-  because it costs tens of milliseconds per refresh.
+  because it costs tens of milliseconds per refresh. It runs on its own
+  thread (`gpu::NvidiaSmi`): each sample queues one query and takes the last
+  answer, so the figures are a sample behind, and an answer older than
+  `NvidiaSmi::STALE` is dropped rather than drawn as current.
+- **systemd units** — `systemctl show -p Id,ActiveState,SubState,Result,
+  NRestarts,ExecMainStatus '*.service'`, every five seconds on its own thread
+  (`units::UnitWatcher`); about 100 ms for a hundred units, which is why it is
+  not in front of the sample. `NRestarts` is cumulative, so the interval
+  loses no restarts. `RestartTracker` keeps each unit's count over the
+  window to turn "restarted 40 times since March" into "restarted 7 times in
+  ten minutes"; a count that drops is a manual restart and starts the
+  history again. A snapshot carries only units that are not healthy or have
+  restarted at all — the rest would be in every frame of every recording —
+  and `units_unreadable` says why there are none where systemd could not be
+  read, or was not asked.
 - **cgroups** — the panel appears only when the process is actually confined,
   since a limitless root cgroup is noise.
 
@@ -406,6 +423,26 @@ engine — which machine the rule was about, and which flight recording this
 pass opened for it — are filled in by `supervisor::attach_context`, because
 the dump does not exist until `drain` has written it.
 
+Every transition is also queued, hook or no hook, as a *notice* — the same
+`HookCall`, with the same context attached — which is what `[[notify]]`
+consumes. `notify.rs` turns one into a `curl --config` file and hands it to
+`supervisor::spawn_curl`, which runs `curl --config -` under the hook
+machinery (own process group, lazy reaping, `HOOK_TIMEOUT`) and, unlike a
+hook, reports a non-zero exit. The config travels on stdin because a Slack or
+Discord webhook URL is a credential, and argv is readable by every user;
+every value in it is quoted, and header values lose control characters, so a
+rule name cannot inject a second `url` or header. The engine bounds the
+notice queue at `MAX_HISTORY`, because `--watch` and the tests never drain it.
+
+Under a fleet the TUI runs one engine per host. The selected host's is
+`App::alerts`; the rest are parked in `App::host_alerts` and evaluated by
+`evaluate_parked_hosts` on every tick against each host's latest frame —
+once per frame, by its `taken_at_unix`, and interrupted while a host is not
+answering. They feed the ALERT column, hooks and notifications, never the
+flight recorder, whose ring is the selected host's frames. Moving off a host
+parks its engine with the frame it last saw marked seen, so the switch does
+not evaluate a frame twice.
+
 A rule with nothing to measure is skipped rather than read as zero. That is
 what makes `kind = "fd"` safe to leave in a config on a machine where
 `[procs] fds` is off, and `cpu.full` report nothing on the kernels that
@@ -429,6 +466,18 @@ hides threads by default the replay would then look almost empty.
 
 Every snapshot type carries `#[serde(default)]`, so a recording made by an older
 crabmon still loads when fields are added.
+
+A replay starts `record::scan_timeline` on a thread of its own: one pass over
+the file, a line and a frame at a time whether the replay is indexed or not,
+collecting each frame's time (for `:`) and the markers (for `(` and `)`).
+Alert markers come from running today's rules over the recording through a
+fresh `AlertEngine`, with the clock taken from the frames' own timestamps, so
+hold times mean recorded seconds. Kernel markers are events whose sequence
+number is newer than any seen so far, skipping the first frame's backlog.
+Positions match `ReplaySource`'s, except at the very end: a truncated final
+line is held back until a later line proves it was not the end, and an
+indexed replay counts it as a frame, so the two can differ by one there.
+Seeks are clamped to the replay.
 
 Credential redaction is applied to a copy of the snapshot before command
 truncation. `[record] redact_commands` controls plain, rotating and flight
@@ -591,7 +640,7 @@ terminal or a runaway process:
 
 ## Testing
 
-Over 800 tests: the in-crate unit tests plus eight integration suites. All are
+Over 900 tests: the in-crate unit tests plus eight integration suites. All are
 offline and deterministic except `proc_control` and `e2e_local`, which exercise
 the running machine, and `e2e_docker`, which builds and runs a container:
 
@@ -616,7 +665,7 @@ the running machine, and `e2e_docker`, which builds and runs a container:
   including the FD column only appearing once descriptors are counted and the
   detail pane's trend rows.
 - **`tests/cli.rs`** — the built binary: `--help`, `--version`, exit codes,
-  `--once` JSON/CSV output, `--diff` in both formats, `--stream` read back
+  `--once` JSON/CSV output, `--diff` as text and JSON, `--stream` read back
   through the recording parser, `--watch`'s exit codes, and the refusal to
   combine a headless mode with `--remote` or `--replay`. Also that recording
   works without a terminal — `--stream` leaving a parseable recording no wider
@@ -640,7 +689,12 @@ the running machine, and `e2e_docker`, which builds and runs a container:
   compatible release binary. Creates a private remote `/tmp` directory and
   temporary workloads, then removes them. Covers credential redaction and
   opt-out, hysteresis hooks, streams, plain/rotating/flight recordings, and a
-  real SSH collector through stalls, failures and recovery. Run with
+  real SSH collector through stalls, failures and recovery, and that a host
+  that never answers exports only `up` and `sample_stale`. `--units` (root on
+  the target) adds transient systemd units — one failing, one crash-looping —
+  and checks detection, the exit status, `unit` alert messages naming the
+  unit, and recovery on `reset-failed`; the units are stopped and reset
+  afterwards. Run with
   `python3 scripts/e2e-ssh.py --target user@host --binary target/release/crabmon`.
 - **`tests/build_script.rs`** — the build tooling against itself: that every
   `make` target has a command behind it, that every command is reachable through
@@ -852,8 +906,8 @@ reads as a quiet machine.
 
 - Process CPU percentages are relative to a single core, as `sysinfo` reports
   them, so a busy multi-threaded process can exceed 100%.
-- `nvidia-smi` polling is opt-in and synchronous; it will stall a refresh on a
-  machine where the driver is slow to answer.
+- `nvidia-smi` figures are one sample behind, and the first sample waits up
+  to two seconds for an answer so `--once` has one.
 - The FreeBSD disk-IO path shells out to `iostat -x` per tick and reports
   since-boot averages rather than instantaneous rates — which now applies to
   the utilisation and latency figures it reads out of `%b` and `ms/t` as well,
@@ -911,34 +965,47 @@ reads as a quiet machine.
   with distinct file and directory labels. Under local `--serve`, cadence
   follows scrapes; a remote host is recorded only when a new live frame is
   observed on a scrape.
-- `--diff` renders JSON or the text report; there is no CSV form of a diff,
-  and `--format csv` alongside it falls through to text.
-- `--watch-rule` always measures a `trend` over `DEFAULT_TREND_WINDOW`:
-  `parse_rule` has nowhere to put an `over_secs`, so the window a `[[alert]]`
-  can set is fixed at five minutes from the command line.
-- `--ssh-option` does not exist. `RemoteSource` takes a vector of extra SSH
-  arguments and every caller passes an empty one, so anything beyond
-  `BatchMode` and `ConnectTimeout` has to go in `~/.ssh/config`.
-- `supervisor::spawn_hooks` reaps finished hooks lazily and holds the rest, so
-  a hook that never exits is held for the life of the process. Bounded in
-  practice by hooks being pagers rather than daemons.
+- `--diff` renders JSON, long-form CSV or the text report. Only the text
+  report is cut to `LIST_LIMIT` rows per list.
+- `supervisor::spawn_hooks` reaps finished hooks lazily, on the next tick,
+  and kills a hook's whole process group once it has run for
+  `HOOK_TIMEOUT` (60 s), reporting that it did. A hook that needs longer has
+  to detach itself.
 - `App::ProcSeries::push` drops the oldest sample with `Vec::remove(0)`, which
   is a memmove of `PROC_HIST_LEN` elements per series per process per sample.
-  It does not show up against the cost of taking the sample, but a `VecDeque`
-  is what it wants to be.
+  At 120 elements that is under half a kilobyte and does not show up against
+  the cost of taking the sample; a `VecDeque` was considered and not taken,
+  because the sparkline and detail pane draw from a contiguous `&[f32]`.
+- Crash-loop detection counts only restarts crabmon has watched happen: a
+  loop already under way at start is reported as restarting at once
+  (`SubState=auto-restart`) and as a crash loop after `[units] crash_loop`
+  more restarts. `--once` therefore never reports a crash loop, only failed
+  and restarting units. User units are not read.
+- `[[notify]]` needs `curl` on the machine running the rules; crabmon links
+  no HTTP or TLS client. A missing `curl` is reported per post, not at start.
+- The replay timeline scan parses every frame once. On a 240 MiB hour that is
+  seconds of one core, on its own thread; markers and time seeks are
+  unavailable until it finishes.
+- Under a fleet, every host's rules run each tick in the TUI. That is one
+  rule evaluation per host per tick, against frames the workers have already
+  fetched; nothing extra crosses the network.
 - Pins do not reorder the tree view. The ordering there is structural, and
   hoisting a child out of its parent would draw a tree that is not one.
 - `--diff` holds both snapshots in memory, so diffing two ends of a large
   recording costs what loading it costs.
-- The audit log grows without bound and `audit::tail` reads the whole file to
-  show its last 200 lines.
+- The audit log keeps one rotated generation (`[audit] max_bytes`, 1 MiB),
+  so at most about twice that is on disk. `audit::tail` reads from the end of
+  the file in 16 KiB chunks, continuing into the rotated file when the
+  current one is short.
 - `config::save_to` writes a sibling temp file and renames it over the target,
   so a crash mid-save leaves either the old config or the new one. A config
   that cannot be parsed is reported and never written back over.
 - The streaming `--remote` path is unit-tested against a controlled child and
   driven end to end through a stand-in `ssh`. `scripts/e2e-ssh.py` also
   exercises real SSH: exports, redaction, hooks, recordings, stale/failure
-  handling and recovery. This passed against the Linux test server for 0.15.0;
+  handling and recovery, and with `--units` systemd failure and crash-loop
+  detection. This passed against the Linux test server (Ubuntu 26.04,
+  systemd 259) for 0.17.0, `--units` included;
   it does not establish coverage for every SSH or remote-platform setup.
 - Kernel events are matched on message text, because the kernel has no
   structured form of "this is an OOM kill". The patterns are ones that have

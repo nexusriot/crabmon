@@ -480,6 +480,30 @@ fn watch_exits_nonzero_and_prints_the_match() {
     assert!(!v["procs"].as_array().unwrap().is_empty(), "{v}");
 }
 
+/// Found on a real host: the match was printed inside an empty snapshot, so
+/// the text report headed it `localhost up 00:00 … mem 0 B / 0 B`.
+#[test]
+fn a_watch_match_reports_the_machine_it_was_measured_on() {
+    let out = crabmon(&[
+        "--watch",
+        "crabmon",
+        "--watch-timeout",
+        "10",
+        "--refresh",
+        "200",
+        "--format",
+        "text",
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!text.contains("mem 0 B / 0 B"), "{text}");
+    assert!(!text.contains("up 00:00"), "{text}");
+    let json = crabmon(&["--watch", "crabmon", "--watch-timeout", "10", "--refresh", "200"]);
+    let v: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert!(v["mem"]["total"].as_u64().unwrap_or(0) > 0, "{v}");
+    assert!(!v["host"]["hostname"].as_str().unwrap_or("").is_empty(), "{v}");
+}
+
 #[test]
 fn a_malformed_watch_query_is_rejected_rather_than_matching_nothing_forever() {
     let out = crabmon(&["--watch", "re:[unclosed", "--watch-timeout", "1"]);

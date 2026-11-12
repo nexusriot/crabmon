@@ -141,17 +141,45 @@ fn read_all(pipe: Option<impl std::io::Read>) -> Vec<u8> {
     buf
 }
 
+/// Turn `ssh_config` options — `[remote] ssh_options` followed by every
+/// `--ssh-option` — into the `-o KEY=VALUE` pairs `ssh` takes, refusing one
+/// that is not an option at all.
+///
+/// An option is required to look like one (`Port=2222`, `Port 2222`) and not
+/// to start with `-`: it is always passed after `-o`, so a stray `-p` would be
+/// read by `ssh` as the *value* of an option it does not know and fail with a
+/// message that names neither crabmon nor the setting that caused it.
+pub fn ssh_option_args<'a>(
+    options: impl IntoIterator<Item = &'a String>,
+) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for opt in options {
+        let opt = opt.trim();
+        let key_len = opt.find(|c: char| c == '=' || c.is_whitespace()).unwrap_or(opt.len());
+        let (key, value) = opt.split_at(key_len);
+        let value = value.trim_start_matches(|c: char| c == '=' || c.is_whitespace());
+        if key.is_empty() || value.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err(format!("not an ssh option: {opt:?} (expected KEY=VALUE, e.g. Port=2222)"));
+        }
+        out.push("-o".into());
+        out.push(opt.to_string());
+    }
+    Ok(out)
+}
+
 /// Build the argv for the SSH invocation.
 pub fn ssh_args(target: &str, options: &[String], remote_command: &str) -> Vec<String> {
-    let mut args: Vec<String> = vec![
-        // Fail fast rather than hanging the UI on an unreachable host, and
-        // never stop to ask about host keys in a full-screen TUI.
-        "-o".into(),
-        "BatchMode=yes".into(),
-        "-o".into(),
-        "ConnectTimeout=5".into(),
-    ];
+    // ssh keeps the *first* value it is given for an option, so order is
+    // precedence. BatchMode leads and cannot be overridden: a password or
+    // host-key prompt would be drawn over a full-screen interface that is
+    // not reading the terminal. The caller's options come next, then the
+    // defaults they are allowed to override — with them first, a
+    // `ConnectTimeout` from the config or the command line was silently
+    // ignored in favour of crabmon's own.
+    let mut args: Vec<String> = vec!["-o".into(), "BatchMode=yes".into()];
     args.extend(options.iter().cloned());
+    // Fail fast rather than hanging the UI on an unreachable host.
+    args.extend(["-o".into(), "ConnectTimeout=5".into()]);
     args.push(target.to_string());
     args.push(remote_command.to_string());
     args
@@ -429,6 +457,37 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["-o", "ConnectTimeout=5"]));
         assert_eq!(args[args.len() - 2], "host");
         assert_eq!(args[args.len() - 1], "crabmon --once");
+    }
+
+    #[test]
+    fn ssh_options_become_dash_o_pairs() {
+        let opts = vec!["Port=2222".to_string(), "IdentityFile ~/.ssh/ops".to_string()];
+        assert_eq!(
+            ssh_option_args(&opts).unwrap(),
+            ["-o", "Port=2222", "-o", "IdentityFile ~/.ssh/ops"]
+        );
+        assert!(ssh_option_args(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn things_that_are_not_ssh_options_are_refused() {
+        for bad in ["", "-p 2222", "Port", "Port=", "=2222", "Por-t=1"] {
+            assert!(ssh_option_args(&[bad.to_string()]).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    /// ssh keeps the first value given for each option, so a user's
+    /// `ConnectTimeout` has to come before crabmon's default to mean
+    /// anything — and BatchMode before the user's, so it cannot be undone.
+    #[test]
+    fn user_options_override_the_defaults_but_not_batch_mode() {
+        let user =
+            ssh_option_args(&["ConnectTimeout=2".to_string(), "BatchMode=no".to_string()]).unwrap();
+        let args = ssh_args("host", &user, "crabmon --once");
+        let first =
+            |key: &str| args.iter().find(|a| a.starts_with(&format!("{key}="))).cloned().unwrap();
+        assert_eq!(first("ConnectTimeout"), "ConnectTimeout=2");
+        assert_eq!(first("BatchMode"), "BatchMode=yes");
     }
 
     #[test]

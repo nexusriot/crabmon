@@ -1,4 +1,4 @@
-.TH CRABMON 1 "2026-11-12" "crabmon 0.16.0" "User Commands"
+.TH CRABMON 1 "2026-11-12" "crabmon 0.17.0" "User Commands"
 .SH NAME
 crabmon \- terminal system monitor
 .SH SYNOPSIS
@@ -14,10 +14,16 @@ limits. Given
 .B [procs] fds
 it also counts each process's open file descriptors against its own limit.
 .PP
+It also reports systemd services that have failed or are restarting in a loop,
+kernel events such as OOM kills, and storage redundancy; evaluates alert rules
+with hooks and built-in notifications, in the interface or headlessly; records
+and replays sessions; exports Prometheus metrics; and watches other machines,
+singly or as a fleet, over SSH.
+.PP
 With
 .B \-\-once
-it prints a single snapshot as JSON or CSV and exits, which makes it usable
-from scripts and monitoring pipelines.
+it prints a single snapshot as JSON, CSV or an aligned text table and exits,
+which makes it usable from scripts and monitoring pipelines.
 .SH OPTIONS
 .TP
 .BR \-r ", " \-\-refresh " " \fIMS\fR
@@ -66,8 +72,9 @@ Always samples the host it runs on; combining it with \fB\-\-remote\fR or
 Output format for \fB\-\-once\fR and \fB\-\-watch\fR: \fBjson\fR (default),
 \fBcsv\fR or \fBtext\fR. \fBtext\fR is an aligned table laid out by the same
 column planner the interface uses, i.e. the \fBtop \-b \-n1\fR shape.
-\fB\-\-diff\fR writes its report as \fBjson\fR or, for anything else, as the
-text report.
+\fB\-\-diff\fR writes its report as \fBjson\fR, as \fBcsv\fR \(em one row per
+change, \fIsection,pid,name,metric,before,after,delta\fR, untruncated \(em or
+otherwise as the text report.
 .TP
 .BR \-n ", " \-\-top " " \fIN\fR
 Limit \fB\-\-once\fR and \fBP\fR snapshot output to the top \fIN\fR processes.
@@ -119,16 +126,33 @@ Drive the interface from a recording instead of sampling this host.
 .B \-\-remote " " \fITARGET\fR[,\fITARGET\fR...]
 Monitor \fITARGET\fR over SSH. crabmon must be installed on the far end and
 SSH must work non-interactively; the refresh rate is bounded by the round trip.
+A target written \fB@\fR\fIname\fR is every host of the \fB[[fleet]]\fR group
+of that name; a host named more than once is watched once.
 .PP
 Several comma-separated targets open the \fBfleet\fR layout: one row per host,
 sampled concurrently on a worker each, so one unreachable machine costs the
 others nothing. \fBEnter\fR points the rest of the interface at the host under
 the cursor; \fBW\fR returns to the table. A single target behaves exactly as it
 always has, with no fleet table and no extra stop in the \fBTab\fR cycle.
+.PP
+Alert rules run on every host of a fleet, and the \fBALERT\fR column counts
+those firing on each; hooks and notifications fire for any host, with
+\fBCRABMON_HOST\fR naming it. \fB<\fR, \fB>\fR and \fBs\fR sort the
+table; the \fIalerts\fR key puts hosts that are not answering first, then
+the most rules firing.
 .TP
 .B \-\-remote\-command " " \fICMD\fR
 Command to run on the remote host. Defaults to
 .BR "crabmon \-\-once \-\-refresh 200" .
+.TP
+.B \-\-ssh\-option " " \fIOPT\fR
+Pass \fB\-o\fR \fIOPT\fR to \fBssh\fR for every \fB\-\-remote\fR connection,
+e.g. \fBPort=2222\fR. Repeatable. ssh keeps the first value given for an
+option, so these override \fB[remote] ssh_options\fR, which override
+\fI~/.ssh/config\fR and crabmon's default \fBConnectTimeout=5\fR;
+\fBBatchMode=yes\fR comes first and cannot be overridden, since a password
+prompt would land in the middle of the interface.
+Something that is not a \fIKEY\fB=\fIVALUE\fR option is refused.
 .TP
 .B \-\-serve " " \fIADDR\fR
 Run headless and serve Prometheus metrics on \fIADDR\fR, e.g. \fB:9100\fR.
@@ -136,6 +160,10 @@ Run headless and serve Prometheus metrics on \fIADDR\fR, e.g. \fB:9100\fR.
 or a bare path \(em in which case nothing listens on a port and the
 filesystem does the access control; the socket is created mode \fB0660\fR.
 A stale socket from a killed exporter is replaced, one still in use is not.
+systemd units are exported as \fBcrabmon_systemd_units_failed\fR,
+\fBcrabmon_systemd_units_crashlooping\fR and, for units that have failed or
+restarted, \fBcrabmon_systemd_unit_restarts_total\fR and
+\fBcrabmon_systemd_unit_state\fR; none of them where systemd was not read.
 Routes: \fB/\fR, \fB/metrics\fR, \fB/healthz\fR. With \fB\-\-remote\fR it
 exports a whole fleet instead, every series carrying \fBhost="..."\fR and each
 host evaluating the \fB[[alert]]\fR rules on its own; flight dumps are then
@@ -203,16 +231,26 @@ As \fB\-\-watch\fR, but for a measurement rather than a process list:
 A \fBtrend\fR rule may name the series it follows in front of its query:
 \fBtrend:postgres>200M\fR is resident memory, \fBtrend:io:postgres>10M\fR
 the same processes' disk rate in bytes per second, and
-\fBtrend:cpu:postgres>20\fR their CPU in percentage points. The query keeps
+\fBtrend:cpu:postgres>20\fR their CPU in percentage points. A \fBunit\fR rule
+names its figure and then, optionally, the unit: \fBunit:failed>=1\fR,
+\fBunit:restarts:api>=3\fR. The query keeps
 its own colons, so \fBtrend:io:user:postgres>10M\fR is the IO rate of
 everything that user runs.
+.PP
+\fBtrend\fR, \fBfillin\fR and \fBoomkill\fR measure over a window, the
+\fBover_secs\fR of an \fB[[alert]]\fR, given after the value as
+\fB/\fR\fIDURATION\fR: \fBtrend:postgres>200M/10m\fR,
+\fBfillin:/var<3h/30m\fR, \fBoomkill>=1/1h\fR. Without one they use five
+minutes; any other kind refuses a window.
 .PP
 \fB>\fR and \fB>=\fR both mean at-or-over and \fB<\fR means strictly under,
 which is how an \fB[[alert]]\fR compares; \fB<=\fR is refused rather than
 quietly read as \fB<\fR. The operator is taken from the right, so a
 \fBproc\fR query may contain one of its own: \fBproc:cpu>5<1\fR is "fewer
 than one process over 5% CPU". A rule that cannot be parsed is an error, not a
-watch that blocks until its timeout and then reports nothing happened.
+watch that blocks until its timeout and then reports nothing happened; so is
+a \fBdisk\fR or \fBfillin\fR rule naming a mount crabmon does not measure
+(tmpfs and other memory filesystems are not).
 .TP
 .B \-\-watch\-for " " \fISECS\fR
 Require the match to hold this many consecutive seconds. A condition that
@@ -250,7 +288,8 @@ Sort by CPU, memory, PID, name or disk IO. Pressing the active column's key
 again reverses the order.
 .TP
 .BR < ", " > " (or " , " and " . )
-Move to the previous or next sort column.
+Move to the previous or next sort column. In the fleet table these, and
+\fBs\fR, sort the hosts instead.
 .TP
 .B s
 Reverse the sort order.
@@ -287,6 +326,15 @@ Pause and resume sampling.
 Step a recording back or forward one frame;
 .BR { " and " }
 step ten.
+.TP
+.BR ( ", " )
+Jump to the previous or next marker in a recording: a frame where an
+\fB[[alert]]\fR rule fires, run over the recording on its own clock, or where
+a kernel event first appears. The bar in the status line shows them.
+.TP
+.B :
+Go to a frame in a recording: \fB#120\fR is a frame number, \fB5m\fR that
+long from the start, \fB+30s\fR and \fB\-2m\fR relative to the current frame.
 .TP
 .B 1-9
 Apply the correspondingly numbered saved filter;
@@ -354,7 +402,9 @@ A file that does not parse changes nothing.
 Write a snapshot to the export directory.
 .TP
 .B !
-Show the alert rules and their state.
+Show the alert rules and their state, every transition, and the last fifty
+notes from running hooks and notifications \(em a post that failed, a hook
+killed after its timeout, a flight recording written.
 .TP
 .BR ? " (or " F1 )
 Show all key bindings.
@@ -476,8 +526,10 @@ panels are additionally hidden when the machine has nothing to report.
 .B enabled
 draws the GPU panel.
 .B nvidia_smi
-additionally shells out to \fBnvidia\-smi\fR on every refresh; off by default
-because it costs tens of milliseconds.
+additionally runs \fBnvidia\-smi\fR once per refresh, on a thread of its own so a
+slow driver delays only the GPU figures (one sample behind, and dropped after
+15 seconds without an answer); off by default because it costs tens of
+milliseconds.
 .SS [export]
 .B dir
 is where \fBP\fR writes snapshots (empty means the working directory),
@@ -552,11 +604,29 @@ looks up listening ports for the rows on screen — one fd table per visible row
 so it is off by default.
 .B pin_marker
 draws the leading marker column (\fB\(bu\fR tagged, pinned).
+.SS [units]
+.B enabled
+reads systemd's services with \fBsystemctl show\fR every five seconds, on a
+thread of its own (default true; Linux only).
+.B crash_loop
+automatic restarts within
+.B window_secs
+seconds make a unit crash-looping (defaults 3 and 600). A unit with
+\fBActiveState=failed\fR is failed. Either is named in the header and the
+fleet table's STATUS column; grouping by service gives such units a row, with
+a \fBUNIT\fR column, even when nothing of theirs is running. Restarts that
+happened before crabmon started are not counted toward a loop.
 .SS [remote]
 .B stream
 holds one SSH session open and reads a stream of frames instead of starting a
 process per sample, falling back automatically when the far end predates
 \fB\-\-stream\fR. Default true.
+.PP
+.B ssh_options
+is a list of \fBssh_config\fR options passed as \fB\-o\fR on every
+connection. \fB\-\-ssh\-option\fR overrides them, and they override
+\fI~/.ssh/config\fR and the default \fBConnectTimeout=5\fR, but not
+\fBBatchMode=yes\fR. Default empty.
 .SS [serve]
 .B top_procs
 per-process series are exported by \fB\-\-serve\fR, busiest first (default
@@ -573,6 +643,10 @@ exempt, and the comparison is constant-time.
 .B enabled
 records every signal, renice and affinity change; \fBpath\fR overrides the
 default location under the platform state directory.
+.B max_bytes
+bounds it: at that size the log is moved to \fIpath\fB.1\fR, replacing the
+previous one, and started again (default 1 MiB; 0 never rotates). The
+\fBL\fR viewer reads across both.
 .SS [[filter_preset]]
 Each table binds a
 .B name
@@ -589,6 +663,32 @@ Overrides individual theme colours by name:
 .BR dim ", " sel_fg ", " sel_bg .
 Values may be colour names (\fBred\fR), hex (\fB#ff8800\fR) or 256-colour
 indexes (\fB33\fR). Unknown keys and unparseable values are ignored.
+.SS [[fleet]]
+Each table names a host list for \fB\-\-remote @\fR\fIname\fR:
+.B name
+and
+.BR hosts ,
+a list of SSH targets.
+.SS [[notify]]
+Each table posts every alert transition \(em of every rule, with or without a
+\fBcommand\fR \(em to one destination.
+.B kind
+is \fBwebhook\fR (JSON carrying the hook variables, lower-cased without the
+prefix), \fBslack\fR or \fBdiscord\fR (a chat message), or \fBntfy\fR (the
+message, with title, priority and tag headers).
+.B url
+is where to post, and must be \fBhttp://\fR or \fBhttps://\fR;
+.B token
+is sent as \fBAuthorization: Bearer\fR when set;
+.B rules
+limits it to rules by name (empty: every rule); and
+.B cleared
+posts recoveries too (default true).
+.B name
+labels it in messages. The post is made by \fBcurl\fR, which must be
+installed, with the URL, token and body on its standard input rather than its
+command line; a failed post is reported, and one taking over 15 seconds is
+abandoned. A target crabmon cannot use stops it at start.
 .SS [[alert]]
 Each table defines one rule:
 .IR name ", " kind ", " threshold ", " hysteresis ", " for_secs ", " over_secs ", " below ", " target ", "
@@ -597,7 +697,13 @@ Each table defines one rule:
 is one of
 .IR cpu ", " mem ", " swap ", " load ", " disk ", " temp ", " gpu ", " psi ", "
 .IR io ", " net ", " fd ", " proc ", " trend ", " fillin ", " cgroup ", "
-.IR kernel ", " cputime ", " vm ", " throttle ", " oomkill ", " tcp " or " storage .
+.IR kernel ", " cputime ", " vm ", " throttle ", " oomkill ", " tcp ", " storage " or " unit .
+.I unit
+measures systemd services: \fItarget\fR is \fBcrashloop\fR (units restarting in
+a loop, the default), \fBfailed\fR, or \fBrestarts\fR (the most automatic
+restarts of any unit within \fB[units] window_secs\fR), and \fIquery\fR names
+a unit, \fBapi\fR or \fBapi.service\fR; empty means all of them. It measures
+nothing where systemd cannot be read.
 .I storage
 counts md arrays, ZFS pools and btrfs filesystems that are degraded,
 rebuilding or failed;
@@ -613,7 +719,10 @@ worst.
 .I oomkill
 counts OOM kills within \fIover_secs\fR (default 300): inside the named
 container or unit, or, with an empty target, on the whole machine from
-\fI/proc/vmstat\fR, which needs no root.
+\fI/proc/vmstat\fR, which needs no root. A named unit whose cgroup is
+already gone \(em it died between samples and systemd removed it \(em is
+counted from the kernel's kill line naming the cgroup, or from the unit
+being failed with \fBResult=oom-kill\fR.
 .I tcp
 reads the figure its target names: \fBretrans\fR (percent of segments
 sent, the default), \fBlistendrops\fR, \fBresets\fR or \fBfailed\fR
@@ -680,6 +789,8 @@ for the flight recording a firing opened and the readable summary beside it.
 Every one is always set, empty where it does not apply, so a hook written with
 \fBset \-u\fR need not guess which exist. Output goes nowhere and the hook is
 not waited on: one that blocks the sampler is worse than no hook at all.
+A hook still running after 60 seconds is killed together with everything it
+started, and the status line says so; one that needs longer must detach.
 .PP
 .I threshold
 is a percentage for \fIcpu\fR, \fImem\fR, \fIswap\fR, \fIdisk\fR,
@@ -724,6 +835,14 @@ about 240 MiB for an hour at the default interval.
 While replaying, sampling is paused: \fB[\fR and \fB]\fR step one frame,
 \fB{\fR and \fB}\fR step ten, and \fBz\fR plays on. Every panel renders
 from the recording exactly as it would from the live host.
+.PP
+The status line draws the recording as a bar with the current frame and a
+mark wherever something happened: \fB!\fR where an \fB[[alert]]\fR rule
+fires, run over the recording on its own clock, and \fBk\fR where a kernel
+event first appears. \fB(\fR and \fB)\fR jump between the marks; \fB:\fR
+goes to \fB#\fR\fIframe\fR, a time from the start such as \fB5m\fR, or a
+relative one such as \fB+30s\fR. The marks and frame times come from one
+pass over the file on a background thread.
 .SS Flight recorder
 .B \-\-record
 only helps if it was started before the incident, which is the one thing nobody
@@ -795,11 +914,18 @@ Success. For \fB\-\-watch\fR, this means the condition was never met before
 A \fB\-\-watch\fR condition matched, or the run failed.
 .TP
 .B 2
-Invalid command line.
+Invalid command line; a \fB[[notify]]\fR target that cannot deliver; or a
+\fB\-\-watch\fR that cannot be run \(em a malformed query or rule, or a
+\fBdisk\fR or \fBfillin\fR rule naming a mount crabmon does not measure.
 .SH FILES
 .TP
 .I ~/.config/crabmon/config.toml
 Configuration.
+.TP
+.I ~/.local/state/crabmon/actions.log
+The action log of signals, renices, affinity and IO-priority changes, unless
+\fB[audit] path\fR says otherwise; moved to \fIactions.log.1\fR at
+\fB[audit] max_bytes\fR.
 .SH SEE ALSO
 .BR htop (1),
 .BR top (1),

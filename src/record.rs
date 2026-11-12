@@ -751,6 +751,196 @@ fn index_lines(mut reader: BufReader<File>) -> Result<Vec<(u64, u32)>, String> {
     Ok(lines)
 }
 
+/// Something worth finding again in a recording: a rule that fired, or a
+/// kernel event that first appeared, at a frame position.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Marker {
+    pub position: usize,
+    pub kind: MarkerKind,
+    /// The rule's name, or the kernel event and the process it names.
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerKind {
+    Alert,
+    Kernel,
+}
+
+/// What a scan of a whole recording found: every frame's time, for seeking
+/// by time, and the markers, in position order.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Timeline {
+    pub at_unix: Vec<u64>,
+    pub markers: Vec<Marker>,
+}
+
+impl Timeline {
+    /// The nearest marker strictly before or after `position`.
+    pub fn neighbour(&self, position: usize, forward: bool) -> Option<&Marker> {
+        match forward {
+            true => self.markers.iter().find(|m| m.position > position),
+            false => self.markers.iter().rev().find(|m| m.position < position),
+        }
+    }
+
+    /// The first frame at or after `at_unix`, or the last frame.
+    pub fn position_at(&self, at_unix: u64) -> usize {
+        self.at_unix
+            .iter()
+            .position(|t| *t >= at_unix)
+            .unwrap_or(self.at_unix.len().saturating_sub(1))
+    }
+}
+
+/// Builds a `Timeline` a frame at a time.
+///
+/// The rules are today's `[[alert]]` rules, run over the recording on its
+/// own clock — a rule's hold time is measured in the recording's seconds, not
+/// in how fast it is being scanned — which is the question being asked of a
+/// recording: "where would this have fired". Kernel events are marked where
+/// they first appear; the ones already in the first frame are the ring the
+/// recorder was started with, and happened before the recording did.
+pub struct TimelineScan {
+    engine: crate::alerts::AlertEngine,
+    first_at: Option<u64>,
+    newest_seq: Option<u64>,
+    timeline: Timeline,
+}
+
+impl TimelineScan {
+    pub fn new(rules: Vec<crate::alerts::AlertRule>) -> TimelineScan {
+        TimelineScan {
+            engine: crate::alerts::AlertEngine::new(rules),
+            first_at: None,
+            newest_seq: None,
+            timeline: Timeline::default(),
+        }
+    }
+
+    /// The next frame; `None` for a line that could not be parsed, which
+    /// still occupies its position.
+    pub fn push(&mut self, snap: Option<&Snapshot>) {
+        let position = self.timeline.at_unix.len();
+        let Some(snap) = snap else {
+            let last = self.timeline.at_unix.last().copied().unwrap_or(0);
+            self.timeline.at_unix.push(last);
+            return;
+        };
+        self.timeline.at_unix.push(snap.taken_at_unix);
+        let first = *self.first_at.get_or_insert(snap.taken_at_unix);
+        self.engine.evaluate(snap, snap.taken_at_unix.saturating_sub(first));
+        // Nobody is listening to these; left queued they would only grow.
+        self.engine.take_commands();
+        self.engine.take_notices();
+        for name in self.engine.take_fired() {
+            self.timeline.markers.push(Marker { position, kind: MarkerKind::Alert, label: name });
+        }
+        let newest = self.newest_seq;
+        for event in &snap.kernel {
+            if position > 0 && newest.is_none_or(|n| event.seq > n) {
+                let label = match &event.process {
+                    Some(p) => format!("{} {p}", event.kind.key_name()),
+                    None => event.kind.key_name().to_string(),
+                };
+                self.timeline.markers.push(Marker { position, kind: MarkerKind::Kernel, label });
+            }
+        }
+        if let Some(max) = snap.kernel.iter().map(|e| e.seq).max() {
+            self.newest_seq = Some(newest.map_or(max, |n| n.max(max)));
+        }
+    }
+
+    pub fn finish(self) -> Timeline {
+        self.timeline
+    }
+}
+
+/// Scan a recording file into a `Timeline`, reading it line by line — the
+/// same positions `ReplaySource` uses, whether it holds the file in memory
+/// or indexes it — so a recording of any size costs one pass and one frame
+/// of memory.
+pub fn scan_timeline(
+    path: &Path,
+    rules: Vec<crate::alerts::AlertRule>,
+) -> Result<Timeline, String> {
+    let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut scan = TimelineScan::new(rules);
+    let mut line = String::new();
+    // A line that does not parse is held back until another follows it: the
+    // last line of a recording killed mid-write is not a frame at all, and
+    // `ReplaySource` drops it, so counting it would put every time one
+    // position out.
+    let mut unparsed = 0usize;
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+            break;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Snapshot>(line.trim_end()) {
+            Ok(snap) => {
+                for _ in 0..std::mem::take(&mut unparsed) {
+                    scan.push(None);
+                }
+                scan.push(Some(&snap));
+            }
+            Err(_) => unparsed += 1,
+        }
+    }
+    Ok(scan.finish())
+}
+
+/// Where `:` should take a replay, from what was typed and the frame it is
+/// on. `#120` is a frame number; `5m` is that far from the start; `+30s` and
+/// `-2m` are relative to the current frame. Durations take the filter
+/// language's suffixes, so `90` alone is seconds.
+pub fn parse_seek(
+    input: &str,
+    position: usize,
+    len: usize,
+    timeline: Option<&Timeline>,
+) -> Result<usize, String> {
+    let input = input.trim();
+    let last = len.saturating_sub(1);
+    if let Some(frame) = input.strip_prefix('#') {
+        let n: usize = frame.trim().parse().map_err(|_| format!("bad frame number: {frame}"))?;
+        if n == 0 {
+            return Err("frames are numbered from 1".into());
+        }
+        return Ok((n - 1).min(last));
+    }
+    let (sign, rest) = match input.as_bytes().first() {
+        Some(b'+') => (1i64, &input[1..]),
+        Some(b'-') => (-1, &input[1..]),
+        _ => (0, input),
+    };
+    let secs = crate::format::parse_duration(rest)
+        .ok_or_else(|| format!("expected #frame, a time like 5m, or +30s / -2m: {input}"))?;
+    // An indexed replay counts a truncated final line as a frame where the
+    // scan does not, so the two may differ by one at the end; the result is
+    // clamped to the replay either way.
+    let timeline = timeline
+        .filter(|t| !t.at_unix.is_empty())
+        .ok_or_else(|| "still scanning the recording for times; #frame works now".to_string())?;
+    let start = timeline.at_unix.first().copied().unwrap_or(0);
+    let here = timeline.at_unix.get(position).copied().unwrap_or(start);
+    let target = match sign {
+        0 => start.saturating_add(secs),
+        1 => here.saturating_add(secs),
+        _ => here.saturating_sub(secs),
+    };
+    if sign < 0 {
+        // Backwards lands on the last frame at or before the time, so `-1m`
+        // never moves forward.
+        return Ok(timeline.at_unix.iter().rposition(|t| *t <= target).unwrap_or(0).min(last));
+    }
+    Ok(timeline.position_at(target).min(last))
+}
+
 /// Parse JSONL, skipping blank lines. A truncated final line (the recorder was
 /// killed mid-write) is dropped rather than failing the whole file.
 pub fn parse_jsonl(content: &str) -> Result<Vec<Snapshot>, String> {
@@ -924,6 +1114,91 @@ mod tests {
             taken_at_unix: 1_700_000_000 + n as u64,
             ..Default::default()
         }
+    }
+
+    fn kernel(seq: u64) -> crate::metrics::kmsg::KernelEvent {
+        crate::metrics::kmsg::KernelEvent {
+            kind: crate::metrics::kmsg::EventKind::OomKill,
+            seq,
+            monotonic_us: 0,
+            text: String::new(),
+            pid: Some(7),
+            process: Some("java".into()),
+        }
+    }
+
+    #[test]
+    fn a_scan_marks_where_rules_fire_on_the_recording_s_own_clock() {
+        // cpu climbs 0..10; a rule at >=5 held for 2 recording-seconds fires
+        // at frame 7, however fast the scan runs.
+        let mut rule = crate::watch::parse_rule("cpu>=5", 2).unwrap();
+        rule.name = "hot".into();
+        let mut scan = TimelineScan::new(vec![rule]);
+        for n in 0..10 {
+            scan.push(Some(&frame(n)));
+        }
+        let t = scan.finish();
+        assert_eq!(t.at_unix.len(), 10);
+        assert_eq!(
+            t.markers,
+            [Marker { position: 7, kind: MarkerKind::Alert, label: "hot".into() }]
+        );
+    }
+
+    #[test]
+    fn kernel_events_are_marked_where_they_first_appear_not_from_the_backlog() {
+        let mut scan = TimelineScan::new(Vec::new());
+        let mut f0 = frame(0);
+        f0.kernel = vec![kernel(1)]; // the ring the recorder started with
+        let mut f1 = frame(1);
+        f1.kernel = vec![kernel(1)];
+        let mut f2 = frame(2);
+        f2.kernel = vec![kernel(1), kernel(2)];
+        for f in [&f0, &f1, &f2, &f2] {
+            scan.push(Some(f));
+        }
+        let t = scan.finish();
+        assert_eq!(
+            t.markers,
+            [Marker { position: 2, kind: MarkerKind::Kernel, label: "oom java".into() }]
+        );
+    }
+
+    #[test]
+    fn a_scanned_file_has_the_positions_the_replay_has() {
+        let path = tmpfile("scan");
+        let mut body: String =
+            (0..5).map(|n| serde_json::to_string(&frame(n)).unwrap() + "\n\n").collect();
+        body.push_str("{\"truncated\": "); // killed mid-write
+        std::fs::write(&path, body).unwrap();
+        let t = scan_timeline(&path, Vec::new()).unwrap();
+        assert_eq!(t.at_unix, (0..5).map(|n| 1_700_000_000 + n).collect::<Vec<_>>());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn seeking_takes_frames_offsets_from_the_start_and_relative_times() {
+        let t = Timeline { at_unix: (0..100).map(|n| 1000 + n * 10).collect(), markers: vec![] };
+        let at = |input: &str, pos: usize| parse_seek(input, pos, 100, Some(&t));
+        assert_eq!(at("#1", 50), Ok(0));
+        assert_eq!(at("#500", 50), Ok(99), "clamped to the recording");
+        assert!(at("#0", 50).is_err());
+        assert_eq!(at("5m", 50), Ok(30));
+        assert_eq!(at("+30s", 50), Ok(53));
+        assert_eq!(at("-25s", 50), Ok(47), "backwards never lands after the target");
+        assert_eq!(at("-1h", 50), Ok(0));
+        assert!(at("soon", 50).is_err());
+        assert!(parse_seek("5m", 0, 100, None).unwrap_err().contains("still scanning"));
+        assert_eq!(parse_seek("#3", 0, 100, None), Ok(2), "frame numbers need no scan");
+    }
+
+    #[test]
+    fn markers_are_found_either_side_of_a_position() {
+        let m = |position| Marker { position, kind: MarkerKind::Alert, label: String::new() };
+        let t = Timeline { at_unix: vec![], markers: vec![m(3), m(8)] };
+        assert_eq!(t.neighbour(3, true).map(|m| m.position), Some(8));
+        assert_eq!(t.neighbour(3, false).map(|m| m.position), None);
+        assert_eq!(t.neighbour(9, false).map(|m| m.position), Some(8));
     }
 
     fn tmpfile(tag: &str) -> PathBuf {

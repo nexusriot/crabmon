@@ -151,6 +151,7 @@ pub fn run(cfg: &crate::config::Config, path: &Path) -> Report {
         privileges(),
         pressure(),
         kernel_events(),
+        systemd_units(cfg),
         package_power(),
         cgroups(),
         gpu(cfg),
@@ -159,6 +160,7 @@ pub fn run(cfg: &crate::config::Config, path: &Path) -> Report {
         process_io(),
         config_file(cfg, path).with_required(true),
         alert_rules(cfg).with_required(true),
+        notifications(cfg).with_required(!cfg.notify.is_empty()),
     ];
     Report { checks }
 }
@@ -229,6 +231,53 @@ fn kernel_events() -> Check {
             "run as root, or set kernel.dmesg_restrict=0 — \
              without it `kind = \"kernel\"` rules measure nothing",
         ),
+    }
+}
+
+fn systemd_units(cfg: &crate::config::Config) -> Check {
+    if !cfg!(target_os = "linux") {
+        return Check::new("systemd-units", Status::Unavailable, "systemd needs Linux");
+    }
+    if !cfg.units.enabled {
+        return Check::new("systemd-units", Status::Unavailable, "[units] enabled is off");
+    }
+    match crate::metrics::units::probe() {
+        Ok(n) => Check::new(
+            "systemd-units",
+            Status::Ok,
+            format!(
+                "systemctl show answers for {n} loaded services; failures and restart loops are reported"
+            ),
+        ),
+        Err(e) => Check::new("systemd-units", Status::Unavailable, e).with_remedy(
+            "without systemd there are no units to watch, and `kind = \"unit\"` rules measure nothing",
+        ),
+    }
+}
+
+/// `[[notify]]` posts with curl, so a configured target on a machine
+/// without it is a notification that will never arrive.
+fn notifications(cfg: &crate::config::Config) -> Check {
+    if cfg.notify.is_empty() {
+        return Check::new("notifications", Status::Ok, "no [[notify]] targets configured");
+    }
+    if let Err(e) = crate::notify::validate(&cfg.notify) {
+        return Check::new("notifications", Status::Unavailable, e);
+    }
+    let curl = std::process::Command::new("curl")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    match curl {
+        true => Check::new(
+            "notifications",
+            Status::Ok,
+            format!("{} [[notify]] targets; curl is installed", cfg.notify.len()),
+        ),
+        false => Check::new("notifications", Status::Unavailable, "curl is not installed")
+            .with_remedy("install curl: [[notify]] posts with it"),
     }
 }
 
@@ -417,11 +466,25 @@ fn config_file(cfg: &crate::config::Config, path: &Path) -> Check {
 /// Rules that cannot measure anything here, which is the failure this whole
 /// command exists to surface: a monitor whose alerts have quietly stopped
 /// existing looks exactly like a monitor with nothing to report.
+/// The mount points crabmon's disk panel lists — sysinfo's, which leave out
+/// tmpfs and the other memory filesystems.
+fn measured_mounts() -> Vec<String> {
+    sysinfo::Disks::new_with_refreshed_list()
+        .map(|d| d.iter().map(|d| d.mount_point().to_string_lossy().to_string()).collect())
+        .unwrap_or_default()
+}
+
 fn alert_rules(cfg: &crate::config::Config) -> Check {
     use crate::alerts::AlertKind;
     let mut inert: Vec<&str> = Vec::new();
+    let mounts = measured_mounts();
     for rule in &cfg.alerts {
         let needs = match rule.kind {
+            AlertKind::Disk | AlertKind::FillIn
+                if !rule.target.is_empty() && !mounts.contains(&rule.target) =>
+            {
+                Some("no measured filesystem is mounted there")
+            }
             AlertKind::Fd if !cfg.procs.fds => Some("[procs] fds is off"),
             AlertKind::Psi if !readable("/proc/pressure/cpu") => Some("no pressure stall"),
             AlertKind::Kernel if !readable("/dev/kmsg") => Some("/dev/kmsg is unreadable"),
@@ -431,6 +494,8 @@ fn alert_rules(cfg: &crate::config::Config) -> Check {
             AlertKind::Storage if crate::metrics::storage::read().is_empty() => {
                 Some("no md, ZFS or btrfs volumes")
             }
+            AlertKind::Unit if !cfg.units.enabled => Some("[units] enabled is off"),
+            AlertKind::Unit if !cfg!(target_os = "linux") => Some("systemd needs Linux"),
             AlertKind::OomKill if rule.target.is_empty() && !readable("/proc/vmstat") => {
                 Some("/proc/vmstat is unreadable")
             }

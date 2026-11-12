@@ -8,7 +8,7 @@ use ratatui::text::Span;
 use ratatui::widgets::{Cell, Row, Table, TableState};
 
 use crate::app::App;
-use crate::fleet::FleetHost;
+use crate::fleet::{FleetHost, FleetSort};
 use crate::format::{compact_bytes, human_duration, truncate_fit};
 use crate::ui::block;
 
@@ -18,8 +18,22 @@ use crate::ui::block;
 /// STATUS is last and takes whatever width is left, which is what gives a
 /// host that is not answering somewhere to put the reason. Squeezing it into
 /// a numeric column truncated "unreachable: No route to host" to "unreac".
-const HEADERS: [&str; 9] =
-    ["HOST", "CPU%", "MEM", "SWAP", "LOAD", "DISK", "NET", "PROCS", "STATUS"];
+const HEADERS: [&str; 10] =
+    ["HOST", "CPU%", "MEM", "SWAP", "LOAD", "DISK", "NET", "PROCS", "ALERT", "STATUS"];
+
+/// The sort key each column header stands for, in `HEADERS` order.
+const SORTS: [Option<FleetSort>; 10] = [
+    Some(FleetSort::Host),
+    Some(FleetSort::Cpu),
+    Some(FleetSort::Mem),
+    Some(FleetSort::Swap),
+    Some(FleetSort::Load),
+    Some(FleetSort::Disk),
+    Some(FleetSort::Net),
+    Some(FleetSort::Procs),
+    Some(FleetSort::Alerts),
+    None,
+];
 
 /// Widest a host name is allowed to get before it is truncated. Beyond this
 /// the name is pushing the numbers off to the right of a wide terminal, and
@@ -48,13 +62,23 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
 
     let page = inner.height.saturating_sub(1) as usize;
+    app.follow_fleet_cursor(&hosts);
     app.set_fleet_page(page, hosts.len());
 
-    let header = Row::new(HEADERS.to_vec())
-        .style(Style::default().add_modifier(Modifier::BOLD).fg(app.theme.title));
-    // The numeric columns and their spacing come to 52; leave at least ten
+    let arrow = if app.fleet_sort_desc { "↓" } else { "↑" };
+    let titles: Vec<String> = HEADERS
+        .iter()
+        .zip(SORTS)
+        .map(|(h, key)| match key == Some(app.fleet_sort) {
+            true => format!("{h}{arrow}"),
+            false => h.to_string(),
+        })
+        .collect();
+    let header =
+        Row::new(titles).style(Style::default().add_modifier(Modifier::BOLD).fg(app.theme.title));
+    // The numeric columns and their spacing come to 59; leave at least ten
     // for the status, and never let the name have more than it needs.
-    let name_w = inner.width.saturating_sub(62).clamp(10, MAX_NAME);
+    let name_w = inner.width.saturating_sub(69).clamp(10, MAX_NAME);
 
     let start = app.fleet_scroll.min(hosts.len().saturating_sub(1));
     let end = (start + page.max(1)).min(hosts.len());
@@ -68,6 +92,7 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
         Constraint::Length(6),
         Constraint::Length(6),
         Constraint::Length(9),
+        Constraint::Length(6),
         Constraint::Length(6),
         Constraint::Min(10),
     ];
@@ -91,10 +116,15 @@ fn row<'a>(app: &App, h: &FleetHost, name_w: usize) -> Row<'a> {
             Span::styled(format!("{}: {e}", h.status()), Style::default().fg(app.theme.crit))
         }
         (None, false) => Span::styled("connecting…", Style::default().fg(app.theme.dim)),
-        (None, true) => Span::styled(
-            format!("up {}", human_duration(h.snapshot.host.uptime_secs)),
-            Style::default().fg(app.theme.dim),
-        ),
+        // A host whose services are failing says so where its uptime would
+        // be: "up 41 days" is not the news about it.
+        (None, true) => match crate::ui::header::unit_trouble(&h.snapshot) {
+            Some(units) => Span::styled(units, Style::default().fg(app.theme.crit)),
+            None => Span::styled(
+                format!("up {}", human_duration(h.snapshot.host.uptime_secs)),
+                Style::default().fg(app.theme.dim),
+            ),
+        },
     };
 
     if !h.has_data() {
@@ -128,8 +158,21 @@ fn row<'a>(app: &App, h: &FleetHost, name_w: usize) -> Row<'a> {
         }),
         Cell::from(format!("{:>8}", compact_bytes((rx + tx) as u64))),
         Cell::from(format!("{:>5}", s.procs.len())),
+        alert_cell(app, h),
         Cell::from(status),
     ])
+}
+
+/// Rules firing on a host: blank when none, so the hosts with some stand out
+/// down a long column of quiet machines.
+fn alert_cell<'a>(app: &App, h: &FleetHost) -> Cell<'a> {
+    match app.fleet_alert_count(h) {
+        0 => Cell::from(""),
+        n => Cell::from(Span::styled(
+            format!("{n:>5}"),
+            Style::default().fg(app.theme.crit).add_modifier(Modifier::BOLD),
+        )),
+    }
 }
 
 /// The one-line summary under the table: how much of the fleet is answering,
@@ -155,6 +198,7 @@ mod tests {
     fn host(target: &str, up: u64, error: Option<&str>, waiting: bool) -> FleetHost {
         FleetHost {
             target: target.into(),
+            index: 0,
             snapshot: Snapshot {
                 host: HostInfo { uptime_secs: up, ..Default::default() },
                 ..Default::default()

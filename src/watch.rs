@@ -77,7 +77,12 @@ pub fn process_rule(query: &str, for_secs: u64) -> AlertRule {
 /// fd>=90           some process at or over 90% of its own fd limit
 /// net>=1M          aggregate throughput at or over 1 MB/s
 /// proc:nginx<1     fewer than one nginx, i.e. it has stopped
+/// trend:postgres>200M/10m   postgres's RSS up 200 MB over ten minutes
 /// ```
+///
+/// The kinds that measure over a window — `trend`, `fillin` and `oomkill` —
+/// take it after the value as `/DURATION`, which is the `over_secs` an
+/// `[[alert]]` sets; without one they use `DEFAULT_TREND_WINDOW`.
 ///
 /// The operator is found by scanning from the *right*, because a `proc`
 /// target is a filter query and a filter query can contain one of its own:
@@ -102,6 +107,10 @@ pub fn parse_rule(expr: &str, for_secs: u64) -> Result<AlertRule, String> {
     }
     let below = op.starts_with('<');
     let (head, value) = (expr[..idx].trim(), expr[idx + op.len()..].trim());
+    let (value, window) = match value.rsplit_once('/') {
+        Some((v, w)) => (v.trim(), Some(w.trim())),
+        None => (value, None),
+    };
 
     let (kind_name, target) = match head.split_once(':') {
         Some((k, t)) => (k.trim(), t.trim()),
@@ -138,6 +147,19 @@ pub fn parse_rule(expr: &str, for_secs: u64) -> Result<AlertRule, String> {
     if !threshold.is_finite() {
         return Err(format!("bad number: {value}"));
     }
+    let over_secs = match window {
+        None => 0,
+        Some(_) if !matches!(kind, AlertKind::Trend | AlertKind::FillIn | AlertKind::OomKill) => {
+            return Err(format!(
+                "{} has no window; only trend, fillin and oomkill take /DURATION",
+                kind.key_name()
+            ));
+        }
+        Some(w) => match crate::format::parse_duration(w) {
+            Some(secs) if secs > 0 => secs,
+            _ => return Err(format!("bad window: {w} (expected a duration like 10m)")),
+        },
+    };
 
     // A `psi` rule naming a resource the kernel has never heard of measures
     // nothing, and a rule that measures nothing never fires: `psi:oi>20`
@@ -190,6 +212,18 @@ pub fn parse_rule(expr: &str, for_secs: u64) -> Result<AlertRule, String> {
         crate::filter::parse(query).map_err(|e| format!("bad query: {e}"))?;
     }
 
+    // `unit:restarts:nginx` — the figure, then which unit; the same
+    // `target`/`query` split an `[[alert]]` is written in.
+    if kind == AlertKind::Unit {
+        let figure = target.split_once(':').map_or(target, |(f, _)| f);
+        if !figure.is_empty() && !crate::metrics::units::UNIT_SERIES.contains(&figure) {
+            return Err(format!(
+                "unknown unit figure: {figure}\nknown figures: {} (then optionally :unit)",
+                crate::metrics::units::UNIT_SERIES.join(", ")
+            ));
+        }
+    }
+
     if kind == AlertKind::Kernel && !crate::alerts::kernel_target_is_known(target) {
         return Err(format!(
             "unknown kernel event: {target}\nknown events: {}",
@@ -216,7 +250,7 @@ pub fn parse_rule(expr: &str, for_secs: u64) -> Result<AlertRule, String> {
         threshold,
         hysteresis: 0.0,
         for_secs,
-        over_secs: 0,
+        over_secs,
         below,
         // A `trend` target that is not one of the machine series is a
         // process query, which belongs in `query` like a `proc` rule's.
@@ -228,6 +262,7 @@ pub fn parse_rule(expr: &str, for_secs: u64) -> Result<AlertRule, String> {
             (AlertKind::Trend, q) if !is_machine_series(q) => {
                 crate::alerts::split_trend_target(q).0.key_name().to_string()
             }
+            (AlertKind::Unit, t) => t.split_once(':').map_or(t, |(f, _)| f).to_string(),
             (_, t) => t.to_string(),
         },
         query: match (kind, target) {
@@ -235,11 +270,32 @@ pub fn parse_rule(expr: &str, for_secs: u64) -> Result<AlertRule, String> {
             (AlertKind::Trend, q) if !is_machine_series(q) => {
                 crate::alerts::split_trend_target(q).1.to_string()
             }
+            (AlertKind::Unit, t) => t.split_once(':').map_or("", |(_, q)| q).to_string(),
             _ => String::new(),
         },
         command: String::new(),
         command_clear: String::new(),
     })
+}
+
+/// Why `rule` can never fire on this machine because the mount it names is
+/// not one crabmon measures, or `None` when it can. `disk` and `fillin`
+/// only; the disk list is sysinfo's, which leaves out tmpfs and the other
+/// memory filesystems.
+pub fn unmeasured_mount(rule: &AlertRule, snap: &crate::metrics::Snapshot) -> Option<String> {
+    if !matches!(rule.kind, AlertKind::Disk | AlertKind::FillIn) || rule.target.is_empty() {
+        return None;
+    }
+    if snap.disks.iter().any(|d| d.mount == rule.target) {
+        return None;
+    }
+    let known: Vec<&str> = snap.disks.iter().map(|d| d.mount.as_str()).collect();
+    Some(format!(
+        "no filesystem crabmon measures is mounted at {} (tmpfs and other memory filesystems \
+         are not measured)\nmeasured: {}",
+        rule.target,
+        if known.is_empty() { "none".to_string() } else { known.join(", ") }
+    ))
 }
 
 /// Whether a `trend` target names a machine-wide series rather than a
@@ -375,6 +431,52 @@ mod tests {
         // A size, not a bare number: 200M is the point.
         assert!(parse_rule("trend:mem>nonsense", 0).is_err());
         assert!(parse_rule("trend:re:[>1G", 0).is_err(), "a broken query must be refused");
+    }
+
+    #[test]
+    fn a_unit_rule_takes_a_figure_and_then_a_unit() {
+        let r = parse_rule("unit:restarts:nginx>=3", 0).unwrap();
+        assert_eq!(
+            (r.kind, r.target.as_str(), r.query.as_str()),
+            (AlertKind::Unit, "restarts", "nginx")
+        );
+        let r = parse_rule("unit:failed>=1", 0).unwrap();
+        assert_eq!((r.target.as_str(), r.query.as_str()), ("failed", ""));
+        assert_eq!(parse_rule("unit>=1", 0).unwrap().target, "");
+        assert!(parse_rule("unit:nginx>=1", 0).unwrap_err().contains("unknown unit figure"));
+    }
+
+    /// Found on a real host: `fillin:/tmp/x<90` on a tmpfs measured nothing
+    /// and timed out with exit 0, which a script reads as "it never filled".
+    #[test]
+    fn a_rule_about_an_unmeasured_mount_is_refused_by_name() {
+        let snap = crate::metrics::Snapshot {
+            disks: vec![crate::metrics::DiskRow { mount: "/".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let err = unmeasured_mount(&parse_rule("fillin:/tmp/x<90", 0).unwrap(), &snap).unwrap();
+        assert!(err.contains("/tmp/x") && err.contains("measured: /"), "{err}");
+        assert!(unmeasured_mount(&parse_rule("disk:/>=90", 0).unwrap(), &snap).is_none());
+        assert!(unmeasured_mount(&parse_rule("disk>=90", 0).unwrap(), &snap).is_none(), "any");
+        assert!(unmeasured_mount(&parse_rule("cpu>=90", 0).unwrap(), &snap).is_none());
+    }
+
+    /// The window an `[[alert]]` sets as `over_secs`, from a shell.
+    #[test]
+    fn windowed_kinds_take_a_window_after_the_value() {
+        let r = parse_rule("trend:postgres>200M/10m", 0).expect("a windowed trend rule");
+        assert_eq!(r.over_secs, 600);
+        assert_eq!(r.threshold, (200u64 << 20) as f64);
+        assert_eq!(r.query, "postgres");
+        assert_eq!(parse_rule("trend:postgres>200M", 0).unwrap().over_secs, 0);
+        assert_eq!(parse_rule("fillin:/var<3h/30m", 0).unwrap().over_secs, 1800);
+        assert_eq!(parse_rule("fillin:/var<3h/30m", 0).unwrap().threshold, 10800.0);
+        assert_eq!(parse_rule("oomkill>=1/1h", 0).unwrap().over_secs, 3600);
+
+        for bad in ["trend:mem>1G/", "trend:mem>1G/0", "trend:mem>1G/soon"] {
+            assert!(parse_rule(bad, 0).unwrap_err().contains("bad window"), "{bad}");
+        }
+        assert!(parse_rule("cpu>=90/5m", 0).unwrap_err().contains("has no window"));
     }
 
     /// RSS is not the only thing that climbs. `trend:io:postgres` follows the

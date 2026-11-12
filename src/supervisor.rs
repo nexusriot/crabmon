@@ -99,6 +99,9 @@ pub struct Observation {
     /// should be told. Returned rather than spawned so that what a rule
     /// *would* do is assertable.
     pub commands: Vec<HookCall>,
+    /// Every transition this sample, with the same context as `commands`,
+    /// for `[[notify]]` — which wants to hear about rules with no hook too.
+    pub notices: Vec<HookCall>,
     /// Lines worth telling the user: a recording started, a recording
     /// finished, a recording that could not be written.
     pub notes: Vec<String>,
@@ -141,7 +144,9 @@ pub fn observe_with_label(
     let drained = drain_named(engine, flight, snap, &active, label);
     let mut commands = engine.take_commands();
     attach_context(&mut commands, &drained.dumps, label, snap);
-    Observation { active, commands, notes: drained.notes }
+    let mut notices = engine.take_notices();
+    attach_context(&mut notices, &drained.dumps, label, snap);
+    Observation { active, commands, notices, notes: drained.notes }
 }
 
 /// Fill in the parts of a hook's context that the engine cannot know: which
@@ -324,7 +329,7 @@ impl Supervisor {
             // The same line the fleet view shows. `CRABMON_HOST` carries the
             // machine on its own, but a hook that echoes `CRABMON_MESSAGE`
             // into a chat channel should say what the screen says.
-            for call in obs.commands.iter_mut() {
+            for call in obs.commands.iter_mut().chain(obs.notices.iter_mut()) {
                 call.message = format!("{}: {}", self.label, call.message);
             }
         }
@@ -336,6 +341,25 @@ impl Supervisor {
     }
 }
 
+/// How long a hook may run before it is killed. A hook pages somebody; one
+/// still going after a minute is wedged — a `curl` with no timeout against
+/// an endpoint that accepted the connection and never answered — and before
+/// this it was held, with its whole process group, for as long as crabmon ran.
+pub const HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+struct PendingHook {
+    child: std::process::Child,
+    started: std::time::Instant,
+    timeout: std::time::Duration,
+    command: String,
+    /// Report a non-zero exit when reaped. A hook's exit status is its own
+    /// business; a notification that did not arrive is worth saying.
+    report_exit: bool,
+    /// Killed already, and waiting to be reaped: a second kill would be
+    /// aimed at a process group id that may have been reused.
+    killed: bool,
+}
+
 /// Hook children that have been started and not yet reaped.
 ///
 /// A spawned child stays a zombie in the process table until somebody waits
@@ -344,54 +368,169 @@ impl Supervisor {
 /// left a defunct `sh` behind, for the whole life of a process that is
 /// typically left running for weeks and whose own process table is on screen.
 /// A flapping rule made that unbounded.
-static PENDING_HOOKS: std::sync::OnceLock<std::sync::Mutex<Vec<std::process::Child>>> =
-    std::sync::OnceLock::new();
-
-fn pending_hooks() -> &'static std::sync::Mutex<Vec<std::process::Child>> {
-    PENDING_HOOKS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+#[derive(Default)]
+struct Hooks {
+    pending: Vec<PendingHook>,
 }
 
-/// Reap any hook that has finished. Never blocks: a hook still running is
-/// kept and looked at again next time.
-pub fn reap_hooks() {
-    let Ok(mut pending) = pending_hooks().lock() else { return };
-    pending.retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_)) | Err(_)));
+impl Hooks {
+    /// Reap any hook that has finished, and kill any that has outrun its
+    /// timeout. Never blocks: a hook still running is kept and looked at
+    /// again next time. Returns a note for each hook it killed.
+    fn reap(&mut self) -> Vec<String> {
+        let mut notes = Vec::new();
+        self.pending.retain_mut(|hook| {
+            match hook.child.try_wait() {
+                Ok(Some(status)) => {
+                    if hook.report_exit && !hook.killed && !status.success() {
+                        notes.push(format!(
+                            "{} failed ({})",
+                            hook.command,
+                            match status.code() {
+                                Some(code) => curl_failure(code),
+                                None => "killed".to_string(),
+                            }
+                        ));
+                    }
+                    return false;
+                }
+                Err(_) => return false,
+                Ok(None) => {}
+            }
+            if !hook.killed && hook.started.elapsed() >= hook.timeout {
+                kill_hook(&mut hook.child);
+                hook.killed = true;
+                notes.push(format!(
+                    "{} still running after {}s, killed: {}",
+                    if hook.report_exit { "notification" } else { "alert command" },
+                    hook.timeout.as_secs(),
+                    crate::format::truncate_fit(&hook.command, 80)
+                ));
+            }
+            true
+        });
+        notes
+    }
+
+    /// Start each command, after reaping. Returns notes on hooks killed and
+    /// errors for commands that could not be started.
+    fn spawn(&mut self, commands: &[HookCall], timeout: std::time::Duration) -> Vec<String> {
+        let mut notes = self.reap();
+        for call in commands {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg("-c").arg(&call.command).envs(call.env());
+            if let Err(e) = self.start(cmd, None, call.command.clone(), false, timeout) {
+                notes.push(format!("alert command failed: {e}"));
+            }
+        }
+        notes
+    }
+
+    /// Start one child, detached and in a process group of its own, so one
+    /// that outlives its timeout can be killed with whatever it started.
+    /// `stdin` is written whole and closed; it is a few kilobytes at most,
+    /// well inside a pipe's buffer, so the write does not wait on the child.
+    fn start(
+        &mut self,
+        mut cmd: std::process::Command,
+        stdin: Option<String>,
+        command: String,
+        report_exit: bool,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<()> {
+        use std::process::Stdio;
+        cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        let mut child = cmd.spawn()?;
+        if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
+            use std::io::Write;
+            let _ = pipe.write_all(text.as_bytes());
+        }
+        self.pending.push(PendingHook {
+            child,
+            started: std::time::Instant::now(),
+            timeout,
+            command,
+            report_exit,
+            killed: false,
+        });
+        Ok(())
+    }
+}
+
+/// Kill a hook and everything it started. The hook is `sh -c`, so killing
+/// only the shell would leave the `curl` it was waiting on running, now
+/// reparented to init where nothing will ever reap it.
+#[cfg(unix)]
+fn kill_hook(child: &mut std::process::Child) {
+    // Each hook leads its own process group (see `Hooks::spawn`), whose id is
+    // the shell's pid, and the shell has not been reaped, so it is still ours.
+    let pgid = nix::unistd::Pid::from_raw(child.id() as i32);
+    if nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL).is_err() {
+        let _ = child.kill();
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_hook(child: &mut std::process::Child) {
+    let _ = child.kill();
+}
+
+static HOOKS: std::sync::Mutex<Hooks> = std::sync::Mutex::new(Hooks { pending: Vec::new() });
+
+/// Reap finished hooks and kill any past `HOOK_TIMEOUT`; see `Hooks::reap`.
+pub fn reap_hooks() -> Vec<String> {
+    HOOKS.lock().map(|mut h| h.reap()).unwrap_or_default()
+}
+
+/// What a curl exit status means, for a failed notification: `curl exit 28`
+/// sent people to a man page in the middle of an incident.
+pub fn curl_failure(code: i32) -> String {
+    let why = match code {
+        6 => "could not resolve the host",
+        7 => "could not connect",
+        22 => "the server answered with an HTTP error",
+        28 => "timed out",
+        35 | 51 | 58 | 60 | 77 | 91 => "TLS failed",
+        52 => "the server sent nothing",
+        56 => "the connection broke",
+        _ => return format!("curl exit {code}"),
+    };
+    format!("{why}, curl exit {code}")
+}
+
+/// Run `curl --config -` with `config` on its stdin, as a hook: reaped
+/// lazily, killed after `HOOK_TIMEOUT`, and reported under `label` if it
+/// exits non-zero. Returns a note if it could not be started at all.
+pub fn spawn_curl(label: &str, config: String) -> Vec<String> {
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(["--config", "-"]);
+    let Ok(mut hooks) = HOOKS.lock() else { return Vec::new() };
+    match hooks.start(cmd, Some(config), label.to_string(), true, HOOK_TIMEOUT) {
+        Ok(()) => Vec::new(),
+        Err(e) => vec![format!("{label}: could not run curl: {e}")],
+    }
 }
 
 /// How many hook children are still unreaped, for tests.
 pub fn pending_hook_count() -> usize {
-    pending_hooks().lock().map(|p| p.len()).unwrap_or(0)
+    HOOKS.lock().map(|h| h.pending.len()).unwrap_or(0)
 }
 
-/// Spawn hook commands, detached. Returns the ones that could not be started.
+/// Spawn hook commands, detached. Returns the ones that could not be started,
+/// and any earlier hook killed for outrunning `HOOK_TIMEOUT`.
 ///
 /// A hook is a user-configured shell command whose job is to page someone; it
 /// is not waited on, and its output goes nowhere, because an alert hook that
 /// blocks the sampler or scribbles on a full-screen interface is worse than no
 /// hook at all. It is still *reaped*, lazily, so a finished hook does not stay
-/// in the process table as a zombie.
+/// in the process table as a zombie, and killed if it is still running after
+/// `HOOK_TIMEOUT`.
 pub fn spawn_hooks(commands: &[HookCall]) -> Vec<String> {
-    reap_hooks();
-    let mut errors = Vec::new();
-    for call in commands {
-        match std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&call.command)
-            .envs(call.env())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            Ok(child) => {
-                if let Ok(mut pending) = pending_hooks().lock() {
-                    pending.push(child);
-                }
-            }
-            Err(e) => errors.push(format!("alert command failed: {e}")),
-        }
-    }
-    errors
+    HOOKS.lock().map(|mut h| h.spawn(commands, HOOK_TIMEOUT)).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -571,6 +710,59 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("the hook was never reaped");
+    }
+
+    #[test]
+    fn curl_failures_say_what_went_wrong() {
+        assert_eq!(curl_failure(28), "timed out, curl exit 28");
+        assert_eq!(curl_failure(22), "the server answered with an HTTP error, curl exit 22");
+        assert_eq!(curl_failure(99), "curl exit 99");
+    }
+
+    /// A hook that never exits is killed — with what it started — rather
+    /// than held for the life of the process.
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_that_outruns_its_timeout_is_killed_with_its_children() {
+        let dir = std::env::temp_dir().join(format!("crabmon-hookkill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("child");
+        // The shell backgrounds a sleeper and waits on it, which is the shape
+        // of `sh -c 'curl ...'` that killing only the shell gets wrong.
+        let cmd = format!("sleep 600 & echo $! > {}; wait", pidfile.display());
+        // A set of its own: the global one is shared with every other test in
+        // the process, whose hooks must not be killed.
+        let mut hooks = Hooks::default();
+        let timeout = std::time::Duration::from_millis(200);
+        assert!(hooks.spawn(&[HookCall::bare(&cmd)], timeout).is_empty());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let child_pid = loop {
+            if let Ok(text) = std::fs::read_to_string(&pidfile)
+                && let Ok(pid) = text.trim().parse::<i32>()
+            {
+                break pid;
+            }
+            assert!(std::time::Instant::now() < deadline, "the hook never started");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+
+        std::thread::sleep(timeout);
+        let notes = hooks.reap();
+        assert!(notes.iter().any(|n| n.contains("killed") && n.contains("sleep 600")), "{notes:?}");
+
+        // Gone, not a zombie of ours: the sleeper's parent was the shell.
+        let alive = || {
+            std::fs::read_to_string(format!("/proc/{child_pid}/stat"))
+                .map(|s| !s.contains(") Z "))
+                .unwrap_or(false)
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while alive() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!alive(), "the hook's child survived the kill");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The whole point of the context: one generic script, told what fired.

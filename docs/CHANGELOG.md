@@ -3,6 +3,102 @@
 Notable changes to crabmon. Versions follow [semantic versioning](https://semver.org),
 with the usual 0.x caveat that minor releases may change behaviour.
 
+## 0.17.0 — unreleased
+
+Watching more than one machine, and hearing about it: the fleet table sorts
+and counts each host's alerts, rules run on every host, notifications reach
+Slack, Discord, ntfy or a webhook without a script, and systemd services that
+have failed or are restarting in a loop are found even when nothing of theirs
+is running. A replay shows where things happened. Most of the fixes were
+found by running all of it against a real host.
+
+### Added
+
+- **`--ssh-option` and `[remote] ssh_options`**: `ssh_config` options passed
+  as `-o` on every `--remote` connection, `Port=2222` or `IdentityFile=...`,
+  without a `~/.ssh/config` entry. The command line overrides the config,
+  which overrides `~/.ssh/config` and the default `ConnectTimeout=5`;
+  `BatchMode=yes` stays. Something that is not `KEY=VALUE` is refused when
+  it is parsed.
+- **A window for `--watch-rule`**: `trend:postgres>200M/10m`,
+  `fillin:/var<3h/30m`, `oomkill>=1/1h` — the `over_secs` an `[[alert]]`
+  sets, previously fixed at five minutes from a shell.
+- **`--diff --format csv`**: the diff in long form, one row per change,
+  every process rather than the text report's dozen.
+- **`[audit] max_bytes`** (1 MiB): the action log moves to `actions.log.1`
+  at that size instead of growing for ever, and the `L` viewer reads across
+  both, from the end of the file rather than the whole of it.
+- **Fleet sorting and an ALERT column.** In the fleet table `<`, `>` and `s`
+  sort the hosts by name, any figure or the order named, and the `alerts`
+  key puts hosts that are not
+  answering first, then the most rules firing. The cursor stays on its host
+  as rows move and through every re-sort.
+- **Alert rules run on every fleet host** in the interface, not only the
+  selected one; their hooks and notifications say which host.
+- **Host groups**: `[[fleet]]` names a host list, and `--remote @db`
+  watches it. Groups and plain targets mix, and a host named twice is
+  watched once.
+- **`[[notify]]`**: alert transitions posted to a generic JSON webhook,
+  Slack, Discord or ntfy, by `curl` with the URL and body on stdin rather
+  than its command line. Per-target rule filters and an option to skip
+  recoveries. Validated at start. A post that fails says why — `timed out`,
+  `could not connect`, an HTTP error — and the `!` popup keeps the last fifty
+  such notes.
+- **Replay timeline.** The status line draws the recording as a bar with
+  marks where alert rules fire (run over the recording on its own clock) and
+  where kernel events appear; `(` and `)` jump between them, and `:` goes to
+  a frame (`#120`), a time from the start (`5m`) or a relative one (`+30s`).
+  The bar stays when an alert fires in the replay, and a jump starts the
+  rules afresh.
+- **Crash-looping and failed systemd services.** `systemctl show`, every
+  five seconds on its own thread, without root: three automatic restarts
+  within ten minutes is a crash loop (`[units] crash_loop`, `window_secs`),
+  and `ActiveState=failed` is failed, with the reason. Named in the header
+  and the fleet table's STATUS column; the service grouping gives such units
+  a row, first, with a UNIT column, even when none of their processes is
+  running. A `unit` alert kind (`unit:failed>=1`, `unit:restarts:api>=3`),
+  `crabmon_systemd_*` series and a `--doctor` check, which also now checks
+  `[[notify]]` has `curl` to post with. Alerts name the units they are
+  about, firing and recovering; the `--format text` report and the incident
+  summary beside a flight dump list them; and a remote host's restart counts
+  are labelled with the window it counted them over.
+
+### Changed
+
+- **Alert hooks are killed after 60 seconds**, with everything they started,
+  and the status line says so. A hook that never exited was previously held
+  for the life of the process.
+- **`nvidia-smi` runs on a thread of its own.** A driver slow to answer used
+  to hold up the whole sample; now only the GPU figures wait, a sample
+  behind, and are dropped after 15 seconds without an answer.
+
+### Fixed
+
+- **A fleet host that had never answered exported a machine of zeros** —
+  no memory, no load, no OOM kills — under `--serve --remote`, with only
+  `crabmon_up 0` to say none of it was measured. It now exports `up` and
+  `sample_stale` and nothing else.
+- **Every service was credited with the whole machine's network traffic**
+  in the grouped view's NET column, because the host's own namespace was
+  counted as each group's. Only namespaces of a group's own are counted now.
+- **An OOM kill was counted twice, and as a kernel oops too.** The kernel
+  logs a kill twice and prints the allocation's call trace inside the
+  report; each line counted. One kill is now one `oom` event and no `oops`.
+- **`oomkill:<unit>` missed a unit killed at its own `MemoryMax`**, which
+  dies between samples and whose cgroup systemd removes. The kernel's kill
+  line and the unit's `Result=oom-kill` now count it.
+- **A `--watch` match printed an empty machine** (`localhost up 00:00 … mem
+  0 B / 0 B`) around the matching processes. It prints the real one.
+- **`--watch-rule` on a mount crabmon does not measure waited out its
+  timeout and exited 0**, as if the disk never filled. It is refused with
+  the measured mounts listed.
+- **A Unix socket path too long to bind** said only "shorter than SUN_LEN";
+  it now names the path and the limit.
+- **Messages were invisible while an alert fired.** The ALERT banner owned
+  the status line, so a failed notification, a killed hook or the answer to
+  a key press never showed. They now show ahead of it for their few seconds,
+  and the `!` popup keeps the last fifty notes from hooks and notifications.
+
 ## 0.16.0 — unreleased
 
 The numbers behind the headline figures: what the busy CPU time was spent

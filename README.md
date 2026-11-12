@@ -159,6 +159,23 @@ interface as drawn rather than a description of it:
   `error_stats` and `missing`, none of which needs root. A routine check or
   scrub of a complete array is shown as progress, not trouble. SMART is out
   of reach without root; block-layer IO errors are in the kernel panel.
+- **Crash-looping services** — a service with `Restart=on-failure` that
+  dies on startup lives a second at a time, so at almost every sample there
+  is nothing running under it: no row in the grouped view, and a
+  `proc:api<1` rule that flickers rather than holds. systemd counts the
+  restarts itself (`NRestarts`), and crabmon reads that count with
+  `systemctl show` every five seconds on a thread of its own — no root, and
+  nothing in front of the sample. Three automatic restarts within ten minutes
+  is a **crash loop** (`[units] crash_loop`, `window_secs`); a unit in
+  `ActiveState=failed` is **failed**, with why — `failed (exit 2)`,
+  `failed (start-limit-hit)`. Either is named in the header on every layout
+  (`1 unit failed, 1 crash-looping`) and in the fleet table's STATUS column,
+  and the service grouping gives such units a row of their own, first, with
+  a UNIT column, even when no process of theirs is running. A `unit` alert
+  kind and `crabmon_systemd_*` series make it pageable. A restart count
+  crabmon finds already high when it starts is history, not a loop: only
+  restarts it sees happen count. User units (`systemctl --user`) are not
+  read.
 - **Kernel events** — OOM kills, segfaults, kernel oopses and block-IO
   errors, read from `/dev/kmsg`. The dashboard shows memory *now*, and the
   process the OOM killer chose is by definition no longer in the table, so
@@ -190,10 +207,13 @@ interface as drawn rather than a description of it:
   something *stops*, and `kind = "trend"` on growth rather than level — the
   process leaking 200 MB every ten minutes, or whose disk rate or CPU has been
   climbing since Tuesday, which no threshold catches until it is too late to
-  act on. `--serve --alerts` and `--stream --alerts` run the same
+  act on — or a systemd service that has failed or is restarting in a loop
+  (`kind = "unit"`). `--serve --alerts` and `--stream --alerts` run the same
   rules with no terminal at all, exporting each one firing or not — which is
   what puts pressure stall, device saturation and descriptor exhaustion within
-  reach of a pager.
+  reach of a pager. `[[notify]]` posts every transition to Slack, Discord,
+  ntfy or any JSON webhook without a script, and the `!` popup keeps what
+  delivering them said.
 - **File descriptors** — an optional FD column with each process's count
   against its own `RLIMIT_NOFILE`, plus `fd>` and `fd%>` filters and an alert
   kind. Descriptor exhaustion is to a process what inode exhaustion is to a
@@ -202,12 +222,16 @@ interface as drawn rather than a description of it:
   TUI, or run `crabmon --once` headless. `--format text` is the `top -b -n1`
   shape, laid out by the same column planner the interface uses, for when the
   question is "what is this box doing" over SSH and `jq` is not the answer.
+  A `units` line names any service that has failed or is crash-looping.
 - **Record & replay** — `--record` writes every sample to a JSONL file (trimmed
   to keep it a sane size) and `--replay` drives the whole UI from one, so "send
   me a recording of the slowdown" is a workable bug report. `--record-rotate`
   keeps a bounded window of it on disk at all times, and both work headlessly
   under `--stream`, `--serve` and `--watch` — so the always-on recorder is a
-  systemd unit rather than something that needs a terminal in front of it.
+  systemd unit rather than something that needs a terminal in front of it. A
+  replay marks where alert rules fire and kernel events appear on a bar in the
+  status line, `(` and `)` jump between them, and `:` goes to a frame or a
+  time.
 - **Flight recorder** — `[record] flight` keeps the last N frames in memory and
   writes them out, with the aftermath, whenever an alert fires. The recording
   of an incident then exists because the incident happened, rather than because
@@ -222,7 +246,10 @@ interface as drawn rather than a description of it:
 - **Prometheus** — `--serve :9100` runs headless and exposes CPU (including
   time per mode, `crabmon_cpu_mode_percent{mode="steal"}`), memory, swap and
   its paging rate, the kernel's OOM-kill counter, TCP health, storage
-  health (`crabmon_storage_degraded`), per-container
+  health (`crabmon_storage_degraded`), systemd unit failures and crash
+  loops (`crabmon_systemd_units_failed`, `crabmon_systemd_units_crashlooping`,
+  and per unit `crabmon_systemd_unit_restarts_total` and
+  `crabmon_systemd_unit_state`), per-container
   throttling, OOM kills and pressure, load, disks, interfaces, sensors, pressure, power and GPU, plus the busiest
   processes (capped, and configurable), including per-device utilisation and
   request latency and, where `[procs] fds` is on, per-process descriptor counts
@@ -236,7 +263,9 @@ interface as drawn rather than a description of it:
   daemon and no open port, over one long-lived session rather than a process
   per sample. `--remote web-1,web-2,db-1` opens a fleet table instead: one row
   per host, sampled concurrently, so the machine in trouble is visible before
-  you have picked one and an unreachable host costs the others nothing.
+  you have picked one and an unreachable host costs the others nothing. Every
+  host's alert rules run, an ALERT column counts them, the table sorts by any
+  figure or by ALERT (hosts not answering first), and `[[fleet]]` names a host list for `--remote @db`.
 - **Never blocks** — sampling runs on its own thread, so a slow `nvidia-smi`, a
   wedged NFS mount or a stalled SSH link leaves the interface responsive instead
   of freezing it.
@@ -330,7 +359,7 @@ run of stuck workers.
 | `--no-color` | Disable colour (same as `--theme mono`) |
 | `--no-mouse` | Do not capture mouse events |
 | `-1`, `--once` | Print one snapshot and exit (this host only) |
-| `--format <FMT>` | `json` (default), `csv` or `text` for `--once` and `--watch`; `--diff` renders `json` or text |
+| `--format <FMT>` | `json` (default), `csv` or `text` for `--once` and `--watch`; `--diff` renders `json`, `csv` or text |
 | `-n`, `--top <N>` | Limit `--once` and `P` snapshot output to the top N processes |
 | `-c`, `--config <PATH>` | Use an alternate config file |
 | `-g`, `--group <BY>` | Group processes: `none`, `service`, `container`, `user` |
@@ -338,8 +367,9 @@ run of stuck workers.
 | `--record <PATH>` | Record every sample to a JSONL file, replacing it if it exists; works headless too |
 | `--record-rotate <DIR>` | Keep a rotating recording in DIR: `[record] rotate_keep` segments of `rotate_frames` frames, oldest deleted; works headless too |
 | `--replay <PATH>` | Replay a recording instead of sampling this host |
-| `--remote <TARGET>` | Monitor TARGET over SSH; comma-separated for a fleet |
+| `--remote <TARGET>` | Monitor TARGET over SSH; comma-separated for a fleet, `@name` for a `[[fleet]]` group |
 | `--remote-command <C>` | Command to run on the remote host |
+| `--ssh-option <OPT>` | Pass `-o OPT` to `ssh` for `--remote`, e.g. `Port=2222`; repeatable; overrides `[remote] ssh_options`, `~/.ssh/config` and the default `ConnectTimeout=5`, but not `BatchMode=yes` |
 | `--serve <ADDR>` | Serve Prometheus metrics on ADDR (`:9100` or `unix:/path.sock`), headless; with `--remote`, a whole fleet |
 | `--stream` | Print one JSON snapshot per line forever (this host only) |
 | `--alerts` | With `--serve`/`--stream`: evaluate alert rules headlessly |
@@ -363,8 +393,8 @@ run of stuck workers.
 | `/` | Filter processes |
 | `Esc` | Clear the filter |
 | `c` `m` `p` `n` `d` | Sort by CPU / memory / PID / name / disk IO |
-| `<`, `>` (or `,` `.`) | Previous / next sort column |
-| `s` | Reverse the sort order |
+| `<`, `>` (or `,` `.`) | Previous / next sort column; in the fleet table, the hosts' |
+| `s` | Reverse the sort order; in the fleet table, the hosts' |
 | click a header | Sort by that column |
 | `T` | Toggle the process tree |
 | `o`, `O` | Fold / unfold a subtree (tree view) |
@@ -378,6 +408,8 @@ run of stuck workers.
 | `z` | Pause and resume sampling |
 | `[`, `]` | Step a recording back or forward |
 | `{`, `}` | Step a recording ten frames |
+| `(`, `)` | Jump to the previous / next alert or kernel event in a recording |
+| `:` | Go to a frame (`#120`) or time (`5m`, `+30s`, `-2m`) in a recording |
 | `1`–`9` | Apply a saved filter |
 | `0` | Clear the filter |
 | `y` | Copy the command line to the clipboard |
@@ -498,6 +530,27 @@ scans it once for line offsets, which touches no JSON at all, and parses one
 frame at a time as you scrub. Smaller ones are read whole, where holding them
 costs less than indexing them.
 
+An hour of frames is a lot to scrub through for the two minutes that matter,
+so the status line carries the recording as a bar — `──●─────k──────!───` —
+with a mark wherever something happened. `!` is a frame where one of your
+`[[alert]]` rules fires, run over the recording on the recording's own clock
+(a 30-second hold time means 30 recorded seconds, however fast the scan
+runs), so a rule written *after* the incident still finds it. `k` is a kernel
+event — an OOM kill, a segfault, an IO error — where it first appears; the
+ones the recorder started with happened before the recording and are not
+marked. `(` and `)` jump to the previous and next mark.
+
+`:` goes somewhere specific: `#120` is a frame, `5m` is five minutes from the
+start, and `+30s` or `-2m` move from the current frame. The marks and times
+come from one pass over the file on a thread of its own, so a long recording
+is usable from its first frame while the scan finishes; until it does, `#`
+frame numbers still work.
+
+The bar stays on the status line whatever else is going on: an alert firing
+in the replay, or the answer to a key just pressed, is drawn beside it. A
+jump is a gap in time, so the rules start again from the frame jumped to
+rather than carrying the alerts of the one left behind.
+
 ### Recording without a terminal
 
 Both flags work in every mode that samples on a loop, not only the interface:
@@ -588,7 +641,11 @@ crabmon --diff before.json after.json
 The report is what changed: CPU, load, memory, swap and per-filesystem usage,
 then the processes that started, exited and moved, biggest mover first. Passing
 one path instead of two diffs a recording's first frame against its last.
-`--format json` emits the same thing for something other than a human.
+`--format json` emits the same thing for something other than a human, and
+`--format csv` emits it in long form — one row per change,
+`section,pid,name,metric,before,after,delta`, with every process rather than
+the dozen the text report shows, and an empty field for the side a process
+that started or exited does not have.
 
 Processes are matched on PID *and* start time, so a recycled PID reads as one
 process exiting and another starting rather than as a process that grew by
@@ -649,6 +706,37 @@ machine costs the others nothing — it becomes one row saying why, next to the
 last numbers it reported, rather than a blank dashboard. A single target
 behaves exactly as it always has: no fleet table, and no extra stop in the
 `Tab` cycle.
+
+Every host's `[[alert]]` rules run, not only the selected one's: the ALERT
+column counts the rules firing on each machine, and their hooks and
+notifications fire with `CRABMON_HOST` naming the host. The flight recorder
+stays with the selected host, whose frames are the ones it holds. In the
+fleet table `<` and `>` sort the hosts by a column — the heading shows which,
+and which way — and `s` reverses it; `alerts` puts the machines that are not
+answering first, then the most rules firing, which is "where do I look" as one
+sort. The cursor stays on its host as rows move.
+
+A fleet you watch often can be named once:
+
+```toml
+[[fleet]]
+name = "db"
+hosts = ["db-1", "db-2", "deploy@db-3.internal"]
+
+[[fleet]]
+name = "web"
+hosts = ["web-1", "web-2"]
+```
+
+```sh
+crabmon --remote @db               # the three database hosts
+crabmon --remote @db,@web,cache-1  # groups and plain targets mix
+crabmon --serve :9100 --remote @db --alerts
+```
+
+`@` cannot begin an SSH target, so a group never shadows a machine. A host
+named twice — directly and through a group, or by two groups — is watched
+once, and an unknown group is an error naming the ones that exist.
 
 ## Alerts without a terminal
 
@@ -810,14 +898,26 @@ fds = false                 # count every process's open descriptors and read
                             # crabmon's own CPU use (~10% → ~20% of a core).
 pin_marker = true           # show the ▸ pinned / • tagged marker column
 
+[units]
+# systemd services: failures and restart loops, from `systemctl show` every
+# five seconds on a thread of its own.
+enabled = true
+crash_loop = 3              # automatic restarts within window_secs that make a loop
+window_secs = 600
+
 [remote]
 # Hold one SSH session open and read a stream of frames instead of starting a
 # process per sample. Falls back automatically if the far end predates --stream.
 stream = true
+# ssh_config options passed as `-o` on every connection. ssh keeps the first
+# value it is given, so --ssh-option overrides these, and these override
+# ~/.ssh/config and crabmon's own ConnectTimeout=5. BatchMode=yes cannot be
+# overridden: a password prompt would land in the middle of the interface.
+ssh_options = []            # e.g. ["Port=2222", "IdentityFile=~/.ssh/ops"]
 
 [gpu]
 enabled = true
-nvidia_smi = false          # shell out to nvidia-smi each refresh
+nvidia_smi = false          # run nvidia-smi each refresh, off the sampling thread
 
 [export]
 redact_commands = true      # hide credentials in exported command lines
@@ -850,6 +950,17 @@ top_procs = 20              # per-process series exported by --serve, busiest
 [audit]
 enabled = true
 path = ""                   # empty means the platform state directory
+max_bytes = 1048576         # then moved to <path>.1 and started again; 0 never
+
+# Named host lists for --remote @name; see "Watching several machines".
+# [[fleet]]
+# name = "db"
+# hosts = ["db-1", "db-2"]
+
+# Where alert transitions are posted; see "Notifications without a script".
+# [[notify]]
+# kind = "ntfy"
+# url = "https://ntfy.sh/my-servers"
 
 # Queries bound to the number keys, in order. $USER is expanded.
 # Declaring any preset replaces the built-in five rather than adding to them.
@@ -868,14 +979,14 @@ crit = "#ff5555"
 
 [[alert]]
 name = "cpu-saturated"
-kind = "cpu"                # cpu mem swap load disk temp gpu psi io net fd proc trend fillin cgroup kernel cputime vm throttle oomkill tcp storage
+kind = "cpu"                # cpu mem swap load disk temp gpu psi io net fd proc trend fillin cgroup kernel cputime vm throttle oomkill tcp storage unit
 threshold = 90.0            # % for most kinds; °C for temp, B/s for net and
                             # vm (faults/s for vm:majfault), a count for proc
                             # kernel and oomkill, absolute for load
 hysteresis = 0.0            # recovery margin in the measurement's unit
 for_secs = 30               # must hold this long before firing
-over_secs = 0               # trend rules: the window growth is measured
-                            # over, in seconds. 0 means 300.
+over_secs = 0               # trend, fillin and oomkill: the window they
+                            # measure over, in seconds. 0 means 300.
 below = false               # fire when strictly *under* the threshold instead
 target = ""                 # mount point, sensor prefix, GPU or interface
                             # name, psi resource (cpu|mem|io[.full]), a
@@ -939,7 +1050,11 @@ container killed at its own memory limit, and a listener refusing
 connections. `oomkill` counts kills inside its `over_secs` window, so it
 fires on a kill and clears once the window has passed it; with no target it
 counts the whole machine from the kernel's counter, which, unlike
-`kind = "kernel"`, needs no root:
+`kind = "kernel"`, needs no root. A service killed at its own `MemoryMax`
+usually dies between two samples, and systemd removes its cgroup when the
+unit fails, so a named target whose cgroup is gone is counted from what is
+left: the kernel's kill line, which names the cgroup, and systemd keeping
+the unit failed with `Result=oom-kill`:
 
 ```toml
 [[alert]]
@@ -975,6 +1090,26 @@ target = ""                 # md0, a pool or btrfs label; empty = any
 threshold = 1
 command = "page-oncall"
 ```
+
+`kind = "unit"` is the crash-looping service. `target` is the figure —
+`crashloop` (units restarting in a loop; the default), `failed`, or
+`restarts` (the most automatic restarts any unit has had within
+`[units] window_secs`) — and `query` names a unit, `api` or `api.service`;
+empty means every unit:
+
+```toml
+[[alert]]
+name = "api-crash-loop"
+kind = "unit"
+target = "restarts"
+query = "api"
+threshold = 3               # three restarts within the window
+command = "page-oncall"
+```
+
+From a shell the unit follows the figure: `--watch-rule 'unit:failed>=1'`,
+`'unit:restarts:api>=3'`. Where systemd cannot be read the rule measures
+nothing rather than reporting no failures.
 
 `kind = "trend"` measures a *slope* rather than a level, which is the shape a
 threshold cannot express. Every other rule catches a machine that is already
@@ -1025,12 +1160,18 @@ threshold is the same rule pointed the other way — memory being *released* —
 which is a cache being dropped or a service restarting. From a shell:
 
 ```sh
-crabmon --watch-rule 'trend:postgres>200M' --watch-timeout 3600 || page-oncall
+crabmon --watch-rule 'trend:postgres>200M/10m' --watch-timeout 3600 || page-oncall
 ```
 
-`--watch-rule` has nowhere to put an `over_secs`, so a trend watched from a
-shell always measures over the five-minute default; the window is a
-`[[alert]]` setting.
+The `/10m` is the window — the `over_secs` of an `[[alert]]` — and the kinds
+that measure over one (`trend`, `fillin`, `oomkill`) take it the same way:
+`fillin:/var<3h/30m`, `oomkill>=1/1h`. Without it they measure over the
+five-minute default. Any other kind refuses a window rather than ignoring it.
+
+A `disk` or `fillin` rule naming a mount crabmon does not measure is refused
+with the list of mounts it does, rather than waiting out its timeout and
+exiting 0 as if the disk had never filled. The disk list leaves out tmpfs and
+the other memory filesystems.
 
 Per-process series are only kept when a `trend` rule has a `query`, only for
 the series some rule actually names, and for at most a few thousand processes
@@ -1109,6 +1250,12 @@ script serves every rule instead of each rule carrying its own message:
 Every one is always set, empty where it does not apply, so a hook written with
 `set -u` does not have to guess which exist.
 
+A hook is not waited on, but it is not left running for ever either: one still
+going after 60 seconds — a `curl` with no timeout against an endpoint that
+never answers — is killed along with everything it started, and the status
+line and the `!` popup (or stderr, headless) say so. A hook that genuinely needs longer has to
+detach itself.
+
 ```toml
 [[alert]]
 name = "cpu-saturated"
@@ -1131,7 +1278,50 @@ curl -sS -X POST -d "$text" "$WEBHOOK"
 ```
 
 `!` lists the rules, which are firing, and a log of every transition — an alert
-that fires at 03:12 and clears at 03:14 says both.
+that fires at 03:12 and clears at 03:14 says both — followed by the last fifty
+things delivering them said: a notification that failed and why, a hook killed
+for running too long, a flight recording written. Those also flash on the
+status line, ahead of the ALERT banner, which otherwise owns the line for as
+long as the alert holds.
+
+### Notifications without a script
+
+That script is what nearly everybody writes, so crabmon has it built in.
+Each `[[notify]]` posts every transition — of every rule, with or without a
+`command` — to one destination:
+
+```toml
+[[notify]]
+name = "ops-chat"
+kind = "slack"             # webhook | slack | discord | ntfy
+url = "https://hooks.slack.com/services/T000/B000/XXXX"
+
+[[notify]]
+name = "phone"
+kind = "ntfy"
+url = "https://ntfy.sh/my-servers"
+token = ""                 # sent as Authorization: Bearer, when set
+rules = ["disk-fill", "something-was-oom-killed"]   # empty means every rule
+cleared = false            # firings only; true (the default) adds recoveries
+```
+
+`slack` and `discord` post `[FIRING] web-1: cpu-saturated 93% ≥ 90%` as a
+chat message, which Mattermost and Rocket.Chat's Slack-compatible hooks take
+too. `ntfy` sends the message with a title, a priority (high when firing) and
+a tag. `webhook` posts JSON carrying everything a hook is told — `rule`,
+`kind`, `state`, `value`, `threshold`, `message`, `host`, `at`, `dump`,
+`summary` — for anything else to route.
+
+The post is made by `curl`, which has to be installed. Nothing about it is on
+a command line: the URL — which for Slack and Discord *is* the credential —
+the token and the body reach `curl` on its standard input, so `ps` shows
+`curl --config -` and nothing more. A post that fails is said, with why — `timed out`,
+`could not connect`, `the server answered with an HTTP error` — on the status
+line and in the `!` popup (or on stderr, headless), and one still waiting
+after 15 seconds is given up. A target with an unknown `kind` or a URL that is not `http(s)://` stops
+crabmon at start, naming the target, rather than failing at the alert it was
+for. Notifications run wherever rules do — the interface, `--serve --alerts`
+and `--stream --alerts` — and not while replaying a recording.
 
 ## Asking what this host can measure
 
@@ -1245,6 +1435,9 @@ or care before sharing exports; this is not a general secret scanner.
 
 For opt-in end-to-end checks over real SSH, build the release binary and run
 `python3 scripts/e2e-ssh.py --target user@host --binary target/release/crabmon`.
+Add `--units` when the target login is root to also check systemd failure and
+crash-loop detection with transient units, which are stopped and reset
+afterwards.
 The harness requires Linux on both ends, Python 3, noninteractive SSH access,
 and a release binary compatible with the remote architecture and libc. It
 uploads into a private remote `/tmp` directory, starts temporary workloads,

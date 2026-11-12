@@ -576,6 +576,32 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     f.render_stateful_widget(table, inner, &mut state);
 }
 
+/// A unit's state, coloured by how bad it is. A unit that has restarted at
+/// some point but is fine now says how often, quietly; one that is not fine
+/// says why, loudly.
+fn unit_cell<'a>(
+    app: &App,
+    unit: Option<&crate::metrics::units::UnitHealth>,
+    width: u16,
+) -> Cell<'a> {
+    use crate::metrics::units::UnitState;
+    let Some(u) = unit else { return Cell::from("") };
+    let (text, style) = match u.state {
+        UnitState::Ok => (format!("{} restarts", u.restarts), Style::default().fg(app.theme.dim)),
+        UnitState::Restarting => (u.summary(), Style::default().fg(app.theme.warn)),
+        UnitState::CrashLoop | UnitState::Failed => {
+            (u.summary(), Style::default().fg(app.theme.crit).add_modifier(Modifier::BOLD))
+        }
+    };
+    // Narrow, the reason is kept and the word the colour already says is
+    // dropped: `oom-kill` rather than `failed (oom`.
+    let text = match text.chars().count() > width as usize {
+        true => u.short(),
+        false => text,
+    };
+    Cell::from(Span::styled(text, style))
+}
+
 /// The aggregate view: one row per systemd unit, container or user.
 ///
 /// It gets the same selection and scrolling as the process table, because
@@ -593,42 +619,99 @@ fn draw_groups(f: &mut Frame<'_>, area: Rect, inner: Rect, app: &mut App) {
     // the per-process byte count the kernel does not keep. It only earns a
     // column when something in view actually has one, so a machine running no
     // containers is not given a column of dashes.
-    let with_net = groups.iter().any(|g| g.net_bps.is_some());
+    let mut with_net = groups.iter().any(|g| g.net_bps.is_some());
     // LIMIT earns its column the same way: only when something in view is
     // actually limited. A machine with no quotas anywhere is not given a
     // column of dashes.
-    let with_limit = groups.iter().any(|g| g.cgroup_mem_ratio.is_some());
+    let mut with_limit = groups.iter().any(|g| g.cgroup_mem_ratio.is_some());
     // THROTL is the share of quota periods the group ran out in — the latency
     // that average CPU against a quota hides — and only where some group has
     // a quota that elapsed periods. OOM is kills inside the group, and only
     // where one has happened: a column of zeros is a column nobody reads.
-    let with_throttle = groups.iter().any(|g| g.cgroup_throttled.is_some());
-    let with_oom = groups.iter().any(|g| g.cgroup_oom_kills.is_some_and(|n| n > 0));
+    let mut with_throttle = groups.iter().any(|g| g.cgroup_throttled.is_some());
+    let mut with_oom = groups.iter().any(|g| g.cgroup_oom_kills.is_some_and(|n| n > 0));
+    // UNIT is what systemd says about the unit — failed, crash-looping,
+    // restarting — and appears once any unit in view has something to say.
+    let with_unit = groups.iter().any(|g| g.unit.is_some());
+    // On a narrow terminal the extras cannot all fit, and squeezing every
+    // one of them left a UNIT cell reading `fail` beside empty LIMIT and NET
+    // columns. They give way in order, least urgent first; a service that has
+    // failed is the last thing to lose.
+    let mut with_disk = true;
+    let mut unit_w: u16 = 22;
+    {
+        // GROUP's floor, the three columns that always stay and their
+        // gaps, then each optional column with the gap before it.
+        let need = |disk: bool, net: bool, lim: bool, thr: bool, oom: bool, unit: u16| -> u16 {
+            10 + 3 * 7
+                + 9
+                + if disk { 9 } else { 0 }
+                + if net { 10 } else { 0 }
+                + if lim { 8 } else { 0 }
+                + if thr { 8 } else { 0 }
+                + if oom { 6 } else { 0 }
+                + if unit > 0 { unit + 1 } else { 0 }
+        };
+        let width = inner.width;
+        let unit_floor = if with_unit { 12 } else { 0 };
+        for drop in 0..5 {
+            if need(with_disk, with_net, with_limit, with_throttle, with_oom, unit_floor) <= width {
+                break;
+            }
+            match drop {
+                0 => with_net = false,
+                1 => with_limit = false,
+                2 => with_throttle = false,
+                3 => with_oom = false,
+                _ => with_disk = false,
+            }
+        }
+        if with_unit {
+            let rest = need(with_disk, with_net, with_limit, with_throttle, with_oom, 0);
+            unit_w = width.saturating_sub(rest + 1).clamp(8, 22);
+        }
+    }
 
-    let mut titles = vec!["GROUP", "PROCS", "CPU%", "MEM", "DISK"];
+    let mut titles = vec!["GROUP", "PROCS", "CPU%", "MEM"];
     let mut widths = vec![
         Constraint::Min(8),
         Constraint::Length(6),
         Constraint::Length(6),
         Constraint::Length(8),
-        Constraint::Length(8),
     ];
-    let mut reserved = 34;
+    if with_disk {
+        titles.push("DISK");
+        widths.push(Constraint::Length(8));
+    }
     for (on, title, w) in [
         (with_net, "NET", 9),
         (with_limit, "LIMIT", 7),
         (with_throttle, "THROTL", 7),
         (with_oom, "OOM", 5),
+        (with_unit, "UNIT", unit_w),
     ] {
         if on {
             titles.push(title);
             widths.push(Constraint::Length(w));
-            reserved += w;
         }
     }
     let header =
         Row::new(titles).style(Style::default().add_modifier(Modifier::BOLD).fg(app.theme.title));
-    let name_w = inner.width.saturating_sub(reserved) as usize;
+    // GROUP takes exactly what the other columns leave — as a `Min` it was
+    // handed more than its share and the last column paid, cutting UNIT's
+    // `oom-kill` to `oom-k` on an 80-column terminal. Each column after the
+    // first costs its width plus one cell of spacing.
+    let fixed: u16 = widths
+        .iter()
+        .skip(1)
+        .map(|c| match c {
+            Constraint::Length(w) => w + 1,
+            _ => 1,
+        })
+        .sum();
+    let name_w = inner.width.saturating_sub(fixed).max(8);
+    widths[0] = Constraint::Length(name_w);
+    let name_w = name_w as usize;
     let ratio_cell = |r: Option<f64>| match r {
         None => Cell::from("     -".to_string()),
         Some(r) => Cell::from(Span::styled(
@@ -654,12 +737,14 @@ fn draw_groups(f: &mut Frame<'_>, area: Rect, inner: Rect, app: &mut App) {
             Cell::from(format!("{:>5}", g.procs)),
             Cell::from(Span::styled(format!("{:>5.1}", g.cpu), Style::default().fg(color))),
             Cell::from(format!("{:>7}", compact_bytes(g.mem))),
-            Cell::from(if g.io_bps < 1.0 {
+        ];
+        if with_disk {
+            cells.push(Cell::from(if g.io_bps < 1.0 {
                 "      -".to_string()
             } else {
                 format!("{:>7}", compact_bytes(g.io_bps as u64))
-            }),
-        ];
+            }));
+        }
         if with_net {
             // `None` is a group whose processes report no namespace at all,
             // which is not the same as a container that moved no bytes.
@@ -684,6 +769,9 @@ fn draw_groups(f: &mut Frame<'_>, area: Rect, inner: Rect, app: &mut App) {
                 }
                 _ => Cell::from("   -".to_string()),
             });
+        }
+        if with_unit {
+            cells.push(unit_cell(app, g.unit.as_ref(), unit_w));
         }
         Row::new(cells)
     });

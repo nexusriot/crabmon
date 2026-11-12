@@ -1,6 +1,6 @@
 [package]
 name = "crabmon"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2024"
 # The floor is the highest any dependency asks for, not the edition's own
 # 1.85: sysinfo 0.40 wants 1.95. Declared so cargo refuses an older toolchain
@@ -60,11 +60,13 @@ with tree view, grouping by systemd unit or container, per-process disk IO, \
 listening ports, open sockets and open files, renice/affinity/signal control \
 in bulk, network and disk throughput charts, per-container network, \
 temperature sensors, GPU, cgroup, pressure-stall and battery panels, \
-threshold alerts with recovery hooks that also run headlessly, JSON/CSV \
-snapshot export, snapshot diffing, a headless watch mode for processes or any \
-measured condition, session recording and replay with or without a terminal, \
-a Prometheus exporter and streaming remote monitoring over SSH of one host or \
-a fleet.
+threshold alerts with recovery hooks that also run headlessly, notifications \
+to Slack, Discord, ntfy or a webhook, failed and crash-looping systemd \
+service detection, JSON/CSV snapshot export, snapshot diffing, a headless \
+watch mode for processes or any measured condition, session recording and \
+replay with a timeline of alerts and kernel events, with or without a \
+terminal, a Prometheus exporter and streaming remote monitoring over SSH of \
+one host or a sortable fleet.
 """
 assets = [
   ["target/release/crabmon", "/usr/bin/", "755"],

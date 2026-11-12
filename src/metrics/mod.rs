@@ -23,6 +23,7 @@ pub mod smaps;
 pub mod sockets;
 pub mod storage;
 pub mod sysinfo_source;
+pub mod units;
 
 use serde::{Deserialize, Serialize};
 
@@ -402,10 +403,29 @@ pub struct Snapshot {
     /// md arrays, ZFS pools and btrfs filesystems, worst first. Empty on a
     /// machine with none, which is most of them.
     pub storage: Vec<storage::StorageArray>,
+    /// systemd services that have failed, are restarting, or have restarted:
+    /// worst first. Empty where systemd is not running or not readable,
+    /// which `units_unreadable` tells apart from a healthy machine.
+    pub units: Vec<units::UnitHealth>,
+    /// A frame without this field — from a crabmon that predates unit
+    /// watching, over `--remote` or in a recording — reads as "not
+    /// reported", not as a machine with no failed services.
+    #[serde(default = "units::not_reported")]
+    pub units_unreadable: Option<String>,
     pub taken_at_unix: u64,
 }
 
 impl Snapshot {
+    /// A unit's health by its id, `nginx.service`.
+    pub fn unit(&self, name: &str) -> Option<&units::UnitHealth> {
+        self.units.iter().find(|u| u.name == name)
+    }
+
+    /// How many units are in a state, for the header and the exporter.
+    pub fn units_in(&self, state: units::UnitState) -> usize {
+        self.units.iter().filter(|u| u.state == state).count()
+    }
+
     /// A group's own accounting, by container id or unit name.
     pub fn cgroup_named(&self, name: &str) -> Option<&cgroup::CgroupStat> {
         self.cgroups.iter().find(|c| c.is_named(name))

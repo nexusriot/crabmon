@@ -10,6 +10,7 @@ _crabmon() {
         '--replay[replay a recording instead of sampling]:file:_files' \
         '--remote[monitor another host over SSH]:target:_hosts' \
         '--remote-command[command to run on the remote host]:command:' \
+        '*--ssh-option[pass -o OPT to ssh for --remote]:option:' \
         '--serve[serve Prometheus metrics on ADDR]:address:' \
         '--stream[print one JSON snapshot per line forever]' \
         '--alerts[with --serve/--stream: evaluate alert rules headlessly]' \

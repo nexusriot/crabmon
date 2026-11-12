@@ -154,6 +154,114 @@ impl Diff {
         serde_json::to_string_pretty(self).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
     }
 
+    /// The diff in long form, one row per figure that changed:
+    /// `section,pid,name,metric,before,after,delta`. Every row, not the
+    /// `LIST_LIMIT` the text report shows — CSV is for a spreadsheet or a
+    /// script to filter, not for reading. A side that did not exist (a
+    /// process that appeared or vanished) is an empty field, not a zero.
+    pub fn to_csv(&self) -> String {
+        use crate::export::csv_field;
+        let mut out = String::from("section,pid,name,metric,before,after,delta\n");
+        let mut row = |section: &str,
+                       pid: Option<u32>,
+                       name: &str,
+                       metric: &str,
+                       before: Option<String>,
+                       after: Option<String>,
+                       delta: Option<String>| {
+            let pid = pid.map(|p| p.to_string()).unwrap_or_default();
+            out.push_str(&format!(
+                "{section},{pid},{},{metric},{},{},{}\n",
+                csv_field(name),
+                before.unwrap_or_default(),
+                after.unwrap_or_default(),
+                delta.unwrap_or_default()
+            ));
+        };
+        let f = |v: f64| format!("{v:.2}");
+        let i = |a: u64, b: u64| (b as i64 - a as i64).to_string();
+
+        row(
+            "machine",
+            None,
+            "",
+            "cpu_percent",
+            Some(f(self.cpu.0)),
+            Some(f(self.cpu.1)),
+            Some(f(self.cpu.1 - self.cpu.0)),
+        );
+        row(
+            "machine",
+            None,
+            "",
+            "load1",
+            Some(f(self.load1.0)),
+            Some(f(self.load1.1)),
+            Some(f(self.load1.1 - self.load1.0)),
+        );
+        for (metric, (a, b)) in
+            [("mem_used_bytes", self.mem_used), ("swap_used_bytes", self.swap_used)]
+        {
+            row(
+                "machine",
+                None,
+                "",
+                metric,
+                Some(a.to_string()),
+                Some(b.to_string()),
+                Some(i(a, b)),
+            );
+        }
+        let (a, b) = self.procs;
+        row(
+            "machine",
+            None,
+            "",
+            "processes",
+            Some(a.to_string()),
+            Some(b.to_string()),
+            Some(i(a as u64, b as u64)),
+        );
+        for d in &self.disks {
+            row(
+                "disk",
+                None,
+                &d.mount,
+                "used_bytes",
+                Some(d.used_before.to_string()),
+                Some(d.used_after.to_string()),
+                Some(d.delta().to_string()),
+            );
+        }
+        for p in &self.appeared {
+            row("appeared", Some(p.pid), &p.name, "mem_bytes", None, Some(p.mem.to_string()), None);
+        }
+        for p in &self.vanished {
+            row("vanished", Some(p.pid), &p.name, "mem_bytes", Some(p.mem.to_string()), None, None);
+        }
+        for m in &self.movers {
+            row(
+                "moved",
+                Some(m.pid),
+                &m.name,
+                "cpu_percent",
+                Some(f(m.cpu_before as f64)),
+                Some(f(m.cpu_after as f64)),
+                Some(f(m.cpu_delta() as f64)),
+            );
+            row(
+                "moved",
+                Some(m.pid),
+                &m.name,
+                "mem_bytes",
+                Some(m.mem_before.to_string()),
+                Some(m.mem_after.to_string()),
+                Some(m.mem_delta().to_string()),
+            );
+        }
+        out
+    }
+
     pub fn to_text(&self) -> String {
         let mut out = String::new();
         if self.hosts_differ() {
@@ -315,6 +423,23 @@ mod tests {
         assert_eq!(d.movers.len(), 1);
         assert_eq!(d.movers[0].mem_delta(), 800);
         assert_eq!(d.movers[0].cpu_delta(), 8.0);
+    }
+
+    #[test]
+    fn the_csv_form_is_one_row_per_change_with_empty_missing_sides() {
+        let before =
+            snap(100, vec![row(1, 1, "stays", 1.0, 100), row(2, 2, "goes, quietly", 0.0, 50)]);
+        let after = snap(160, vec![row(1, 1, "stays", 9.0, 900), row(3, 3, "new", 0.0, 70)]);
+        let csv = compare(&before, &after).to_csv();
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines[0], "section,pid,name,metric,before,after,delta");
+        assert!(lines.contains(&"machine,,,processes,2,2,0"), "{csv}");
+        assert!(lines.contains(&"appeared,3,new,mem_bytes,,70,"), "{csv}");
+        assert!(lines.contains(&"vanished,2,\"goes, quietly\",mem_bytes,50,,"), "{csv}");
+        assert!(lines.contains(&"moved,1,stays,mem_bytes,100,900,800"), "{csv}");
+        assert!(lines.contains(&"moved,1,stays,cpu_percent,1.00,9.00,8.00"), "{csv}");
+        // Every row has the header's seven fields (the quoted comma aside).
+        assert!(lines.iter().filter(|l| !l.contains('"')).all(|l| l.split(',').count() == 7));
     }
 
     #[test]

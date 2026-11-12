@@ -9,7 +9,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Every long flag the parser accepts. The docs tests check this against the
 /// README, the man page and the shell completions.
-pub const LONG_FLAGS: [&str; 33] = [
+pub const LONG_FLAGS: [&str; 34] = [
     "--refresh",
     "--sort",
     "--ascending",
@@ -31,6 +31,7 @@ pub const LONG_FLAGS: [&str; 33] = [
     "--replay",
     "--remote",
     "--remote-command",
+    "--ssh-option",
     "--serve",
     "--stream",
     "--alerts",
@@ -94,6 +95,8 @@ pub struct Args {
     pub remote: Option<String>,
     /// Command run on the far end of `--remote`.
     pub remote_command: Option<String>,
+    /// Extra `ssh -o` options for `--remote`, repeatable.
+    pub ssh_options: Vec<String>,
     pub group: Option<crate::metrics::GroupBy>,
 }
 
@@ -124,7 +127,7 @@ OPTIONS:
         --no-color           Disable colour (same as --theme mono)
         --no-mouse           Do not capture mouse events
     -1, --once               Print a single snapshot and exit
-        --format <FMT>       json|csv|text for --once/--watch; json|text for --diff
+        --format <FMT>       json|csv|text for --once, --watch and --diff
     -n, --top <N>            Limit --once output to the top N processes
     -c, --config <PATH>      Use an alternate config file
     -g, --group <BY>         Group processes: none|service|container|user
@@ -133,8 +136,10 @@ OPTIONS:
                              [record] rotate_keep segments of rotate_frames
                              frames each, oldest deleted
         --replay <PATH>      Replay a recording instead of sampling this host
-        --remote <TARGET>    Monitor TARGET over SSH (needs crabmon installed there)
+        --remote <TARGET>    Monitor TARGET over SSH (needs crabmon installed there);
+                             a,b,c for a fleet, @name for a [[fleet]] group
         --remote-command <C> Command to run on the remote host
+        --ssh-option <OPT>   Pass -o OPT to ssh for --remote; repeatable
         --serve <ADDR>       Serve Prometheus metrics on ADDR: :9100, or a
                              socket path like unix:/run/crabmon.sock
         --stream             Print a JSON snapshot per line forever
@@ -294,6 +299,11 @@ where
             "--remote-command" => {
                 out.remote_command = Some(take_value(&mut i, &args, inline, &flag)?)
             }
+            "--ssh-option" => {
+                let v = take_value(&mut i, &args, inline, &flag)?;
+                crate::remote::ssh_option_args([&v])?;
+                out.ssh_options.push(v);
+            }
             "--serve" => out.serve = Some(take_value(&mut i, &args, inline, &flag)?),
             "--stream" => out.stream = true,
             "--doctor" => out.doctor = true,
@@ -345,6 +355,9 @@ where
     let sources = [out.replay.is_some(), out.remote.is_some()];
     if sources.iter().filter(|s| **s).count() > 1 {
         return Err("--replay and --remote cannot be combined".into());
+    }
+    if !out.ssh_options.is_empty() && out.remote.is_none() {
+        return Err("--ssh-option only applies to --remote".into());
     }
     if out.replay.is_some() && out.record.is_some() {
         return Err("--record and --replay cannot be combined".into());

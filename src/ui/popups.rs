@@ -133,6 +133,17 @@ pub fn renice(f: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
+pub fn seek(f: &mut Frame<'_>, area: Rect, app: &App) {
+    input_popup(
+        f,
+        area,
+        app,
+        " Go to ".to_string(),
+        "#frame, 5m from the start, or +30s / -2m:",
+        "[Enter] go   [Esc] cancel",
+    );
+}
+
 pub fn affinity(f: &mut Frame<'_>, area: Rect, app: &App) {
     input_popup(
         f,
@@ -408,7 +419,7 @@ fn fd_field(p: &crate::metrics::ProcRow) -> String {
 }
 
 /// Every binding, in one place, so the help and the README cannot drift.
-pub const KEYS: [(&str, &str); 42] = [
+pub const KEYS: [(&str, &str); 44] = [
     ("q / Ctrl-C", "quit"),
     ("↑ ↓ / k j", "move selection"),
     ("PgUp PgDn", "move a page"),
@@ -417,8 +428,8 @@ pub const KEYS: [(&str, &str); 42] = [
     ("/", "filter (user: pid: cpu> mem> re: !neg)"),
     ("Esc", "clear the filter"),
     ("c m p n d", "sort by cpu / mem / pid / name / disk"),
-    ("< >", "previous / next sort column"),
-    ("s", "reverse sort order"),
+    ("< >", "previous / next sort column (hosts, in the fleet)"),
+    ("s", "reverse sort order (hosts, in the fleet)"),
     ("click header", "sort by that column"),
     ("T", "toggle process tree"),
     ("H", "show or hide individual threads"),
@@ -431,6 +442,8 @@ pub const KEYS: [(&str, &str); 42] = [
     ("z", "pause and resume sampling"),
     ("[ ]", "step a recording back or forward"),
     ("{ }", "step a recording ten frames"),
+    ("( )", "previous / next alert or kernel event in a recording"),
+    (":", "go to a frame or time in a recording"),
     ("1-9", "apply a saved filter"),
     ("0", "clear the filter"),
     ("y", "copy the command line to the clipboard"),
@@ -469,7 +482,7 @@ pub fn help(f: &mut Frame<'_>, area: Rect, app: &mut App) {
 }
 
 pub fn alerts(f: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let total = app.alerts.rules.len() + app.alerts.history_len();
+    let total = app.alerts.rules.len() + app.alerts.history_len() + app.alert_notes.len();
     let inner = scroll_frame(f, area, app, " Alerts ", total, (72, 60));
     if app.alerts.rules.is_empty() {
         f.render_widget(
@@ -525,8 +538,29 @@ pub fn alerts(f: &mut Frame<'_>, area: Rect, app: &mut App) {
         })
         .collect();
 
+    // What delivering them said, newest first: a notification that did not
+    // arrive is the one thing about an alert you most need to know, and it
+    // happens exactly while the alert holds the status line.
+    let note_rows = app.alert_notes.iter().rev().map(|(at, note)| {
+        let failed = note.contains("failed") || note.contains("killed");
+        let style = if failed {
+            Style::default().fg(app.theme.warn)
+        } else {
+            Style::default().fg(app.theme.dim)
+        };
+        Row::new(vec![
+            Cell::from(Span::styled(note.clone(), style)),
+            Cell::from("note"),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(relative_time(&at.to_string())),
+            Cell::from(""),
+        ])
+    });
+
     let mut rows = rule_rows;
     rows.extend(history_rows);
+    rows.extend(note_rows);
     let rows: Vec<Row> = rows
         .into_iter()
         .skip(app.popup_scroll)

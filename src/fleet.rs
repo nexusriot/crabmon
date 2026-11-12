@@ -21,6 +21,9 @@ use crate::metrics::{MetricSource, Snapshot};
 pub struct FleetHost {
     /// What the user wrote: `web-1`, `deploy@db-2`, `localhost`.
     pub target: String,
+    /// Position in the order the hosts were named, which is what
+    /// `MetricSource::select_host` takes. The table may be sorted otherwise.
+    pub index: usize,
     /// The most recent frame, or a default one if none has arrived yet.
     pub snapshot: Snapshot,
     /// Why this host has no current numbers, when it has none.
@@ -157,8 +160,10 @@ impl MetricSource for FleetSource {
     fn fleet(&self) -> Vec<FleetHost> {
         self.hosts
             .iter()
-            .map(|h| FleetHost {
+            .enumerate()
+            .map(|(index, h)| FleetHost {
                 target: h.target.clone(),
+                index,
                 snapshot: h.latest.clone(),
                 error: h.source.error(),
                 waiting: !h.seen,
@@ -209,6 +214,184 @@ impl MetricSource for FleetSource {
 /// has an `@` and a `:` in it already.
 pub fn parse_targets(spec: &str) -> Vec<String> {
     spec.split(',').map(str::trim).filter(|t| !t.is_empty()).map(String::from).collect()
+}
+
+/// A named list of hosts, from `[[fleet]]`, so a fleet is `--remote @db`
+/// rather than the same comma-separated list retyped every time.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct FleetGroup {
+    pub name: String,
+    pub hosts: Vec<String>,
+}
+
+/// `parse_targets`, with each `@name` replaced by that group's hosts.
+///
+/// `@` because it cannot start an SSH target — `user@host` has one, but not
+/// first — so a group can never shadow a machine of the same name. A host
+/// named twice, directly or through two groups, is watched once, where it
+/// was first named: two workers on one machine would be two rows that
+/// always agree, and two recorders truncating the same file.
+pub fn expand_targets(spec: &str, groups: &[FleetGroup]) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for item in parse_targets(spec) {
+        let named = match item.strip_prefix('@') {
+            Some(name) => {
+                let group = groups.iter().find(|g| g.name == name).ok_or_else(|| {
+                    let known: Vec<String> =
+                        groups.iter().map(|g| format!("@{}", g.name)).collect();
+                    match known.is_empty() {
+                        true => format!("no [[fleet]] group named {name}"),
+                        false => {
+                            format!("no [[fleet]] group named {name}; known: {}", known.join(", "))
+                        }
+                    }
+                })?;
+                let hosts: Vec<String> = group
+                    .hosts
+                    .iter()
+                    .map(|h| h.trim())
+                    .filter(|h| !h.is_empty())
+                    .map(String::from)
+                    .collect();
+                if hosts.is_empty() {
+                    return Err(format!("[[fleet]] group {name} names no hosts"));
+                }
+                hosts
+            }
+            None => vec![item],
+        };
+        for host in named {
+            if !out.contains(&host) {
+                out.push(host);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// What the fleet table is sorted by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FleetSort {
+    /// The order the hosts were named in.
+    #[default]
+    Named,
+    Host,
+    Cpu,
+    Mem,
+    Swap,
+    Load,
+    Disk,
+    Net,
+    Procs,
+    /// Rules firing, with a host that is not answering counted worst of all:
+    /// "which machine needs me" as one key press.
+    Alerts,
+}
+
+impl FleetSort {
+    pub const ALL: [FleetSort; 10] = [
+        FleetSort::Named,
+        FleetSort::Host,
+        FleetSort::Cpu,
+        FleetSort::Mem,
+        FleetSort::Swap,
+        FleetSort::Load,
+        FleetSort::Disk,
+        FleetSort::Net,
+        FleetSort::Procs,
+        FleetSort::Alerts,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            FleetSort::Named => "as named",
+            FleetSort::Host => "host",
+            FleetSort::Cpu => "cpu",
+            FleetSort::Mem => "mem",
+            FleetSort::Swap => "swap",
+            FleetSort::Load => "load",
+            FleetSort::Disk => "disk",
+            FleetSort::Net => "net",
+            FleetSort::Procs => "procs",
+            FleetSort::Alerts => "alerts",
+        }
+    }
+
+    pub fn next(self) -> FleetSort {
+        let i = Self::ALL.iter().position(|k| *k == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
+    pub fn prev(self) -> FleetSort {
+        let i = Self::ALL.iter().position(|k| *k == self).unwrap_or(0);
+        Self::ALL[(i + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    /// Whether a key reads best biggest-first, which is every figure: the
+    /// busiest host is the one being looked for. Names read A to Z.
+    pub fn default_desc(self) -> bool {
+        !matches!(self, FleetSort::Named | FleetSort::Host)
+    }
+}
+
+/// Order `hosts` by `key`. `alerts(host)` is how many rules are firing on
+/// it, which only the caller knows.
+///
+/// A host with no numbers sorts after every host that has some, whichever
+/// way the figures are sorted — a blank row at the top of "busiest CPU"
+/// would read as the busiest — except under `Alerts`, where a host that is
+/// not answering is the worst of all and goes first. The sort is stable, so
+/// ties keep the order the hosts were named in.
+pub fn sort_hosts(
+    hosts: &mut [FleetHost],
+    key: FleetSort,
+    desc: bool,
+    show_virtual: bool,
+    alerts: impl Fn(&FleetHost) -> usize,
+) {
+    use std::cmp::Ordering;
+    let figure = |h: &FleetHost| -> Option<f64> {
+        let s = &h.snapshot;
+        if !h.has_data() {
+            return None;
+        }
+        Some(match key {
+            FleetSort::Cpu => s.cpu.avg(),
+            FleetSort::Mem => s.mem.ratio(),
+            FleetSort::Swap => s.mem.swap_ratio(),
+            FleetSort::Load => s.host.load[0],
+            FleetSort::Disk => s.disk_util_max().unwrap_or(0.0),
+            FleetSort::Net => {
+                let (rx, tx) = s.net_totals(show_virtual);
+                rx + tx
+            }
+            FleetSort::Procs => s.procs.len() as f64,
+            _ => 0.0,
+        })
+    };
+    let dir = |o: Ordering| if desc { o.reverse() } else { o };
+    match key {
+        FleetSort::Named => {
+            hosts.sort_by_key(|h| h.index);
+            if desc {
+                hosts.reverse();
+            }
+        }
+        FleetSort::Host => hosts.sort_by(|a, b| dir(a.target.cmp(&b.target))),
+        FleetSort::Alerts => {
+            // Unreachable first, then most rules firing; the direction only
+            // reverses the whole thing.
+            let rank = |h: &FleetHost| (!h.is_live() as usize, alerts(h));
+            hosts.sort_by(|a, b| dir(rank(a).cmp(&rank(b))));
+        }
+        _ => hosts.sort_by(|a, b| match (figure(a), figure(b)) {
+            (Some(x), Some(y)) => dir(x.partial_cmp(&y).unwrap_or(Ordering::Equal)),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -434,5 +617,88 @@ mod tests {
         assert_eq!(f.snapshot(Duration::ZERO).host.hostname, "");
         assert!(f.fleet().is_empty());
         assert_eq!(f.label(), None);
+    }
+
+    fn groups() -> Vec<FleetGroup> {
+        vec![
+            FleetGroup { name: "db".into(), hosts: vec!["db-1".into(), "db-2".into()] },
+            FleetGroup { name: "web".into(), hosts: vec!["web-1".into(), "db-1".into()] },
+            FleetGroup { name: "empty".into(), hosts: vec![" ".into()] },
+        ]
+    }
+
+    #[test]
+    fn a_group_expands_in_place_and_a_host_is_watched_once() {
+        assert_eq!(
+            expand_targets("@db,cache,@web", &groups()).unwrap(),
+            ["db-1", "db-2", "cache", "web-1"]
+        );
+        assert_eq!(expand_targets("deploy@db-1", &groups()).unwrap(), ["deploy@db-1"]);
+    }
+
+    #[test]
+    fn an_unknown_or_empty_group_is_refused_by_name() {
+        let err = expand_targets("@nope", &groups()).unwrap_err();
+        assert!(err.contains("nope") && err.contains("@db"), "{err}");
+        assert!(expand_targets("@empty", &groups()).unwrap_err().contains("names no hosts"));
+        assert!(expand_targets("@x", &[]).unwrap_err().contains("no [[fleet]] group"));
+    }
+
+    fn row(target: &str, index: usize, cpu: f32, live: bool) -> FleetHost {
+        FleetHost {
+            target: target.into(),
+            index,
+            snapshot: Snapshot {
+                cpu: CpuSample { per_core: vec![cpu], freq_mhz: vec![] },
+                ..Default::default()
+            },
+            error: (!live).then(|| "down".to_string()),
+            waiting: false,
+        }
+    }
+
+    fn order(hosts: &[FleetHost]) -> Vec<&str> {
+        hosts.iter().map(|h| h.target.as_str()).collect()
+    }
+
+    #[test]
+    fn hosts_sort_by_a_figure_with_blank_rows_last_either_way() {
+        let mut never = row("never", 3, 0.0, true);
+        never.waiting = true;
+        let mut hosts =
+            vec![row("a", 0, 10.0, true), row("b", 1, 90.0, true), row("c", 2, 50.0, true), never];
+        sort_hosts(&mut hosts, FleetSort::Cpu, true, false, |_| 0);
+        assert_eq!(order(&hosts), ["b", "c", "a", "never"]);
+        sort_hosts(&mut hosts, FleetSort::Cpu, false, false, |_| 0);
+        assert_eq!(order(&hosts), ["a", "c", "b", "never"]);
+        sort_hosts(&mut hosts, FleetSort::Named, false, false, |_| 0);
+        assert_eq!(order(&hosts), ["a", "b", "c", "never"]);
+    }
+
+    #[test]
+    fn the_alerts_key_puts_unreachable_hosts_then_the_most_alerts_first() {
+        let mut hosts = vec![
+            row("quiet", 0, 1.0, true),
+            row("two", 1, 1.0, true),
+            row("down", 2, 1.0, false),
+            row("one", 3, 1.0, true),
+        ];
+        let firing = |h: &FleetHost| match h.target.as_str() {
+            "two" => 2,
+            "one" => 1,
+            _ => 0,
+        };
+        sort_hosts(&mut hosts, FleetSort::Alerts, true, false, firing);
+        assert_eq!(order(&hosts), ["down", "two", "one", "quiet"]);
+    }
+
+    #[test]
+    fn sort_keys_cycle_both_ways() {
+        let mut k = FleetSort::Named;
+        for _ in 0..FleetSort::ALL.len() {
+            assert_eq!(k.next().prev(), k);
+            k = k.next();
+        }
+        assert_eq!(k, FleetSort::Named);
     }
 }

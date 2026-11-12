@@ -102,12 +102,21 @@ pub enum AlertKind {
     /// rule can see it — and the time until the second disk fails is the
     /// only time anybody can act in.
     Storage,
+    /// systemd services in trouble. `target` names the figure: `crashloop`
+    /// (units restarting in a loop; the default), `failed`, or `restarts`
+    /// (the most automatic restarts any unit has had within `[units]
+    /// window_secs`). `query` names a unit — `nginx` or `nginx.service` —
+    /// and empty means every unit.
+    ///
+    /// A crash-looping service has no process most of the time, so a `proc`
+    /// rule watching for it flickers instead of holding.
+    Unit,
 }
 
 /// Every kind a rule can be, so the docs can be checked against the code
 /// rather than against a hand-maintained list — the same reason `ALL_SORTS`
 /// and `ALL_GROUPINGS` exist.
-pub const ALL_ALERT_KINDS: [AlertKind; 22] = [
+pub const ALL_ALERT_KINDS: [AlertKind; 23] = [
     AlertKind::Cpu,
     AlertKind::Mem,
     AlertKind::Swap,
@@ -130,6 +139,7 @@ pub const ALL_ALERT_KINDS: [AlertKind; 22] = [
     AlertKind::OomKill,
     AlertKind::Tcp,
     AlertKind::Storage,
+    AlertKind::Unit,
 ];
 
 impl AlertKind {
@@ -158,6 +168,7 @@ impl AlertKind {
             AlertKind::OomKill => "oomkill",
             AlertKind::Tcp => "tcp",
             AlertKind::Storage => "storage",
+            AlertKind::Unit => "unit",
         }
     }
 }
@@ -176,8 +187,8 @@ pub struct AlertRule {
     pub hysteresis: f64,
     #[serde(default)]
     pub for_secs: u64,
-    /// The window a `trend` rule measures growth over, in seconds. Ignored
-    /// by every other kind. 0 means `DEFAULT_TREND_WINDOW`.
+    /// The window `trend`, `fillin` and `oomkill` rules measure over, in
+    /// seconds. Ignored by every other kind. 0 means `DEFAULT_TREND_WINDOW`.
     ///
     /// Distinct from `for_secs`, which is how long the *answer* has to hold
     /// before the rule fires: a leak alert wants both — measured over ten
@@ -242,6 +253,43 @@ pub struct HookCall {
     /// crossing that triggered a dump.
     pub dump: String,
     pub summary: String,
+}
+
+/// OOM kills in a group crabmon has no cgroup for any more.
+///
+/// A service OOM-killed at its own `MemoryMax` usually dies between two
+/// samples, and when its unit fails systemd removes the cgroup — so the
+/// group's own `memory.events` was never read, and a rule naming it measured
+/// nothing for exactly the kill it was written for. Found by OOM-killing a
+/// real transient unit. Two other witnesses remain: the kernel's kill line,
+/// which names the cgroup (`task_memcg=`, readable with `/dev/kmsg`), and
+/// systemd, which keeps the unit failed with `Result=oom-kill` (no root
+/// needed). `None` when neither can say, rather than zero.
+fn oom_kills_after_the_cgroup_is_gone(snap: &Snapshot, name: &str, window: u64) -> Option<u64> {
+    let names = |group: &str| {
+        group == name
+            || group.strip_suffix(".service") == Some(name)
+            || (name.len() >= 12 && group.contains(name))
+    };
+    let from_kernel = (snap.kernel_unreadable.is_none()).then(|| {
+        snap.kernel
+            .iter()
+            .filter(|e| e.kind == crate::metrics::kmsg::EventKind::OomKill)
+            .filter(|e| e.age_secs(snap.host.uptime_secs) <= window)
+            .filter(|e| e.memcg().is_some_and(names))
+            .count() as u64
+    });
+    let from_unit = snap.units_unreadable.is_none().then(|| {
+        snap.units
+            .iter()
+            .filter(|u| names(&u.name) && u.state == crate::metrics::units::UnitState::Failed)
+            .filter(|u| u.result == "oom-kill")
+            .count() as u64
+    });
+    match (from_kernel, from_unit) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0).max(b.unwrap_or(0))),
+    }
 }
 
 /// The variables a hook is run with.
@@ -324,6 +372,10 @@ struct Tracked {
     /// Monotonic seconds at which the condition first held.
     over_since: Option<u64>,
     fired: bool,
+    /// What the firing message named, for the recovery message: by the
+    /// time a failed unit is reset it has left the snapshot, and "recovered"
+    /// on its own does not say what did.
+    subject: String,
 }
 
 /// A rule crossing into or out of its alarm state.
@@ -334,6 +386,13 @@ pub struct AlertEvent {
     /// Wall-clock time of the snapshot that caused the transition, for display.
     pub at_unix: u64,
     pub value: f64,
+}
+
+fn push_notice(notices: &mut Vec<HookCall>, call: HookCall) {
+    if notices.len() >= MAX_HISTORY {
+        notices.remove(0);
+    }
+    notices.push(call);
 }
 
 /// Transitions kept for the `!` popup. Enough to cover a night, small enough
@@ -358,6 +417,10 @@ pub struct AlertEngine {
     /// Hooks the engine wants run, with the context each should be told;
     /// drained by the caller, which is what runs them.
     pending_commands: Vec<HookCall>,
+    /// Every transition, hook or no hook, for `[[notify]]`. Bounded by
+    /// `MAX_HISTORY` so a caller that never drains it — `--watch`, a test —
+    /// does not grow without limit.
+    pending_notices: Vec<HookCall>,
     /// Rules that have just gone active, for the flight recorder. Kept apart
     /// from `pending_commands` because a rule with no hook still wants its
     /// dump — the hook is for paging someone, the dump is the evidence.
@@ -400,6 +463,7 @@ impl AlertEngine {
             state,
             queries,
             pending_commands: Vec::new(),
+            pending_notices: Vec::new(),
             pending_fired: Vec::new(),
             history: Vec::new(),
             trends: TrendTracker::default(),
@@ -434,8 +498,8 @@ impl AlertEngine {
                 // Recovering is a transition worth reporting: an alert that
                 // only ever says "started" leaves you guessing when it ended.
                 if std::mem::take(&mut st.fired) {
-                    if !rule.command_clear.is_empty() {
-                        self.pending_commands.push(HookCall {
+                    {
+                        let call = HookCall {
                             command: rule.command_clear.clone(),
                             rule: rule.name.clone(),
                             kind: rule.kind,
@@ -443,17 +507,22 @@ impl AlertEngine {
                             threshold: rule.threshold,
                             firing: false,
                             message: format!(
-                                "{} recovered: {} {} {}",
+                                "{} recovered: {} {} {}{}",
                                 rule.name,
                                 quantity(value, unit),
                                 if rule.below { "≥" } else { "<" },
                                 quantity(threshold, unit),
+                                std::mem::take(&mut st.subject),
                             ),
                             at_unix,
                             host: String::new(),
                             dump: String::new(),
                             summary: String::new(),
-                        });
+                        };
+                        if !call.command.is_empty() {
+                            self.pending_commands.push(call.clone());
+                        }
+                        push_notice(&mut self.pending_notices, call);
                     }
                     events.push(AlertEvent {
                         name: rule.name.clone(),
@@ -491,8 +560,14 @@ impl AlertEngine {
                         format!(" ({name} over {})", crate::format::human_duration(span))
                     })
                     .unwrap_or_default(),
+                AlertKind::Unit => {
+                    crate::metrics::units::subject(&snap.units, &rule.target, &rule.query)
+                }
                 _ => String::new(),
             };
+            if just_fired && rule.kind == AlertKind::Unit {
+                self.state[i].subject = subject.clone();
+            }
             // Built before the hook so the hook is told the same line the
             // status bar and the `!` popup show, subject and all.
             let mut message = format!(
@@ -513,8 +588,8 @@ impl AlertEngine {
                     quantity(rule.recovery_threshold(), unit)
                 );
             }
-            if just_fired && !rule.command.is_empty() {
-                self.pending_commands.push(HookCall {
+            if just_fired {
+                let call = HookCall {
                     command: rule.command.clone(),
                     rule: rule.name.clone(),
                     kind: rule.kind,
@@ -526,7 +601,11 @@ impl AlertEngine {
                     host: String::new(),
                     dump: String::new(),
                     summary: String::new(),
-                });
+                };
+                if !call.command.is_empty() {
+                    self.pending_commands.push(call.clone());
+                }
+                push_notice(&mut self.pending_notices, call);
             }
             active.push(ActiveAlert {
                 name: rule.name.clone(),
@@ -597,6 +676,12 @@ impl AlertEngine {
 
     pub fn take_commands(&mut self) -> Vec<HookCall> {
         std::mem::take(&mut self.pending_commands)
+    }
+
+    /// Every transition since the last call, whether or not its rule has a
+    /// hook, for `[[notify]]`.
+    pub fn take_notices(&mut self) -> Vec<HookCall> {
+        std::mem::take(&mut self.pending_notices)
     }
 
     /// Names of the rules that became active since this was last called.
@@ -1183,6 +1268,13 @@ fn measure(
             let n = crate::metrics::storage::unhealthy_count(&snap.storage, rule.target.trim());
             return Some((n as f64, ""));
         }
+        // Nothing when systemd could not be read: "no failed units" about a
+        // machine nobody asked would be a healthy reading of nothing.
+        AlertKind::Unit if snap.units_unreadable.is_some() => return None,
+        AlertKind::Unit => {
+            return crate::metrics::units::measure(&snap.units, &rule.target, &rule.query)
+                .map(|v| (v, ""));
+        }
         AlertKind::Throttle => {
             return match rule.target.trim() {
                 "" => snap
@@ -1201,7 +1293,10 @@ fn measure(
             let window = rule.window();
             let n = match rule.target.trim() {
                 "" => trends.machine_oom_kills(window),
-                name => trends.cgroup_oom_kills(&snap.cgroup_named(name)?.name, window),
+                name => match snap.cgroup_named(name) {
+                    Some(cg) => trends.cgroup_oom_kills(&cg.name, window),
+                    None => oom_kills_after_the_cgroup_is_gone(snap, name, window),
+                },
             }?;
             return Some((n as f64, ""));
         }
@@ -2000,7 +2095,7 @@ mod tests {
         assert_eq!(e.evaluate(&snap_cpu(40.0), 1).len(), 1);
         assert!(e.evaluate(&snap_cpu(39.9), 2).is_empty());
         r.below = true;
-        let mut e = AlertEngine::new(vec![r]);
+        let mut e = crate::alerts::AlertEngine::new(vec![r]);
         e.evaluate(&snap_cpu(49.0), 0);
         assert_eq!(e.evaluate(&snap_cpu(59.9), 1).len(), 1);
         assert!(e.evaluate(&snap_cpu(60.0), 2).is_empty());
@@ -2100,7 +2195,7 @@ mod tests {
     fn the_command_hook_runs_once_per_activation() {
         let mut r = rule("cpu", AlertKind::Cpu, 90.0, 0);
         r.command = "notify-send hot".into();
-        let mut e = AlertEngine::new(vec![r]);
+        let mut e = crate::alerts::AlertEngine::new(vec![r]);
 
         e.evaluate(&snap_cpu(95.0), 0);
         assert_eq!(commands_of(&mut e), vec!["notify-send hot"]);
@@ -2161,7 +2256,7 @@ mod tests {
         let mut r = rule("nginx-down", AlertKind::Proc, 1.0, 0);
         r.below = true;
         r.query = "nginx".into();
-        let mut e = AlertEngine::new(vec![r]);
+        let mut e = crate::alerts::AlertEngine::new(vec![r]);
 
         let running = Snapshot {
             procs: vec![ProcRow { pid: 1, name: "nginx".into(), ..Default::default() }],
@@ -2185,7 +2280,7 @@ mod tests {
     fn a_proc_rule_counts_what_its_query_matches() {
         let mut r = rule("too-many-workers", AlertKind::Proc, 3.0, 0);
         r.query = "user:app cpu>1".into();
-        let mut e = AlertEngine::new(vec![r]);
+        let mut e = crate::alerts::AlertEngine::new(vec![r]);
         let worker = |pid: u32, cpu: f32, user: &str| ProcRow {
             pid,
             name: "worker".into(),
@@ -2217,7 +2312,7 @@ mod tests {
         let mut r = rule("typo", AlertKind::Proc, 1.0, 0);
         r.below = true;
         r.query = "re:[unclosed".into();
-        let mut e = AlertEngine::new(vec![r]);
+        let mut e = crate::alerts::AlertEngine::new(vec![r]);
         assert!(e.evaluate(&Snapshot::default(), 0).is_empty());
         assert!(e.take_commands().is_empty());
     }
@@ -2590,5 +2685,74 @@ mod hook_number_tests {
         for v in [23.076923370361328f64, 0.0, 90.0, 412_013_312.0, -2048.0, 0.5] {
             assert!(hook_number(v).parse::<f64>().is_ok(), "{v}");
         }
+    }
+
+    /// Found on a real host: the recovery of a unit alert said only
+    /// "recovered", because the reset unit had already left the snapshot.
+    #[test]
+    fn a_unit_alert_recovery_names_what_recovered() {
+        use crate::metrics::units::{UnitHealth, UnitState};
+        let mut r = crate::watch::parse_rule("unit:failed>=1", 0).unwrap();
+        r.command_clear = "x".into();
+        let mut e = crate::alerts::AlertEngine::new(vec![r]);
+        let mut snap = crate::metrics::Snapshot { taken_at_unix: 1, ..Default::default() };
+        snap.units_unreadable = None;
+        snap.units = vec![UnitHealth {
+            name: "backup.service".into(),
+            state: UnitState::Failed,
+            ..Default::default()
+        }];
+        let firing = e.evaluate(&snap, 0);
+        assert!(firing[0].message.contains("(backup.service)"), "{}", firing[0].message);
+        snap.units.clear();
+        e.evaluate(&snap, 1);
+        let cleared = e.take_commands();
+        assert!(cleared[0].message.contains("recovered"), "{}", cleared[0].message);
+        assert!(cleared[0].message.contains("(backup.service)"), "{}", cleared[0].message);
+    }
+
+    /// Found OOM-killing a real transient unit: it died between samples and
+    /// systemd removed its cgroup, so `oomkill:<unit>` never saw the kill.
+    #[test]
+    fn a_unit_oom_killed_after_its_cgroup_is_gone_is_still_counted() {
+        use crate::metrics::kmsg::{EventKind, KernelEvent};
+        use crate::metrics::units::{UnitHealth, UnitState};
+        let mut r = crate::watch::parse_rule("oomkill:cm3-oom>=1", 0).unwrap();
+        r.name = "cg".into();
+        let fires = |snap: &crate::metrics::Snapshot| {
+            let mut e = crate::alerts::AlertEngine::new(vec![r.clone()]);
+            !e.evaluate(snap, 0).is_empty()
+        };
+        let mut snap = crate::metrics::Snapshot { taken_at_unix: 1, ..Default::default() };
+        snap.units_unreadable = None;
+        assert!(!fires(&snap), "nothing has been killed");
+
+        // systemd's witness, which needs no root.
+        snap.units = vec![UnitHealth {
+            name: "cm3-oom.service".into(),
+            state: UnitState::Failed,
+            result: "oom-kill".into(),
+            ..Default::default()
+        }];
+        assert!(fires(&snap));
+
+        // The kernel's, by the cgroup its kill line names.
+        snap.units.clear();
+        snap.host.uptime_secs = 1000;
+        snap.kernel = vec![KernelEvent {
+            kind: EventKind::OomKill,
+            seq: 1,
+            monotonic_us: 990_000_000,
+            text: "oom-kill:constraint=CONSTRAINT_MEMCG,oom_memcg=/system.slice/cm3-oom.service,task_memcg=/system.slice/cm3-oom.service,task=python3,pid=7".into(),
+            pid: Some(7),
+            process: Some("python3".into()),
+        }];
+        assert!(fires(&snap));
+        // ...only within the window, and only in that group.
+        snap.host.uptime_secs = 100_000;
+        assert!(!fires(&snap), "a kill from a day ago is outside five minutes");
+        snap.host.uptime_secs = 1000;
+        snap.kernel[0].text = snap.kernel[0].text.replace("cm3-oom", "other");
+        assert!(!fires(&snap));
     }
 }

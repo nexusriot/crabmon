@@ -177,12 +177,80 @@ fn query_nvidia_smi() -> Vec<GpuInfo> {
     }
 }
 
-pub fn read_all(use_nvidia_smi: bool) -> Vec<GpuInfo> {
+/// GPUs under `/sys/class/drm`, plus `nvidia`'s latest answer when there
+/// is a poller.
+pub fn read_all(nvidia: Option<&NvidiaSmi>) -> Vec<GpuInfo> {
     let mut gpus = scan_drm(Path::new("/sys/class/drm"));
-    if use_nvidia_smi {
-        gpus.extend(query_nvidia_smi());
+    if let Some(nvidia) = nvidia {
+        gpus.extend(nvidia.latest());
     }
     gpus
+}
+
+/// `nvidia-smi`, run on a thread of its own.
+///
+/// It takes ~50 ms on a healthy machine and seconds on one whose driver is in
+/// trouble — which is exactly when somebody has crabmon open. Run inline it
+/// held up the whole sample, CPU and processes included. Here each sample
+/// asks for a fresh answer and takes whatever the last one was, so the GPU
+/// figures are one sample behind and nothing else waits on the driver.
+pub struct NvidiaSmi {
+    shared: std::sync::Arc<NvidiaShared>,
+    /// Dropping this ends the worker: its `recv` fails and it returns.
+    wake: std::sync::mpsc::SyncSender<()>,
+}
+
+#[derive(Default)]
+struct NvidiaShared {
+    latest: std::sync::Mutex<Option<(Vec<GpuInfo>, std::time::Instant)>>,
+    ready: std::sync::Condvar,
+}
+
+impl NvidiaSmi {
+    /// An answer older than this is from a driver that has stopped
+    /// answering, and is dropped rather than drawn as if it were current.
+    pub const STALE: std::time::Duration = std::time::Duration::from_secs(15);
+    /// How long the very first sample waits, so `--once` has an answer.
+    const FIRST_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    pub fn spawn() -> Self {
+        Self::spawn_with(query_nvidia_smi)
+    }
+
+    fn spawn_with(query: impl Fn() -> Vec<GpuInfo> + Send + 'static) -> Self {
+        let shared = std::sync::Arc::new(NvidiaShared::default());
+        let (wake, requests) = std::sync::mpsc::sync_channel::<()>(1);
+        let worker = shared.clone();
+        let _ = std::thread::Builder::new().name("crabmon-nvidia-smi".into()).spawn(move || {
+            while requests.recv().is_ok() {
+                let gpus = query();
+                if let Ok(mut latest) = worker.latest.lock() {
+                    *latest = Some((gpus, std::time::Instant::now()));
+                }
+                worker.ready.notify_all();
+            }
+        });
+        NvidiaSmi { shared, wake }
+    }
+
+    /// Ask for a fresh answer and return the latest one. Never blocks on the
+    /// driver, except for up to `FIRST_WAIT` before there has been any answer.
+    pub fn latest(&self) -> Vec<GpuInfo> {
+        // Full means a query is already queued behind the one running: one
+        // is enough, however many samples go by while the driver is slow.
+        let _ = self.wake.try_send(());
+        let Ok(mut latest) = self.shared.latest.lock() else { return Vec::new() };
+        if latest.is_none() {
+            latest = match self.shared.ready.wait_timeout(latest, Self::FIRST_WAIT) {
+                Ok((guard, _)) => guard,
+                Err(_) => return Vec::new(),
+            };
+        }
+        match &*latest {
+            Some((gpus, at)) if at.elapsed() < Self::STALE => gpus.clone(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -266,6 +334,47 @@ mod tests {
         write(root.join("card0/device/vendor"), "0x1234\n");
         assert!(scan_drm(&root).is_empty());
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn card(name: &str) -> GpuInfo {
+        GpuInfo {
+            name: name.into(),
+            vendor: "NVIDIA".into(),
+            busy_percent: Some(1.0),
+            vram_used: None,
+            vram_total: None,
+            temp_c: None,
+            freq_mhz: None,
+            max_freq_mhz: None,
+        }
+    }
+
+    /// The first sample waits for an answer, so `--once` has one.
+    #[test]
+    fn the_first_nvidia_sample_waits_for_an_answer() {
+        let smi = NvidiaSmi::spawn_with(|| vec![card("first")]);
+        assert_eq!(smi.latest().len(), 1);
+    }
+
+    /// A driver that takes seconds to answer must not hold the sample up:
+    /// later samples get the last answer straight away.
+    #[test]
+    fn a_slow_nvidia_smi_does_not_block_later_samples() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let smi = NvidiaSmi::spawn_with(move || {
+            let n = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n > 0 {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+            vec![card(&format!("call {n}"))]
+        });
+        assert_eq!(smi.latest()[0].name, "call 0");
+        let t = std::time::Instant::now();
+        for _ in 0..5 {
+            assert_eq!(smi.latest()[0].name, "call 0");
+        }
+        assert!(t.elapsed() < std::time::Duration::from_secs(1), "{:?}", t.elapsed());
     }
 
     #[test]

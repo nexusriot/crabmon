@@ -608,10 +608,21 @@ fn the_fleet_table_draws_a_row_per_host() {
         ("db-1".into(), host("db-1", 95.0)),
     ]);
 
-    let mut a = crabmon::App::new(common::config(), Box::new(fleet));
+    let mut cfg = common::config();
+    cfg.alerts = vec![crabmon::watch::parse_rule("cpu>=90", 0).unwrap()];
+    let mut a = crabmon::App::new(cfg, Box::new(fleet));
     a.cfg.layout = crabmon::ui::Layout::Fleet;
+    a.tick();
+    a.on_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('>'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
     let s = screen(&mut a, 160, 24);
 
+    assert!(s.contains("ALERT"), "{s}");
+    assert!(s.contains("HOST↑"), "the sorted column is marked: {s}");
+    let db = s.lines().find(|l| l.contains("db-1") && l.contains("95.0")).expect(&s);
+    assert!(db.trim_end().contains("    1 "), "db-1 has one rule firing: {db}");
     assert!(s.contains("Fleet"), "{s}");
     assert!(s.contains("2 hosts"), "{s}");
     assert!(s.contains("web-1"), "{s}");
@@ -1073,4 +1084,158 @@ fn a_saturated_disk_is_labelled_busy_even_when_it_is_nearly_empty() {
     a.tick();
     let s = screen(&mut a, 160, 48);
     assert!(s.contains("97% busy"), "expected the utilisation in:\n{s}");
+}
+
+/// A replay's status line shows where it is in the recording and where the
+/// markers are.
+#[test]
+fn a_replay_draws_its_markers_on_a_bar_in_the_status_line() {
+    use crabmon::record::{Marker, MarkerKind, ReplaySource, Timeline};
+    let frames: Vec<_> = (0..40).map(|_| crabmon::Snapshot::default()).collect();
+    let mut a =
+        crabmon::App::new(common::config(), Box::new(ReplaySource::from_frames(frames, "rec")));
+    a.tick();
+    a.set_replay_timeline(Timeline {
+        at_unix: (0..40).collect(),
+        markers: vec![
+            Marker { position: 30, kind: MarkerKind::Alert, label: "hot".into() },
+            Marker { position: 20, kind: MarkerKind::Kernel, label: "oom".into() },
+        ],
+    });
+    let s = screen(&mut a, 160, 24);
+    let status = s.lines().last().unwrap_or_default().to_string();
+    let before_label = status.split(" replay").next().unwrap_or_default();
+    let bar: String = before_label.chars().filter(|c| matches!(c, '●' | '!' | 'k' | '─')).collect();
+    let at = |c: char| bar.chars().position(|x| x == c).expect(&status);
+    assert!(at('●') < at('k'), "drawing has only moved a few frames in: {status}");
+    assert!(at('k') < at('!'), "the kernel event comes before the alert: {status}");
+}
+
+/// A crash-looping service has nothing running at most samples, and a
+/// failed one nothing at all, so grouping what runs left them out. They get
+/// rows of their own, first, and the header says so on every layout.
+#[test]
+fn units_in_trouble_are_shown_even_with_no_processes_and_named_in_the_header() {
+    use crabmon::metrics::units::{UnitHealth, UnitState};
+    let mut snap = common::snapshot();
+    snap.units = vec![
+        UnitHealth {
+            name: "api.service".into(),
+            active: "activating".into(),
+            sub: "auto-restart".into(),
+            restarts: 12,
+            recent_restarts: 7,
+            state: UnitState::CrashLoop,
+            ..Default::default()
+        },
+        UnitHealth {
+            name: "backup.service".into(),
+            active: "failed".into(),
+            result: "exit-code".into(),
+            exit_status: Some(2),
+            state: UnitState::Failed,
+            ..Default::default()
+        },
+    ];
+    let mut a = crabmon::App::new(common::config(), Box::new(common::FakeSource::single(snap)));
+    a.tick();
+    let s = screen(&mut a, 160, 48);
+    assert!(s.contains("1 unit failed, 1 crash-looping"), "the header says it: {s}");
+    assert!(!s.contains("UNIT "), "the column is the grouped view's: {s}");
+
+    a.cfg.group_by = crabmon::metrics::GroupBy::Service;
+    a.tick();
+    let s = screen(&mut a, 160, 48);
+    assert!(s.contains("UNIT"), "{s}");
+    let api = s.lines().find(|l| l.contains("api.service")).expect(&s);
+    assert!(api.contains("crash-loop 7×/10m"), "{api}");
+    let backup = s.lines().find(|l| l.contains("backup.service")).expect(&s);
+    assert!(backup.contains("failed (exit 2)"), "{backup}");
+    let firefox = s.lines().position(|l| l.contains("firefox.service")).expect(&s);
+    let first = s.lines().position(|l| l.contains("api.service") || l.contains("backup.service"));
+    assert!(first.unwrap() < firefox, "broken services come before busy ones: {s}");
+}
+
+/// Found replaying a real recording: an alert firing in the replay took the
+/// whole status line, so the bar — the one thing that says where in the
+/// recording you are — vanished, and with it every "jumped to" message.
+#[test]
+fn a_replay_keeps_its_bar_when_an_alert_fires() {
+    let mut cfg = common::config();
+    cfg.alerts = vec![crabmon::watch::parse_rule("cpu>=0", 0).unwrap()];
+    let frames: Vec<_> = (0..10).map(|_| common::snapshot()).collect();
+    let mut a =
+        crabmon::App::new(cfg, Box::new(crabmon::record::ReplaySource::from_frames(frames, "rec")));
+    a.tick();
+    assert!(!a.active_alerts.is_empty(), "the rule fires in the replay");
+    let s = screen(&mut a, 160, 24);
+    let status = s.lines().last().unwrap_or_default();
+    assert!(status.contains("frame ") && status.contains('●'), "{status}");
+    assert!(status.contains("ALERT"), "the alert is still said: {status}");
+
+    // A jump is a gap: the alert of the frame left behind is not carried.
+    a.on_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char(']'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(a.active_alerts.is_empty());
+}
+
+/// Found live: a notification that failed while its alert was firing said so
+/// on the status line — which the alert owned — and nowhere else.
+#[test]
+fn delivery_notes_and_key_feedback_are_visible_while_an_alert_fires() {
+    let mut cfg = common::config();
+    cfg.alerts = vec![crabmon::watch::parse_rule("cpu>=0", 0).unwrap()];
+    let mut a = crabmon::App::new(cfg, Box::new(common::FakeSource::single(common::snapshot())));
+    a.tick();
+    assert!(!a.active_alerts.is_empty());
+
+    a.set_status("notify ops failed (timed out, curl exit 28)");
+    let s = screen(&mut a, 160, 30);
+    let status = s.lines().last().unwrap_or_default();
+    assert!(status.contains("curl exit 28") && status.contains("ALERT"), "{status}");
+
+    a.alert_notes.push_back((1_700_000_000, "notify ops failed (timed out, curl exit 28)".into()));
+    a.on_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('!'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    let s = screen(&mut a, 160, 30);
+    let popup = s.lines().filter(|l| l.contains("curl exit 28")).count();
+    assert!(popup >= 2, "kept in the alerts popup, not only the status line:\n{s}");
+}
+
+/// Found at 80×24 against a real host: the header clipped `1 unit failed`
+/// to `1 unit fai` behind a long hostname, and the grouped view squeezed the
+/// UNIT column to `fail` while empty LIMIT and NET columns kept their room.
+#[test]
+fn unit_trouble_survives_a_narrow_terminal() {
+    use crabmon::metrics::NetNamespace;
+    use crabmon::metrics::units::{UnitHealth, UnitState};
+    let mut snap = common::snapshot();
+    snap.host.hostname = "vps3639009.trouble-free.net".into();
+    snap.units = vec![UnitHealth {
+        name: "cm3-oom.service".into(),
+        active: "failed".into(),
+        result: "oom-kill".into(),
+        state: UnitState::Failed,
+        ..Default::default()
+    }];
+    // Something in view with a namespace and a limit, so NET and LIMIT want
+    // their columns too.
+    for p in &mut snap.procs {
+        p.netns = Some(9);
+        p.service = Some("app.service".into());
+    }
+    snap.netns = vec![NetNamespace { id: 9, rx_bps: 5.0, ..Default::default() }];
+    let mut a = crabmon::App::new(common::config(), Box::new(common::FakeSource::single(snap)));
+    a.cfg.group_by = crabmon::metrics::GroupBy::Service;
+    a.tick();
+    let s = screen(&mut a, 80, 24);
+    let header = s.lines().nth(1).unwrap_or_default();
+    assert!(header.contains("1 unit failed") || header.contains("1 failed"), "{header}");
+    let row = s.lines().find(|l| l.contains("cm3-oom")).expect(&s);
+    assert!(row.contains("oom-kill"), "the reason survives: {row}\n{s}");
+    assert!(!header.contains("failed2c") && !header.contains("failed1 cpu"), "{header}");
 }

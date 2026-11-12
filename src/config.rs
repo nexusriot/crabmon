@@ -94,11 +94,14 @@ pub struct AuditConfig {
     pub enabled: bool,
     /// Empty means the platform state directory.
     pub path: String,
+    /// Size at which the log is moved to `<path>.1` and started again;
+    /// 0 never rotates.
+    pub max_bytes: u64,
 }
 
 impl Default for AuditConfig {
     fn default() -> Self {
-        Self { enabled: true, path: String::new() }
+        Self { enabled: true, path: String::new(), max_bytes: 1024 * 1024 }
     }
 }
 
@@ -236,11 +239,49 @@ pub struct RemoteConfig {
     /// paying a connection and a process start for every sample. Falls back
     /// automatically when the far end is too old to understand `--stream`.
     pub stream: bool,
+    /// `ssh_config` options passed as `-o` on every connection, before any
+    /// `--ssh-option`: `["Port=2222", "IdentityFile=~/.ssh/ops"]`.
+    pub ssh_options: Vec<String>,
 }
 
 impl Default for RemoteConfig {
     fn default() -> Self {
-        Self { stream: true }
+        Self { stream: true, ssh_options: Vec::new() }
+    }
+}
+
+/// systemd unit health: failures and restart loops.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UnitsConfig {
+    /// Run `systemctl show` every few seconds, on a thread of its own.
+    pub enabled: bool,
+    /// This many automatic restarts within `window_secs` is a crash loop.
+    pub crash_loop: u64,
+    pub window_secs: u64,
+}
+
+impl Default for UnitsConfig {
+    fn default() -> Self {
+        Self { enabled: true, crash_loop: 3, window_secs: 600 }
+    }
+}
+
+impl UnitsConfig {
+    /// How often `systemctl show` runs. Restart counts are cumulative, so a
+    /// longer interval loses no restarts; it only notices them later.
+    pub const INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+    pub fn settings(&self) -> Option<crate::metrics::units::UnitSettings> {
+        self.enabled.then(|| crate::metrics::units::UnitSettings {
+            interval: Self::INTERVAL,
+            window: self.window(),
+            crash_loop: self.crash_loop,
+        })
+    }
+
+    pub fn window(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.window_secs.max(60))
     }
 }
 
@@ -248,7 +289,8 @@ impl Default for RemoteConfig {
 #[serde(default)]
 pub struct GpuConfig {
     pub enabled: bool,
-    /// Shell out to `nvidia-smi` each refresh. Off by default: it costs ~50 ms.
+    /// Run `nvidia-smi` each refresh, on its own thread. Off by default: it
+    /// costs ~50 ms of CPU a time.
     pub nvidia_smi: bool,
 }
 
@@ -306,12 +348,19 @@ pub struct Config {
     pub serve: ServeConfig,
     pub record: RecordConfig,
     pub remote: RemoteConfig,
+    pub units: UnitsConfig,
     pub colors: BTreeMap<String, String>,
     /// Queries bound to the number keys, in order.
     #[serde(rename = "filter_preset")]
     pub saved_filters: Vec<SavedFilter>,
     #[serde(rename = "alert")]
     pub alerts: Vec<AlertRule>,
+    /// Named host lists for `--remote @name`.
+    #[serde(rename = "fleet")]
+    pub fleet_groups: Vec<crate::fleet::FleetGroup>,
+    /// Where alert transitions are posted, besides any hook.
+    #[serde(rename = "notify")]
+    pub notify: Vec<crate::notify::NotifyTarget>,
 }
 
 impl Default for Config {
@@ -340,9 +389,12 @@ impl Default for Config {
             serve: ServeConfig::default(),
             record: RecordConfig::default(),
             remote: RemoteConfig::default(),
+            units: UnitsConfig::default(),
             colors: BTreeMap::new(),
             saved_filters: default_saved_filters(),
             alerts: crate::alerts::default_rules(),
+            fleet_groups: Vec::new(),
+            notify: Vec::new(),
         }
     }
 }

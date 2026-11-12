@@ -32,6 +32,9 @@ use crate::ui::Layout;
 /// it just big" without having to leave the program and come back later.
 pub const PROC_HIST_LEN: usize = 120;
 
+/// Hook and notification notes kept for the `!` popup.
+pub const ALERT_NOTES: usize = 50;
+
 /// Kept for callers that only want the sparkline column's window.
 pub const PROC_SPARK_LEN: usize = PROC_HIST_LEN;
 
@@ -76,6 +79,8 @@ pub enum Mode {
     Help,
     Alerts,
     AuditLog,
+    /// `:` in a replay: where to go, as a frame or a time.
+    Seek,
 }
 
 /// What `run_app` must do after handling an event.
@@ -162,6 +167,25 @@ pub struct App {
     pub active_alerts: Vec<ActiveAlert>,
     /// Alert state belongs to a host, even while another host is selected.
     host_alerts: HashMap<String, (AlertEngine, Vec<ActiveAlert>)>,
+    /// The sample time each parked host's rules last saw, so a host whose
+    /// worker has nothing new is not evaluated twice on one frame.
+    host_alert_seen: HashMap<String, u64>,
+    /// What the fleet table is sorted by, and which way.
+    pub fleet_sort: crate::fleet::FleetSort,
+    pub fleet_sort_desc: bool,
+    /// What running the hooks and notifications said — a post that failed, a
+    /// hook killed, a flight dump written — newest last, for the `!` popup.
+    /// The status line cannot be trusted with these: while the alert that
+    /// caused them is firing, the alert has the line.
+    pub alert_notes: std::collections::VecDeque<(u64, String)>,
+    /// Frame times and markers for a replay, once the background scan of the
+    /// recording has finished.
+    pub replay_timeline: Option<crate::record::Timeline>,
+    timeline_scan: Option<std::sync::mpsc::Receiver<Result<crate::record::Timeline, String>>>,
+    /// The host the fleet cursor is on, by `FleetHost::index`, once it has
+    /// been moved: a row number alone would slide onto another host every
+    /// time the sort reordered the table.
+    fleet_cursor: Option<usize>,
     started: Instant,
 
     /// Set during draw so mouse clicks can be mapped back to rows and columns.
@@ -276,6 +300,13 @@ impl App {
             disk_w_hist: hist(),
             active_alerts: Vec::new(),
             host_alerts: HashMap::new(),
+            host_alert_seen: HashMap::new(),
+            fleet_sort: crate::fleet::FleetSort::Named,
+            fleet_sort_desc: false,
+            alert_notes: std::collections::VecDeque::new(),
+            replay_timeline: None,
+            timeline_scan: None,
+            fleet_cursor: None,
             started: Instant::now(),
             proc_area: Rect::default(),
             header_cols: Vec::new(),
@@ -344,6 +375,7 @@ impl App {
     }
 
     pub fn tick(&mut self) {
+        self.poll_timeline_scan();
         let dt = self.last_refresh.elapsed();
         let next = self.source.snapshot(dt);
         // Compare against the preceding sample, not mere PID membership:
@@ -366,6 +398,7 @@ impl App {
         self.snap = next;
         self.last_refresh = Instant::now();
         self.generation = self.generation.wrapping_add(1);
+        self.evaluate_parked_hosts();
 
         // A source that samples on another thread hands back the same frame
         // until a new one is ready. Pushing that into the charts would draw a
@@ -545,8 +578,96 @@ impl App {
 
     /// Every host crabmon is watching. Empty for a single-machine run, which
     /// is what keeps the fleet layout out of everyone else's way.
+    ///
+    /// In the order the table draws them: sorted by `fleet_sort`.
     pub fn fleet(&self) -> Vec<crate::fleet::FleetHost> {
-        self.source.fleet()
+        let mut hosts = self.source.fleet();
+        crate::fleet::sort_hosts(
+            &mut hosts,
+            self.fleet_sort,
+            self.fleet_sort_desc,
+            self.cfg.show_virtual_ifaces,
+            |h| self.fleet_alert_count(h),
+        );
+        hosts
+    }
+
+    /// How many rules are firing on a fleet host: the selected host's live
+    /// engine, or the one parked for it.
+    pub fn fleet_alert_count(&self, host: &crate::fleet::FleetHost) -> usize {
+        if host.index == self.source.selected_host() {
+            return self.active_alerts.len();
+        }
+        self.host_alerts.get(&host.target).map_or(0, |(_, active)| active.len())
+    }
+
+    /// Run the rules for every fleet host but the selected one, against its
+    /// latest frame. Only the selected host's rules used to run at all, so a
+    /// machine nobody had opened could cross every threshold in the file
+    /// unseen — the opposite of what a fleet table is for.
+    fn evaluate_parked_hosts(&mut self) {
+        if self.source.timeline().is_some() {
+            return;
+        }
+        let selected = self.source.selected_host();
+        let now = self.started.elapsed().as_secs();
+        for host in self.source.fleet() {
+            if host.index == selected {
+                continue;
+            }
+            let (engine, active) = self
+                .host_alerts
+                .entry(host.target.clone())
+                .or_insert_with(|| (AlertEngine::new(self.cfg.alerts.clone()), Vec::new()));
+            if !host.is_live() {
+                // An unobserved interval cannot count toward a hold time, and
+                // a host that is not answering is not over any threshold.
+                engine.interrupt();
+                continue;
+            }
+            let at = host.snapshot.taken_at_unix;
+            if self.host_alert_seen.get(&host.target) == Some(&at) {
+                continue;
+            }
+            self.host_alert_seen.insert(host.target.clone(), at);
+            *active = engine.evaluate(&host.snapshot, now);
+        }
+    }
+
+    /// Cycle the fleet table's sort key, each starting in its natural
+    /// direction.
+    fn set_fleet_sort(&mut self, key: crate::fleet::FleetSort) {
+        self.pin_fleet_cursor();
+        self.fleet_sort = key;
+        self.fleet_sort_desc = key.default_desc();
+        self.set_fleet_sort_status();
+    }
+
+    /// Remember which host the cursor is on before the order changes. Only a
+    /// cursor that had been moved used to be remembered, so the first re-sort
+    /// left it on row 0 — by then a different host. Found on a real fleet.
+    fn pin_fleet_cursor(&mut self) {
+        if self.fleet_cursor.is_none() {
+            self.fleet_cursor = self.fleet().get(self.fleet_selected).map(|h| h.index);
+        }
+    }
+
+    fn set_fleet_sort_status(&mut self) {
+        self.set_status(format!(
+            "fleet sorted by {} {}",
+            self.fleet_sort.name(),
+            if self.fleet_sort_desc { "↓" } else { "↑" }
+        ));
+    }
+
+    /// Keep the fleet cursor on the host it was on, wherever a re-sort has
+    /// moved that host's row. Called by the table with the order it drew.
+    pub fn follow_fleet_cursor(&mut self, hosts: &[crate::fleet::FleetHost]) {
+        if let Some(index) = self.fleet_cursor
+            && let Some(row) = hosts.iter().position(|h| h.index == index)
+        {
+            self.fleet_selected = row;
+        }
     }
 
     pub fn in_fleet(&self) -> bool {
@@ -557,7 +678,7 @@ impl App {
     /// the row the fleet cursor is on, because moving the cursor must not
     /// re-point every other panel at a different machine on the way past.
     pub fn fleet_target(&self) -> Option<String> {
-        let hosts = self.fleet();
+        let hosts = self.source.fleet();
         hosts.get(self.source.selected_host()).map(|h| h.target.clone())
     }
 
@@ -590,6 +711,7 @@ impl App {
         }
         let next = (self.fleet_selected as isize + delta).clamp(0, self.fleet_len as isize - 1);
         self.fleet_selected = next as usize;
+        self.fleet_cursor = self.fleet().get(self.fleet_selected).map(|h| h.index);
         self.clamp_fleet_scroll();
     }
 
@@ -603,10 +725,11 @@ impl App {
         let hosts = self.fleet();
         let Some(host) = hosts.get(self.fleet_selected) else { return };
         let target = host.target.clone();
-        if self.source.selected_host() != self.fleet_selected {
+        if self.source.selected_host() != host.index {
             if let Some(previous) = self.fleet_target() {
-                // An unobserved interval cannot count toward a hold time.
-                self.alerts.interrupt();
+                // Parked, and still evaluated every tick from here on — from
+                // its next frame: this one it has already seen.
+                self.host_alert_seen.insert(previous.clone(), self.snap.taken_at_unix);
                 let old =
                     std::mem::replace(&mut self.alerts, AlertEngine::new(self.cfg.alerts.clone()));
                 self.host_alerts.insert(previous, (old, std::mem::take(&mut self.active_alerts)));
@@ -616,7 +739,7 @@ impl App {
                 self.active_alerts = active;
             }
         }
-        self.source.select_host(self.fleet_selected);
+        self.source.select_host(host.index);
         self.snap = self.source.peek().unwrap_or_else(|| host.snapshot.clone());
         self.reset_histories();
         self.selected = 0;
@@ -881,6 +1004,10 @@ impl App {
                 self.on_affinity_key(key);
                 Action::None
             }
+            Mode::Seek => {
+                self.on_seek_key(key);
+                Action::None
+            }
             Mode::Detail | Mode::Help | Mode::Alerts | Mode::AuditLog => {
                 self.on_popup_key(key);
                 Action::None
@@ -925,7 +1052,9 @@ impl App {
     pub fn popup_lines(&self) -> usize {
         match self.mode {
             Mode::Help => crate::ui::popups::KEYS.len(),
-            Mode::Alerts => self.alerts.rules.len() + self.alerts.history_len(),
+            Mode::Alerts => {
+                self.alerts.rules.len() + self.alerts.history_len() + self.alert_notes.len()
+            }
             Mode::AuditLog => self.audit_entries.len(),
             Mode::Detail => {
                 crate::ui::popups::DETAIL_FIELDS
@@ -983,6 +1112,18 @@ impl App {
             KeyCode::Char('p') => self.set_sort(SortBy::Pid),
             KeyCode::Char('n') => self.set_sort(SortBy::Name),
             KeyCode::Char('d') => self.set_sort(SortBy::Disk),
+            // In the fleet table the sort keys sort hosts.
+            KeyCode::Char('>') | KeyCode::Char('.') if self.in_fleet() => {
+                self.set_fleet_sort(self.fleet_sort.next())
+            }
+            KeyCode::Char('<') | KeyCode::Char(',') if self.in_fleet() => {
+                self.set_fleet_sort(self.fleet_sort.prev())
+            }
+            KeyCode::Char('s') if self.in_fleet() => {
+                self.pin_fleet_cursor();
+                self.fleet_sort_desc = !self.fleet_sort_desc;
+                self.set_fleet_sort_status();
+            }
             KeyCode::Char('>') | KeyCode::Char('.') => self.set_sort(self.cfg.sort_by.next()),
             KeyCode::Char('<') | KeyCode::Char(',') => self.set_sort(self.cfg.sort_by.prev()),
             KeyCode::Char('s') => {
@@ -1045,6 +1186,17 @@ impl App {
             KeyCode::Char(']') => self.scrub(1),
             KeyCode::Char('{') => self.scrub(-10),
             KeyCode::Char('}') => self.scrub(10),
+            KeyCode::Char('(') => self.jump_marker(false),
+            KeyCode::Char(')') => self.jump_marker(true),
+            KeyCode::Char(':') => {
+                if self.source.timeline().is_some() {
+                    self.input.clear();
+                    self.input_error = None;
+                    self.mode = Mode::Seek;
+                } else {
+                    self.set_status("not a recording");
+                }
+            }
 
             // Tag the selected process for a bulk action.
             KeyCode::Char(' ') => {
@@ -1174,6 +1326,125 @@ impl App {
             return;
         };
         let next = (pos as isize + delta).clamp(0, len.saturating_sub(1) as isize) as usize;
+        self.go_to_frame(next);
+        self.set_status(format!("frame {}/{}", next + 1, len));
+    }
+
+    /// Scan the recording at `path` on a thread of its own, for the frame
+    /// times `:` seeks by and the markers `(` and `)` jump between. A long
+    /// recording takes a while to read through, and the replay is usable
+    /// from its first frame meanwhile.
+    pub fn scan_replay(&mut self, path: PathBuf) {
+        let rules = self.cfg.alerts.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned =
+            std::thread::Builder::new().name("crabmon-timeline".into()).spawn(move || {
+                let _ = tx.send(crate::record::scan_timeline(&path, rules));
+            });
+        if spawned.is_ok() {
+            self.timeline_scan = Some(rx);
+        }
+    }
+
+    /// Install a finished timeline scan.
+    pub fn set_replay_timeline(&mut self, timeline: crate::record::Timeline) {
+        self.timeline_scan = None;
+        self.replay_timeline = Some(timeline);
+    }
+
+    fn poll_timeline_scan(&mut self) {
+        let Some(rx) = &self.timeline_scan else { return };
+        match rx.try_recv() {
+            Ok(Ok(timeline)) => {
+                let n = timeline.markers.len();
+                self.set_replay_timeline(timeline);
+                if n > 0 {
+                    self.set_status(format!("{n} markers in this recording · ( ) to jump"));
+                }
+            }
+            Ok(Err(e)) => {
+                self.timeline_scan = None;
+                self.set_status(format!("could not scan the recording: {e}"));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.timeline_scan = None,
+        }
+    }
+
+    /// Jump to the previous or next marker: an alert firing or a kernel
+    /// event, which is where a recording of an incident is worth reading.
+    fn jump_marker(&mut self, forward: bool) {
+        let Some((pos, len)) = self.source.timeline() else {
+            self.set_status("not a recording");
+            return;
+        };
+        let Some(timeline) = &self.replay_timeline else {
+            self.set_status(match self.timeline_scan.is_some() {
+                true => "still scanning the recording for markers",
+                false => "no markers: the recording could not be scanned",
+            });
+            return;
+        };
+        let Some(marker) = timeline.neighbour(pos, forward).cloned() else {
+            self.set_status(match forward {
+                true => "no later markers",
+                false => "no earlier markers",
+            });
+            return;
+        };
+        let target = marker.position.min(len.saturating_sub(1));
+        self.go_to_frame(target);
+        let kind = match marker.kind {
+            crate::record::MarkerKind::Alert => "alert",
+            crate::record::MarkerKind::Kernel => "kernel",
+        };
+        self.set_status(format!("{kind} {} · frame {}/{len}", marker.label, target + 1));
+    }
+
+    fn on_seek_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.input.clear();
+                self.close_prompt();
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Char(c) if c.is_ascii_alphanumeric() || matches!(c, '#' | '+' | '-') => {
+                self.input.push(c)
+            }
+            KeyCode::Enter => {
+                let Some((pos, len)) = self.source.timeline() else {
+                    self.close_prompt();
+                    return;
+                };
+                match crate::record::parse_seek(
+                    &self.input,
+                    pos,
+                    len,
+                    self.replay_timeline.as_ref(),
+                ) {
+                    Ok(target) => {
+                        self.input.clear();
+                        self.close_prompt();
+                        self.go_to_frame(target);
+                        self.set_status(format!("frame {}/{len}", target + 1));
+                    }
+                    Err(e) => self.input_error = Some(e),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Show frame `next` of a recording, paused there.
+    ///
+    /// The rules start again from here: a jump is time nobody watched, the
+    /// way switching fleet hosts is, and the alerts of the frame left behind
+    /// stayed on the status line describing a moment no longer on screen.
+    fn go_to_frame(&mut self, next: usize) {
+        self.alerts = AlertEngine::new(self.cfg.alerts.clone());
+        self.active_alerts.clear();
         self.source.seek(next);
         // Scrubbing implies stepping frame by frame rather than playing on.
         self.paused = true;
@@ -1183,7 +1454,6 @@ impl App {
             self.snap = snap;
             self.rebuild_view();
         }
-        self.set_status(format!("frame {}/{}", next + 1, len));
     }
 
     /// Copy the selected process's command line to the system clipboard.
@@ -1215,7 +1485,8 @@ impl App {
     ) {
         let Some(path) = self.audit_path.clone() else { return };
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        audit::append(&path, &audit::format_entry(now, &action, pid, name, result));
+        let line = audit::format_entry(now, &action, pid, name, result);
+        audit::append(&path, &line, self.cfg.audit.max_bytes);
     }
 
     /// Processes a prompt will act on: whatever it captured when it opened.
@@ -1756,6 +2027,7 @@ impl App {
             // Replaying evidence must never execute today's hooks or open
             // another flight recording. Keep alert display available.
             self.alerts.take_commands();
+            self.alerts.take_notices();
             self.alerts.take_fired();
             return Vec::new();
         }
@@ -1771,7 +2043,43 @@ impl App {
         let label = self.fleet_target().unwrap_or_default();
         let mut commands = self.alerts.take_commands();
         crate::supervisor::attach_context(&mut commands, &drained.dumps, &label, &self.snap);
+        let mut notices = self.alerts.take_notices();
+        crate::supervisor::attach_context(&mut notices, &drained.dumps, &label, &self.snap);
+
+        // Every other fleet host's rules. No flight recorder: the ring holds
+        // the selected host's frames, and a dump of one machine named after
+        // another's alert would be evidence of the wrong thing.
+        let hosts = self.source.fleet();
+        for (target, (engine, _)) in self.host_alerts.iter_mut() {
+            engine.take_fired();
+            let mut theirs = engine.take_commands();
+            let mut their_notices = engine.take_notices();
+            if theirs.is_empty() && their_notices.is_empty() {
+                continue;
+            }
+            let snap = hosts.iter().find(|h| h.target == *target).map(|h| &h.snapshot);
+            let snap = snap.cloned().unwrap_or_default();
+            crate::supervisor::attach_context(&mut theirs, &[], target, &snap);
+            crate::supervisor::attach_context(&mut their_notices, &[], target, &snap);
+            // Said on the status line the way the headless fleet says it.
+            for call in theirs.iter_mut().chain(their_notices.iter_mut()) {
+                call.message = format!("{target}: {}", call.message);
+            }
+            for call in their_notices.iter().filter(|c| c.firing) {
+                notes.push(call.message.clone());
+            }
+            commands.extend(theirs);
+            notices.extend(their_notices);
+        }
         notes.extend(crate::supervisor::spawn_hooks(&commands));
+        notes.extend(crate::notify::send(&self.cfg.notify, &notices));
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        for note in &notes {
+            if self.alert_notes.len() >= ALERT_NOTES {
+                self.alert_notes.pop_front();
+            }
+            self.alert_notes.push_back((now, note.clone()));
+        }
         notes
     }
 
@@ -1821,6 +2129,7 @@ impl App {
         // with them, since a rule that has been edited is a new rule.
         self.alerts = AlertEngine::new(self.cfg.alerts.clone());
         self.host_alerts.clear();
+        self.host_alert_seen.clear();
         self.active_alerts.clear();
         if history_changed {
             self.reset_histories();
@@ -1925,6 +2234,9 @@ pub struct GroupRow {
     /// What to draw instead of `name`: a container's name, where known.
     /// `name` stays the key, so opening the group filters by id.
     pub label: Option<String>,
+    /// The unit's health, when grouping by service and systemd has something
+    /// to say about it.
+    pub unit: Option<crate::metrics::units::UnitHealth>,
 }
 
 impl GroupRow {
@@ -1947,6 +2259,11 @@ pub fn group_rows(rows: &[ProcRow], by: GroupBy, snap: &Snapshot) -> Vec<GroupRo
     // a container reports the same counters, so adding them per process would
     // multiply the container's traffic by its process count.
     let mut namespaces: HashMap<String, HashSet<u64>> = HashMap::new();
+    // The host's own namespace is everybody's: its traffic is the network
+    // panel's, and crediting it to each group in it gave every service on
+    // the machine the machine's whole throughput. Found on a real host, where
+    // sshd, journald and a crash-looping `sh` all "moved" 116 KB/s.
+    let host_ns: HashSet<u64> = snap.netns.iter().filter(|n| n.host).map(|n| n.id).collect();
     for p in rows {
         let key = match by {
             GroupBy::Service => p.service.clone(),
@@ -1956,7 +2273,7 @@ pub fn group_rows(rows: &[ProcRow], by: GroupBy, snap: &Snapshot) -> Vec<GroupRo
         }
         .unwrap_or_else(|| "-".to_string());
 
-        if let Some(ns) = p.netns {
+        if let Some(ns) = p.netns.filter(|ns| !host_ns.contains(ns)) {
             namespaces.entry(key.clone()).or_default().insert(ns);
         }
         let entry = acc.entry(key.clone()).or_insert_with(|| {
@@ -1974,6 +2291,7 @@ pub fn group_rows(rows: &[ProcRow], by: GroupBy, snap: &Snapshot) -> Vec<GroupRo
                 cgroup_throttled: None,
                 cgroup_oom_kills: None,
                 label: None,
+                unit: None,
             }
         });
         if by == GroupBy::Container && entry.label.is_none() {
@@ -2012,6 +2330,39 @@ pub fn group_rows(rows: &[ProcRow], by: GroupBy, snap: &Snapshot) -> Vec<GroupRo
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| b.mem.cmp(&a.mem))
     });
+    if by == GroupBy::Service {
+        for row in out.iter_mut() {
+            row.unit = snap.unit(&row.name).cloned();
+        }
+        // A unit in trouble usually has nothing running: a crash-looping
+        // service is between restarts at almost every sample, and a failed
+        // one has nothing at all. Grouping only what is running left exactly
+        // those out, so they get a row of their own — first, since a broken
+        // service outranks a busy one.
+        let mut troubled: Vec<GroupRow> = snap
+            .units
+            .iter()
+            .filter(|u| u.state != crate::metrics::units::UnitState::Ok)
+            .filter(|u| !out.iter().any(|r| r.name == u.name))
+            .map(|u| GroupRow {
+                name: u.name.clone(),
+                procs: 0,
+                cpu: 0.0,
+                mem: 0,
+                io_bps: 0.0,
+                net_bps: None,
+                cgroup_mem: None,
+                cgroup_mem_ratio: None,
+                cgroup_cpu_ratio: None,
+                cgroup_throttled: None,
+                cgroup_oom_kills: None,
+                label: None,
+                unit: Some(u.clone()),
+            })
+            .collect();
+        troubled.append(&mut out);
+        out = troubled;
+    }
     out
 }
 
@@ -2224,6 +2575,39 @@ mod tests {
         assert_eq!(abc.net_bps, Some((1000.0, 250.0)), "three processes, one namespace");
         let def = groups.iter().find(|g| g.name == "def456").expect("def456");
         assert_eq!(def.net_bps, Some((7.0, 7.0)));
+    }
+
+    /// The host's namespace belongs to every host process, and its traffic
+    /// is the network panel's. Counting it per group gave every service on a
+    /// real host the whole machine's throughput; a group that is partly in
+    /// a namespace of its own keeps that one's.
+    #[test]
+    fn host_namespace_traffic_is_not_credited_to_every_group() {
+        use crate::metrics::NetNamespace;
+        let snap = Snapshot {
+            netns: vec![
+                NetNamespace {
+                    id: 1,
+                    host: true,
+                    rx_bps: 9000.0,
+                    tx_bps: 9000.0,
+                    ..Default::default()
+                },
+                NetNamespace { id: 2, rx_bps: 40.0, tx_bps: 2.0, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let row = |pid, ns, unit: &str| ProcRow {
+            netns: Some(ns),
+            service: Some(unit.into()),
+            ..proc(pid, "x", 1.0, 10)
+        };
+        let rows =
+            vec![row(1, 1, "sshd.service"), row(2, 1, "app.service"), row(3, 2, "app.service")];
+        let groups = group_rows(&rows, GroupBy::Service, &snap);
+        let net = |name: &str| groups.iter().find(|g| g.name == name).unwrap().net_bps;
+        assert_eq!(net("sshd.service"), None, "the host's traffic is not sshd's");
+        assert_eq!(net("app.service"), Some((40.0, 2.0)), "its own namespace still counts");
     }
 
     /// A process that reports no namespace is not a process that moved no

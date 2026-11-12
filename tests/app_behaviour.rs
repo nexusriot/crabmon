@@ -1194,6 +1194,10 @@ fn descriptors_can_be_filtered_on_like_any_other_column() {
 /// An `App` over several hosts, each a fixture with a recognisable hostname
 /// and CPU.
 fn fleet_app(hosts: &[(&str, f32)]) -> crabmon::App {
+    fleet_app_with(common::config(), hosts)
+}
+
+fn fleet_app_with(cfg: crabmon::Config, hosts: &[(&str, f32)]) -> crabmon::App {
     use crabmon::fleet::FleetSource;
     use crabmon::metrics::{CpuSample, HostInfo, MetricSource, Snapshot};
 
@@ -1211,7 +1215,68 @@ fn fleet_app(hosts: &[(&str, f32)]) -> crabmon::App {
             ((*name).to_string(), source)
         })
         .collect();
-    crabmon::App::new(common::config(), Box::new(FleetSource::new(sources)))
+    crabmon::App::new(cfg, Box::new(FleetSource::new(sources)))
+}
+
+/// Rules run on every host, not only the one opened: the machine in trouble
+/// is the one nobody has selected yet.
+#[test]
+fn rules_fire_on_hosts_that_are_not_selected_and_are_counted_per_host() {
+    let mut cfg = common::config();
+    cfg.alerts = vec![crabmon::watch::parse_rule("cpu>=90", 0).unwrap()];
+    let mut a = fleet_app_with(cfg, &[("web-1", 10.0), ("db-1", 95.0)]);
+    a.tick();
+
+    let hosts = a.fleet();
+    let count = |name: &str| a.fleet_alert_count(hosts.iter().find(|h| h.target == name).unwrap());
+    assert_eq!(count("web-1"), 0);
+    assert_eq!(count("db-1"), 1, "db-1 is over the line while web-1 is selected");
+    assert!(a.active_alerts.is_empty(), "the selected host's own status line is unaffected");
+
+    let notes = a.drain_alert_side_effects(None);
+    assert!(notes.iter().any(|n| n.starts_with("db-1: ")), "{notes:?}");
+    // Fired once, not once per tick.
+    a.tick();
+    assert!(a.drain_alert_side_effects(None).iter().all(|n| !n.starts_with("db-1")));
+
+    // Opening it carries its engine over, still firing.
+    a.cfg.layout = crabmon::ui::Layout::Fleet;
+    a.set_fleet_page(10, 2);
+    a.on_key(key('j'));
+    a.on_key(code(KeyCode::Enter));
+    a.tick();
+    assert_eq!(a.active_alerts.len(), 1);
+}
+
+#[test]
+fn the_fleet_sorts_by_column_and_the_cursor_stays_on_its_host() {
+    use crabmon::fleet::FleetSort;
+    let mut a = fleet_app(&[("web-1", 10.0), ("web-2", 50.0), ("db-1", 90.0)]);
+    a.cfg.layout = crabmon::ui::Layout::Fleet;
+    a.tick();
+    a.set_fleet_page(10, 3);
+    a.on_key(key('j')); // web-2
+    let names = |a: &crabmon::App| a.fleet().iter().map(|h| h.target.clone()).collect::<Vec<_>>();
+
+    a.on_key(key('>'));
+    assert_eq!(a.fleet_sort, FleetSort::Host);
+    assert_eq!(names(&a), ["db-1", "web-1", "web-2"]);
+    a.on_key(key('>'));
+    assert_eq!(a.fleet_sort, FleetSort::Cpu);
+    assert!(a.fleet_sort_desc, "a figure sorts busiest first");
+    assert_eq!(names(&a), ["db-1", "web-2", "web-1"]);
+    a.on_key(key('s'));
+    assert_eq!(names(&a), ["web-1", "web-2", "db-1"]);
+
+    let hosts = a.fleet();
+    a.follow_fleet_cursor(&hosts);
+    assert_eq!(hosts[a.fleet_selected].target, "web-2", "the cursor followed its host");
+
+    // ...and Enter opens that host, not whatever named-order row it is on.
+    a.on_key(code(KeyCode::Enter));
+    assert_eq!(a.fleet_target().as_deref(), Some("web-2"));
+    // The process table's sort was not touched by any of it.
+    assert_eq!(a.cfg.sort_by, common::config().sort_by);
 }
 
 #[test]
@@ -1416,4 +1481,83 @@ fn replay_discards_hooks_and_does_not_feed_the_flight_recorder() {
     assert!(a.alerts.take_fired().is_empty());
     assert_eq!(flight.buffered(), 0);
     assert!(!flight.is_dumping());
+}
+
+/// `(` and `)` jump between the places a recording is worth reading, and
+/// `:` goes to a frame or a time.
+#[test]
+fn a_replay_jumps_between_markers_and_seeks_by_time() {
+    use crabmon::record::{Marker, MarkerKind, ReplaySource, Timeline};
+    let frames: Vec<_> = (0..20)
+        .map(|n| {
+            let mut s = snapshot();
+            s.taken_at_unix = 1_000 + n * 10;
+            s
+        })
+        .collect();
+    let mut a =
+        crabmon::App::new(common::config(), Box::new(ReplaySource::from_frames(frames, "rec")));
+    a.tick();
+
+    a.on_key(key(')'));
+    assert!(a.status_text().is_some_and(|s| s.contains("scanning") || s.contains("could not")));
+
+    let marker = |position, kind, label: &str| Marker { position, kind, label: label.into() };
+    a.set_replay_timeline(Timeline {
+        at_unix: (0..20).map(|n| 1_000 + n * 10).collect(),
+        markers: vec![
+            marker(5, MarkerKind::Alert, "hot"),
+            marker(12, MarkerKind::Kernel, "oom java"),
+        ],
+    });
+    a.on_key(key(')'));
+    assert_eq!(a.timeline(), Some((5, 20)));
+    assert!(a.status_text().is_some_and(|s| s.contains("alert hot")), "{:?}", a.status_text());
+    a.on_key(key(')'));
+    assert_eq!(a.timeline(), Some((12, 20)));
+    a.on_key(key(')'));
+    assert_eq!(a.timeline(), Some((12, 20)), "nothing later: stay put");
+    a.on_key(key('('));
+    assert_eq!(a.timeline(), Some((5, 20)));
+
+    a.on_key(key(':'));
+    assert_eq!(a.mode, Mode::Seek);
+    for c in "nonsense".chars() {
+        a.on_key(key(c));
+    }
+    a.on_key(code(KeyCode::Enter));
+    assert_eq!(a.mode, Mode::Seek, "a bad seek keeps the prompt open");
+    assert!(a.input_error.is_some());
+    a.input.clear();
+    for c in "+1m".chars() {
+        a.on_key(key(c));
+    }
+    a.on_key(code(KeyCode::Enter));
+    assert_eq!(a.mode, Mode::Normal);
+    assert_eq!(a.timeline(), Some((11, 20)), "frame 5 is at 1050s; a minute on is frame 11");
+}
+
+#[test]
+fn seek_is_refused_on_a_live_source() {
+    let mut a = app();
+    a.on_key(key(':'));
+    assert_eq!(a.mode, Mode::Normal);
+}
+
+/// The first re-sort has to keep the cursor on its host too, not only one
+/// that had been moved first: on a real fleet it was left on row 0, which
+/// the sort had just given to another machine.
+#[test]
+fn the_fleet_cursor_follows_its_host_on_the_very_first_sort() {
+    let mut a = fleet_app(&[("web-1", 10.0), ("db-1", 90.0)]);
+    a.cfg.layout = crabmon::ui::Layout::Fleet;
+    a.tick();
+    a.set_fleet_page(10, 2);
+    assert_eq!(a.fleet()[a.fleet_selected].target, "web-1");
+    a.on_key(key('>'));
+    a.on_key(key('>')); // cpu, busiest first: db-1 moves to the top
+    let hosts = a.fleet();
+    a.follow_fleet_cursor(&hosts);
+    assert_eq!(hosts[0].target, "db-1");
+    assert_eq!(hosts[a.fleet_selected].target, "web-1", "the cursor stayed on row 0");
 }

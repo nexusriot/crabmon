@@ -13,6 +13,7 @@
 *.swp
 .DS_Store
 
+# Per-checkout state of the Serena coding-agent tool.
 .serena/
 
 # Snapshots written by the `P` key. With `[export] dir` unset — the default —
@@ -53,7 +54,10 @@ crabmon-*.md
 
 # Action log, when `[audit] path` points somewhere relative, or when no
 # platform state directory can be resolved and it falls back to `./crabmon/`.
+# `.1` is the generation `[audit] max_bytes` rotates it to; see
+# `audit::rotated_path`.
 /actions.log
+/actions.log.1
 /crabmon/
 
 # `cargo vendor`, which docs/DESIGN.md names as the way to close the last

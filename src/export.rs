@@ -99,7 +99,7 @@ pub fn to_json(snap: &Snapshot) -> String {
 }
 
 /// Escape a field for RFC 4180 CSV.
-fn csv_field(s: &str) -> String {
+pub(crate) fn csv_field(s: &str) -> String {
     if s.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
@@ -245,6 +245,19 @@ pub fn to_text_with(snap: &Snapshot, columns: &[String], width: u16) -> String {
     let (rx, tx) = snap.net_totals(false);
     if rx > 0.0 || tx > 0.0 {
         out.push_str(&format!("   net ↓ {} ↑ {}", human_bps(rx), human_bps(tx)));
+    }
+    // A failed or crash-looping service is the "what is this box doing"
+    // answer more often than any figure above, and the text report is what
+    // is read over SSH. It was missing; found against a real host with an
+    // OOM-killed unit.
+    let troubled: Vec<String> = snap
+        .units
+        .iter()
+        .filter(|u| u.state != crate::metrics::units::UnitState::Ok)
+        .map(|u| format!("{} {}", u.name, u.summary()))
+        .collect();
+    if !troubled.is_empty() {
+        out.push_str(&format!("\nunits  {}", troubled.join(", ")));
     }
     out.push_str("\n\n");
     out.push_str(&crate::ui::procs::text_table_with(&snap.procs, columns, width));
@@ -404,5 +417,24 @@ mod redaction_tests {
             }
         }
         assert!(snap.procs[0].cmd.contains("hunter2"));
+    }
+
+    #[test]
+    fn the_text_report_names_services_in_trouble_and_only_those() {
+        use crate::metrics::units::{UnitHealth, UnitState};
+        let mut snap = Snapshot::default();
+        assert!(!to_text(&snap).contains("units"));
+        snap.units = vec![
+            UnitHealth {
+                name: "cm3-oom.service".into(),
+                state: UnitState::Failed,
+                result: "oom-kill".into(),
+                ..Default::default()
+            },
+            UnitHealth { name: "fine.service".into(), restarts: 3, ..Default::default() },
+        ];
+        let text = to_text(&snap);
+        assert!(text.contains("units  cm3-oom.service failed (oom-kill)"), "{text}");
+        assert!(!text.contains("fine.service"), "{text}");
     }
 }

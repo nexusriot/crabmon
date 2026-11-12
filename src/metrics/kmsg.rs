@@ -76,6 +76,16 @@ impl KernelEvent {
     pub fn age_secs(&self, uptime_secs: u64) -> u64 {
         uptime_secs.saturating_sub(self.monotonic_us / 1_000_000)
     }
+
+    /// The cgroup an OOM kill happened in — the last part of the
+    /// `task_memcg=` path the cgroup-aware kill line carries, such as
+    /// `cm3-oom.service` or `docker-<id>.scope`.
+    pub fn memcg(&self) -> Option<&str> {
+        let path = self.text.split(',').find_map(|f| {
+            f.trim().strip_prefix("task_memcg=").or_else(|| f.trim().strip_prefix("oom_memcg="))
+        })?;
+        path.rsplit('/').find(|p| !p.is_empty())
+    }
 }
 
 /// Events kept per sample, and in a recording.
@@ -213,7 +223,16 @@ pub struct KmsgReader {
     last_seq: Option<u64>,
     /// Events seen since the last `take_new`, for the alert rules.
     new_since: Vec<KernelEvent>,
+    /// Records left of an OOM-killer report in progress. The report dumps a
+    /// `Call Trace:` of the allocation that triggered it, which is not a
+    /// kernel oops, and was counted as one on every OOM kill.
+    oom_report_left: usize,
 }
+
+/// How many records an OOM-killer report can run to: the trace, the memory
+/// statistics and the task table. A report whose kill line never comes stops
+/// suppressing call traces after this many.
+const OOM_REPORT_RECORDS: usize = 400;
 
 /// Records read in one drain. Opening the device replays the whole ring, and
 /// a sample is not the place to spend an unbounded number of syscalls.
@@ -241,6 +260,7 @@ impl KmsgReader {
             events: Vec::new(),
             last_seq: None,
             new_since: Vec::new(),
+            oom_report_left: 0,
         }
     }
 
@@ -289,11 +309,40 @@ impl KmsgReader {
     /// Accept a record as though it had been read from the device. The IO and
     /// the bookkeeping are separated so the latter can be driven from a test.
     pub fn accept(&mut self, record: &str) {
+        let text = record.split_once(';').map_or("", |(_, t)| t);
+        let line = text.split('\n').next().unwrap_or(text);
+        if line.contains("invoked oom-killer") {
+            self.oom_report_left = OOM_REPORT_RECORDS;
+        } else {
+            self.oom_report_left = self.oom_report_left.saturating_sub(1);
+        }
         let Some(event) = parse_record(record) else { return };
         if self.last_seq.is_some_and(|seen| event.seq <= seen) {
             return;
         }
         self.last_seq = Some(event.seq);
+        // The allocation trace inside an OOM report, not an oops of its own.
+        if event.kind == EventKind::Oops
+            && self.oom_report_left > 0
+            && event.text.to_ascii_lowercase().contains("call trace:")
+        {
+            return;
+        }
+        if event.kind == EventKind::OomKill {
+            self.oom_report_left = 0;
+            // One kill is logged twice — `oom-kill:...task=x,pid=N` and then
+            // `Killed process N (x)` — and was counted twice. The pid ties
+            // the pair together; a different victim is a different kill.
+            let same_kill = self.events.last().is_some_and(|prev| {
+                prev.kind == EventKind::OomKill
+                    && prev.pid.is_some()
+                    && prev.pid == event.pid
+                    && event.seq.saturating_sub(prev.seq) <= 4
+            });
+            if same_kill {
+                return;
+            }
+        }
         self.new_since.push(event.clone());
         self.events.push(event);
         let overflow = self.events.len().saturating_sub(MAX_EVENTS);
@@ -350,6 +399,34 @@ impl KmsgReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sequence a memory-cgroup OOM kill really logs, from a 7.0 kernel:
+    /// the trigger, an allocation trace, statistics, and the kill — twice.
+    const OOM_REPORT: [&str; 6] = [
+        "4,5000,100,-;python3 invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL), order=0, oom_score_adj=0",
+        "4,5001,100,-;Call Trace:",
+        "4,5002,100,-; oom_kill_process.cold+0x8/0xac",
+        "6,5003,100,-;Memory cgroup stats for /system.slice/cm3-oom.service:",
+        "3,5004,100,-;oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=cm3-oom.service,mems_allowed=0,oom_memcg=/system.slice/cm3-oom.service,task_memcg=/system.slice/cm3-oom.service,task=python3,pid=396716,uid=0",
+        "3,5005,100,-;Memory cgroup out of memory: Killed process 396716 (python3) total-vm:223496kB, anon-rss:30548kB",
+    ];
+
+    #[test]
+    fn an_oom_report_is_one_kill_and_no_oops() {
+        let mut r = KmsgReader::closed();
+        for record in OOM_REPORT {
+            r.accept(record);
+        }
+        let kinds: Vec<_> = r.events().iter().map(|e| (e.kind, e.pid)).collect();
+        assert_eq!(kinds, [(EventKind::OomKill, Some(396_716))], "{:?}", r.events());
+
+        // A second victim right after is a second kill, and a call trace
+        // outside any OOM report is still an oops.
+        r.accept("3,5006,100,-;Memory cgroup out of memory: Killed process 396717 (python3) total-vm:1kB");
+        r.accept("4,5100,100,-;Call Trace:");
+        let kinds: Vec<_> = r.events().iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, [EventKind::OomKill, EventKind::OomKill, EventKind::Oops]);
+    }
 
     /// Real lines, as the kernels that emit them spell them.
     const OOM_CLASSIC: &str = "4,1234,1234567890,-;Out of memory: Killed process 4242 (firefox) \

@@ -84,6 +84,27 @@ pub fn summary(rule: &ActiveAlert, first: &Snapshot, at: &Snapshot, dump: &str) 
         }
     }
 
+    // Services systemd has given up on or keeps restarting: no gauge above
+    // shows them, and a crash-looping service has no row in a process table
+    // at most moments.
+    let troubled: Vec<_> = at
+        .units
+        .iter()
+        .filter(|u| u.state != crate::metrics::units::UnitState::Ok)
+        .take(TOP_N)
+        .collect();
+    if !troubled.is_empty() {
+        out.push_str("\n## systemd services\n\n");
+        for u in troubled {
+            out.push_str(&format!(
+                "- `{}` {} — {} automatic restarts in all\n",
+                u.name,
+                u.summary(),
+                u.restarts
+            ));
+        }
+    }
+
     out.push_str("\n## Busiest processes\n\n");
     out.push_str(&table(at, TOP_N));
 
@@ -274,6 +295,38 @@ mod tests {
         let out = summary(&alert(), &s, &s, "d.jsonl");
         let row = out.lines().find(|l| l.contains("sh -c")).expect("the row");
         assert_eq!(row.matches(" | ").count(), 4, "an argv split the row: {row}");
+    }
+
+    #[test]
+    fn services_in_trouble_are_listed_and_healthy_ones_are_not() {
+        use crate::metrics::units::{UnitHealth, UnitState};
+        let s = Snapshot {
+            units: vec![
+                UnitHealth {
+                    name: "api.service".into(),
+                    state: UnitState::CrashLoop,
+                    recent_restarts: 5,
+                    restarts: 40,
+                    window_secs: 600,
+                    ..Default::default()
+                },
+                UnitHealth { name: "old.service".into(), restarts: 2, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let rule = ActiveAlert {
+            name: "loop".into(),
+            message: "loop 1 ≥ 1".into(),
+            value: 1.0,
+            threshold: 1.0,
+        };
+        let out = summary(&rule, &s, &s, "d.jsonl");
+        assert!(out.contains("## systemd services"), "{out}");
+        assert!(out.contains("`api.service` crash-loop 5×/10m — 40 automatic restarts"), "{out}");
+        assert!(!out.contains("old.service"), "a healthy unit is not news: {out}");
+        assert!(
+            !summary(&rule, &Snapshot::default(), &Snapshot::default(), "d").contains("systemd")
+        );
     }
 
     #[test]

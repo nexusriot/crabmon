@@ -25,6 +25,7 @@ complete -c crabmon -l record-rotate -r -f -a '(__fish_complete_directories)' -d
 complete -c crabmon -l replay -r -F -d 'Replay a recording instead of sampling'
 complete -c crabmon -l remote -r -d 'Monitor another host over SSH'
 complete -c crabmon -l remote-command -r -d 'Command to run on the remote host'
+complete -c crabmon -l ssh-option -r -d 'Pass -o OPT to ssh for --remote'
 complete -c crabmon -l serve -r -d 'Serve Prometheus metrics on ADDR'
 complete -c crabmon -l stream -d 'Print one JSON snapshot per line forever'
 complete -c crabmon -l alerts -d 'With --serve/--stream: evaluate alert rules headlessly'

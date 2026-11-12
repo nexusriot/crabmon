@@ -8,7 +8,7 @@ _crabmon() {
           -t --tree -l --layout --theme --no-color --no-mouse -1 --once --format
           -n --top -c --config -g --group --columns --record --record-rotate
           --replay --remote
-          --remote-command --serve --stream --alerts --diff --doctor --watch --watch-rule
+          --remote-command --ssh-option --serve --stream --alerts --diff --doctor --watch --watch-rule
           --watch-for --watch-timeout -h --help -V --version"
 
     case "$prev" in
@@ -29,7 +29,7 @@ _crabmon() {
             return 0 ;;
         --watch|--watch-rule|--watch-for|--watch-timeout)
             return 0 ;;
-        --remote|--remote-command|--serve)
+        --remote|--remote-command|--ssh-option|--serve)
             return 0 ;;
         -l|--layout)
             COMPREPLY=($(compgen -W "dashboard processes cpu io fleet" -- "$cur"))
