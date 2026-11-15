@@ -326,6 +326,26 @@ fn doctor_reports_on_the_config_that_is_actually_in_force() {
 
 /// ...and it is a check, not just a report: a config naming something that
 /// cannot work here exits non-zero so a deploy can refuse it.
+/// Found auditing the docs: `--doctor` passed a `[[silence]]` window that
+/// crabmon then refused to start with, so `crabmon --doctor && deploy`
+/// deployed a config that would not run.
+#[test]
+fn doctor_fails_a_silence_window_that_crabmon_would_refuse() {
+    let dir = scratch("doctor-silence");
+    let cfg = dir.join("crabmon.toml");
+    std::fs::write(&cfg, "[[silence]]\ncomment = \"backup\"\ndaily = \"25:00-26:00\"\n").unwrap();
+    let out = crabmon(&["--config", cfg.to_str().unwrap(), "--doctor"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("silences") && text.contains("\"backup\""), "{text}");
+    let start = crabmon(&["--config", cfg.to_str().unwrap(), "--once"]);
+    assert_eq!(start.status.code(), Some(2), "and a start refuses it the same way");
+
+    std::fs::write(&cfg, "[[silence]]\ndaily = \"02:00-03:00\"\n").unwrap();
+    let out = crabmon(&["--config", cfg.to_str().unwrap(), "--doctor"]);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stdout));
+}
+
 #[test]
 fn doctor_exits_non_zero_when_the_config_asks_for_the_impossible() {
     let dir = scratch("doctor");

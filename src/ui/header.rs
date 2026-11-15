@@ -66,30 +66,38 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &App) {
     // When the half-line is short, the hostname gives way to it — on an
     // 80-column terminal a long hostname used to clip it to `1 unit fai`.
     let room = cols[0].width as usize;
-    let trouble = unit_trouble(&app.snap).map(|t| match t.chars().count() + 10 > room {
-        true => unit_trouble_compact(&app.snap).unwrap_or(t),
-        false => t,
+    // Long, then compact, then cut to fit, always leaving a gap before the
+    // right half: at 50 columns even the compact form ran straight into
+    // the CPU count (`1 failed, 1 lo1 cpu`).
+    let trouble = unit_trouble(&app.snap).map(|t| {
+        let t = match t.chars().count() + 10 > room {
+            true => unit_trouble_compact(&app.snap).unwrap_or(t),
+            false => t,
+        };
+        crate::format::truncate_fit(&t, room.saturating_sub(1).max(1))
     });
     let host_room = match &trouble {
         // The warning, the gap after it, and a gap before the right half.
-        Some(t) => room.saturating_sub(t.chars().count() + 4).max(8),
+        Some(t) => room.saturating_sub(t.chars().count() + 4),
         None => room,
     };
-    let mut left = vec![
-        Span::styled(
-            crate::format::truncate_fit(&h.hostname, host_room),
+    let mut left = Vec::new();
+    // The hostname gives way entirely before the warning is cut further;
+    // a stub of three letters names nothing.
+    if trouble.is_none() || host_room >= 6 {
+        left.push(Span::styled(
+            crate::format::truncate_fit(&h.hostname, host_room.max(1)),
             Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  ", Style::default()),
-    ];
+        ));
+        left.push(Span::styled("  ", Style::default()));
+    }
+    let fits_os = trouble.as_ref().is_none_or(|t| t.chars().count() + 3 < room);
     if let Some(units) = trouble {
         left.push(Span::styled(
             format!("{units}  "),
             Style::default().fg(app.theme.crit).add_modifier(Modifier::BOLD),
         ));
     }
-    left.push(Span::styled(format!("{} {}", h.os, h.kernel), Style::default().fg(app.theme.dim)));
-    let left = Line::from(left);
     let right = Line::from(vec![
         Span::styled(format!("{cores}  "), Style::default().fg(app.theme.text)),
         Span::styled("load ", Style::default().fg(app.theme.dim)),
@@ -102,6 +110,25 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(app.theme.dim),
         ),
     ]);
+    // The OS takes what is left. A gap is kept before the right half only
+    // when that half is full — it ran into the core count on a narrow
+    // terminal — and the kernel version goes before the OS name is cut, so
+    // a 100-column header says `Linux (Ubuntu 26.04)` rather than
+    // `Linux (Ubuntu 26.0…`.
+    let right_len: usize = right.spans.iter().map(|s| s.content.chars().count()).sum();
+    let gap = usize::from(right_len >= cols[1].width as usize);
+    let used: usize = left.iter().map(|s| s.content.chars().count()).sum();
+    let os_room = room.saturating_sub(used + gap);
+    let full = format!("{} {}", h.os, h.kernel);
+    let os_text = match () {
+        _ if full.chars().count() <= os_room => full,
+        _ if h.os.chars().count() <= os_room => h.os.clone(),
+        _ => crate::format::truncate_fit(&h.os, os_room),
+    };
+    if fits_os && os_room >= 4 {
+        left.push(Span::styled(os_text, Style::default().fg(app.theme.dim)));
+    }
+    let left = Line::from(left);
 
     f.render_widget(inner, area);
     f.render_widget(Paragraph::new(left), cols[0]);
@@ -144,6 +171,41 @@ pub fn timeline_bar<'a>(app: &App, pos: usize, len: usize, width: usize) -> Vec<
         .collect()
 }
 
+/// The firing rules: the ones paging somebody in the red banner, and the
+/// silenced ones after it, quietly — still firing, still worth knowing
+/// about, but not what the red is for.
+fn alert_spans<'a>(app: &App) -> Vec<Span<'a>> {
+    let (muted, paging): (Vec<_>, Vec<_>) =
+        app.active_alerts.iter().partition(|a| a.silenced.is_some());
+    let mut spans = Vec::new();
+    if !paging.is_empty() {
+        let msg = paging.iter().map(|a| a.message.clone()).collect::<Vec<_>>().join("  •  ");
+        spans.push(Span::styled(
+            format!(" ALERT  {msg} "),
+            Style::default().fg(app.theme.sel_fg).bg(app.theme.crit).add_modifier(Modifier::BOLD),
+        ));
+    }
+    match (paging.is_empty(), muted.as_slice()) {
+        (_, []) => {}
+        (false, m) => spans.push(Span::styled(
+            format!("  +{} silenced", m.len()),
+            Style::default().fg(app.theme.dim),
+        )),
+        (true, m) => {
+            let names = m
+                .iter()
+                .map(|a| format!("{} ({})", a.name, a.silenced.clone().unwrap_or_default()))
+                .collect::<Vec<_>>()
+                .join("  •  ");
+            spans.push(Span::styled(
+                format!(" silenced  {names}"),
+                Style::default().fg(app.theme.warn),
+            ));
+        }
+    }
+    spans
+}
+
 /// One-line status bar: alerts win over transient status, which wins over hints.
 pub fn draw_status(f: &mut Frame<'_>, area: Rect, app: &App) {
     // A replay keeps its bar whatever else is going on: it is how the replay
@@ -166,19 +228,7 @@ pub fn draw_status(f: &mut Frame<'_>, area: Rect, app: &App) {
         if let Some(status) = app.status_text() {
             spans.push(Span::styled(status.to_string(), Style::default().fg(app.theme.accent)));
         } else if !app.active_alerts.is_empty() {
-            let names = app
-                .active_alerts
-                .iter()
-                .map(|a| a.message.clone())
-                .collect::<Vec<_>>()
-                .join("  •  ");
-            spans.push(Span::styled(
-                format!(" ALERT  {names} "),
-                Style::default()
-                    .fg(app.theme.sel_fg)
-                    .bg(app.theme.crit)
-                    .add_modifier(Modifier::BOLD),
-            ));
+            spans.extend(alert_spans(app));
         } else {
             spans.push(Span::styled(
                 format!(
@@ -191,8 +241,6 @@ pub fn draw_status(f: &mut Frame<'_>, area: Rect, app: &App) {
         }
         Line::from(spans)
     } else if !app.active_alerts.is_empty() {
-        let msg =
-            app.active_alerts.iter().map(|a| a.message.clone()).collect::<Vec<_>>().join("  •  ");
         // The answer to a key just pressed, or a hook or notification that
         // failed, goes first for its few seconds: an alert used to own the
         // whole line, so while one fired every other message was invisible.
@@ -200,10 +248,7 @@ pub fn draw_status(f: &mut Frame<'_>, area: Rect, app: &App) {
         if let Some(status) = app.status_text() {
             spans.push(Span::styled(format!(" {status} "), Style::default().fg(app.theme.accent)));
         }
-        spans.push(Span::styled(
-            format!(" ALERT  {msg} "),
-            Style::default().fg(app.theme.sel_fg).bg(app.theme.crit).add_modifier(Modifier::BOLD),
-        ));
+        spans.extend(alert_spans(app));
         Line::from(spans)
     } else if let Some(status) = app.status_text() {
         Line::from(Span::styled(format!(" {status}"), Style::default().fg(app.theme.accent)))

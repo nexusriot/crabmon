@@ -81,6 +81,10 @@ pub enum Mode {
     AuditLog,
     /// `:` in a replay: where to go, as a frame or a time.
     Seek,
+    /// `u`: a systemd unit's state and journal, and what can be done to it.
+    Unit,
+    /// `S`: silence a rule, or every rule, for a while.
+    Silence,
 }
 
 /// What `run_app` must do after handling an event.
@@ -173,6 +177,19 @@ pub struct App {
     /// What the fleet table is sorted by, and which way.
     pub fleet_sort: crate::fleet::FleetSort,
     pub fleet_sort_desc: bool,
+    /// The unit the `u` popup is about, its journal, and an action waiting
+    /// for `y`.
+    /// Silences set with `S`, for every engine this session runs — the
+    /// selected host's and every parked one — so muting a deploy's alerts
+    /// mutes them on whichever host they fire.
+    pub muted: Vec<crate::silence::Muted>,
+    pub unit_name: String,
+    pub unit_log: Vec<String>,
+    pub unit_confirm: Option<crate::metrics::units::UnitVerb>,
+    /// What runs `systemctl` and reads the journal. Swapped in tests, which
+    /// must never restart a real unit.
+    pub unit_control: fn(crate::metrics::units::UnitVerb, &str) -> Result<(), String>,
+    pub unit_journal: fn(&str, usize) -> Vec<String>,
     /// What running the hooks and notifications said — a post that failed, a
     /// hook killed, a flight dump written — newest last, for the `!` popup.
     /// The status line cannot be trusted with these: while the alert that
@@ -273,7 +290,7 @@ impl App {
             refresh: Duration::from_millis(cfg.refresh_ms),
             filter_text: cfg.filter.clone(),
             filter: filter::parse(&cfg.filter).unwrap_or_default(),
-            alerts: AlertEngine::new(cfg.alerts.clone()),
+            alerts: AlertEngine::configured(&cfg),
             theme,
             source,
             tree_rows: Vec::new(),
@@ -303,6 +320,12 @@ impl App {
             host_alert_seen: HashMap::new(),
             fleet_sort: crate::fleet::FleetSort::Named,
             fleet_sort_desc: false,
+            muted: Vec::new(),
+            unit_name: String::new(),
+            unit_log: Vec::new(),
+            unit_confirm: None,
+            unit_control: crate::metrics::units::control,
+            unit_journal: crate::metrics::units::read_log,
             alert_notes: std::collections::VecDeque::new(),
             replay_timeline: None,
             timeline_scan: None,
@@ -413,6 +436,8 @@ impl App {
         }
 
         self.record_history();
+        self.alerts.muted = self.muted.clone();
+        self.alerts.host = self.fleet_target().unwrap_or_default();
         self.active_alerts = self.alerts.evaluate(&self.snap, self.started.elapsed().as_secs());
         self.rebuild_view();
     }
@@ -594,11 +619,26 @@ impl App {
 
     /// How many rules are firing on a fleet host: the selected host's live
     /// engine, or the one parked for it.
+    /// Silenced rules are not counted: the column answers "which machine
+    /// needs me", and a muted rule is one somebody has already said does not.
+    /// Decided now rather than at the host's last evaluation, so a silence
+    /// set with `S` empties the column at once, not at each host's next frame.
     pub fn fleet_alert_count(&self, host: &crate::fleet::FleetHost) -> usize {
+        let hosts = [host.target.as_str(), host.snapshot.host.hostname.as_str()];
+        let at = host.snapshot.taken_at_unix;
+        let paging = |active: &[ActiveAlert]| {
+            active
+                .iter()
+                .filter(|a| {
+                    crate::silence::covering(&self.cfg.silences, &self.muted, &a.name, &hosts, at)
+                        .is_none()
+                })
+                .count()
+        };
         if host.index == self.source.selected_host() {
-            return self.active_alerts.len();
+            return paging(&self.active_alerts);
         }
-        self.host_alerts.get(&host.target).map_or(0, |(_, active)| active.len())
+        self.host_alerts.get(&host.target).map_or(0, |(_, active)| paging(active))
     }
 
     /// Run the rules for every fleet host but the selected one, against its
@@ -618,7 +658,7 @@ impl App {
             let (engine, active) = self
                 .host_alerts
                 .entry(host.target.clone())
-                .or_insert_with(|| (AlertEngine::new(self.cfg.alerts.clone()), Vec::new()));
+                .or_insert_with(|| (AlertEngine::configured(&self.cfg), Vec::new()));
             if !host.is_live() {
                 // An unobserved interval cannot count toward a hold time, and
                 // a host that is not answering is not over any threshold.
@@ -630,6 +670,8 @@ impl App {
                 continue;
             }
             self.host_alert_seen.insert(host.target.clone(), at);
+            engine.muted = self.muted.clone();
+            engine.host = host.target.clone();
             *active = engine.evaluate(&host.snapshot, now);
         }
     }
@@ -730,8 +772,7 @@ impl App {
                 // Parked, and still evaluated every tick from here on — from
                 // its next frame: this one it has already seen.
                 self.host_alert_seen.insert(previous.clone(), self.snap.taken_at_unix);
-                let old =
-                    std::mem::replace(&mut self.alerts, AlertEngine::new(self.cfg.alerts.clone()));
+                let old = std::mem::replace(&mut self.alerts, AlertEngine::configured(&self.cfg));
                 self.host_alerts.insert(previous, (old, std::mem::take(&mut self.active_alerts)));
             }
             if let Some((engine, active)) = self.host_alerts.remove(&target) {
@@ -1008,6 +1049,14 @@ impl App {
                 self.on_seek_key(key);
                 Action::None
             }
+            Mode::Unit => {
+                self.on_unit_key(key);
+                Action::None
+            }
+            Mode::Silence => {
+                self.on_silence_key(key);
+                Action::None
+            }
             Mode::Detail | Mode::Help | Mode::Alerts | Mode::AuditLog => {
                 self.on_popup_key(key);
                 Action::None
@@ -1028,6 +1077,9 @@ impl App {
     fn on_popup_key(&mut self, key: KeyEvent) {
         let page = self.popup_page();
         match key.code {
+            // The alerts popup is where a silence is wanted: the rule is in
+            // front of you, firing.
+            KeyCode::Char('S') if self.mode == Mode::Alerts => self.open_silence(),
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?') => {
                 self.popup_scroll = 0;
                 self.mode = Mode::Normal;
@@ -1056,6 +1108,7 @@ impl App {
                 self.alerts.rules.len() + self.alerts.history_len() + self.alert_notes.len()
             }
             Mode::AuditLog => self.audit_entries.len(),
+            Mode::Unit => crate::ui::popups::UNIT_FIELDS + self.unit_log.len(),
             Mode::Detail => {
                 crate::ui::popups::DETAIL_FIELDS
                     + self.detail_sockets.len()
@@ -1313,6 +1366,8 @@ impl App {
             KeyCode::Char('r') => self.open_renice(),
             KeyCode::Char('t') => self.open_signal_menu(),
             KeyCode::Char('!') => self.open_popup(Mode::Alerts),
+            KeyCode::Char('S') => self.open_silence(),
+            KeyCode::Char('u') => self.open_unit(),
             KeyCode::Char('P') => return Action::Export,
             _ => {}
         }
@@ -1443,7 +1498,7 @@ impl App {
     /// way switching fleet hosts is, and the alerts of the frame left behind
     /// stayed on the status line describing a moment no longer on screen.
     fn go_to_frame(&mut self, next: usize) {
-        self.alerts = AlertEngine::new(self.cfg.alerts.clone());
+        self.alerts = AlertEngine::configured(&self.cfg);
         self.active_alerts.clear();
         self.source.seek(next);
         // Scrubbing implies stepping frame by frame rather than playing on.
@@ -1557,6 +1612,162 @@ impl App {
             self.cfg.sort_by = key;
         }
         self.rebuild_view();
+    }
+
+    /// Open the `S` prompt, pre-filled with an hour for every rule.
+    fn open_silence(&mut self) {
+        if self.alerts.rules.is_empty() {
+            self.set_status("no alert rules to silence");
+            return;
+        }
+        self.input = "1h".into();
+        self.input_error = None;
+        self.mode = Mode::Silence;
+    }
+
+    fn on_silence_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.input.clear();
+                self.close_prompt();
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Char(c) => self.input.push(c),
+            KeyCode::Enter => {
+                let names: Vec<String> = self.alerts.rules.iter().map(|r| r.name.clone()).collect();
+                match crate::silence::parse_request(&self.input, &names) {
+                    Ok(request) => {
+                        self.apply_silence(request);
+                        self.input.clear();
+                        self.close_prompt();
+                    }
+                    Err(e) => self.input_error = Some(e),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Set or lift a silence. It reaches every engine on the next tick.
+    pub fn apply_silence(&mut self, request: crate::silence::SilenceRequest) {
+        use crate::silence::{Muted, SilenceRequest};
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        self.muted.retain(|m| m.until_unix > now);
+        let what = |rule: &Option<String>| rule.clone().unwrap_or_else(|| "every rule".into());
+        match request {
+            SilenceRequest::For { secs, rule } => {
+                let until_unix = now.saturating_add(secs);
+                self.set_status(format!(
+                    "silenced {} until {}",
+                    what(&rule),
+                    crate::silence::clock(until_unix)
+                ));
+                self.muted.push(Muted { rule, until_unix });
+            }
+            SilenceRequest::Lift { rule } => {
+                let before = self.muted.len();
+                self.muted.retain(|m| rule.is_some() && m.rule != rule);
+                self.set_status(match before - self.muted.len() {
+                    0 => format!("no silence on {} to lift", what(&rule)),
+                    _ => format!("lifted the silence on {}", what(&rule)),
+                });
+            }
+        }
+    }
+
+    /// The unit `u` is about: the selected group when grouping by service,
+    /// else the selected process's.
+    fn selected_unit(&self) -> Option<String> {
+        if self.cfg.group_by == GroupBy::Service {
+            return self
+                .groups()
+                .get(self.group_selected)
+                .map(|g| g.name.clone())
+                .filter(|n| n != "-");
+        }
+        self.selected_row().and_then(|r| r.service.clone())
+    }
+
+    /// Open the unit popup: its state, its recent journal, and restart or
+    /// reset. A unit in trouble brings its journal in the snapshot, read on
+    /// its own machine; for any other unit on this machine it is read now.
+    fn open_unit(&mut self) {
+        let Some(name) = self.selected_unit() else {
+            self.set_status("no systemd unit here: select a process or group that has one");
+            return;
+        };
+        let carried = self.snap.unit(&name).map(|u| u.log_tail.clone()).unwrap_or_default();
+        self.unit_log = match carried.is_empty() && self.samples_this_host() {
+            true => crate::metrics::units::redact_lines(
+                (self.unit_journal)(&name, 40),
+                self.cfg.units.redact_logs,
+            ),
+            false => carried,
+        };
+        self.unit_name = name;
+        self.unit_confirm = None;
+        self.open_popup(Mode::Unit);
+    }
+
+    fn on_unit_key(&mut self, key: KeyEvent) {
+        use crate::metrics::units::UnitVerb;
+        if let Some(verb) = self.unit_confirm {
+            match key.code {
+                KeyCode::Char('y') => {
+                    self.unit_confirm = None;
+                    self.run_unit_verb(verb);
+                }
+                _ => {
+                    self.unit_confirm = None;
+                    self.set_status("cancelled");
+                }
+            }
+            return;
+        }
+        let verb = match key.code {
+            KeyCode::Char('r') => UnitVerb::Restart,
+            KeyCode::Char('x') => UnitVerb::ResetFailed,
+            KeyCode::Char('l') => {
+                if self.samples_this_host() {
+                    self.unit_log = crate::metrics::units::redact_lines(
+                        (self.unit_journal)(&self.unit_name, 40),
+                        self.cfg.units.redact_logs,
+                    );
+                    self.set_status(format!(
+                        "{} lines of {}'s journal",
+                        self.unit_log.len(),
+                        self.unit_name
+                    ));
+                }
+                return;
+            }
+            _ => return self.on_popup_key(key),
+        };
+        // The unit under the cursor belongs to the far end, or to a
+        // recording; the local unit of the same name is another machine's
+        // service, and restarting it is exactly the mistake to refuse.
+        if !self.samples_this_host() {
+            self.set_status("read-only: this unit is not on this machine");
+            return;
+        }
+        self.unit_confirm = Some(verb);
+    }
+
+    fn run_unit_verb(&mut self, verb: crate::metrics::units::UnitVerb) {
+        let name = self.unit_name.clone();
+        let result = (self.unit_control)(verb, &name);
+        if result.is_ok() {
+            // What it did should show now, not at the next scheduled read.
+            crate::metrics::units::refresh_now();
+        }
+        let action = audit::Action::Unit { verb: verb.name().to_string() };
+        match &result {
+            Ok(()) => self.set_status(format!("systemctl {} {name}: ok", verb.name())),
+            Err(e) => self.set_status(format!("systemctl {} {name}: {e}", verb.name())),
+        }
+        self.log_action(action, 0, &name, result.as_ref().map(|_| ()).map_err(|e| e.as_str()));
     }
 
     fn nudge_refresh(&mut self, delta_ms: i64) {
@@ -2102,6 +2313,14 @@ impl App {
             self.set_status(format!("config unchanged: {e}"));
             return;
         }
+        // What a start refuses, a reload refuses too: an edit that breaks a
+        // maintenance window or a notification target keeps the old ones.
+        if let Err(e) = crate::silence::validate(&loaded.silences)
+            .and_then(|()| crate::notify::validate(&loaded.notify))
+        {
+            self.set_status(format!("config unchanged: {e}"));
+            return;
+        }
 
         // Session state, carried across.
         let filter_text = self.filter_text.clone();
@@ -2127,7 +2346,7 @@ impl App {
         // Rules are rebuilt from the file, which is the main reason to do
         // this at all — and the engine's hold times and series start again
         // with them, since a rule that has been edited is a new rule.
-        self.alerts = AlertEngine::new(self.cfg.alerts.clone());
+        self.alerts = AlertEngine::configured(&self.cfg);
         self.host_alerts.clear();
         self.host_alert_seen.clear();
         self.active_alerts.clear();

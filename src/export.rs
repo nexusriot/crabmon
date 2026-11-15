@@ -93,6 +93,56 @@ pub fn redact_command(command: &str) -> String {
     bearer.replace_all(&out, "${1}[REDACTED]").into_owned()
 }
 
+/// Redact credentials in a line a service wrote to its journal.
+///
+/// Narrower than `redact_command` on purpose. A command line is argv joined
+/// with spaces, so after `--password` the only safe thing is to hide the
+/// rest of it; a log line is prose, and hiding everything after the word
+/// `token` turns `failed to read token file /etc/api.key` — the reason the
+/// unit is down — into nothing. Here only a *value* goes: what follows
+/// `key=`, `key:` or `"key": ` for a credential-looking key, up to the next
+/// space, comma, semicolon or `&`; the credential after an `Authorization`
+/// header's scheme; a bearer token; and the user and password in a URL.
+/// Still a heuristic: a secret logged with no key in front of it is not
+/// recognisable as one.
+pub fn redact_log(line: &str) -> String {
+    use regex::Regex;
+    use std::sync::OnceLock;
+    static PAIR: OnceLock<Regex> = OnceLock::new();
+    static AUTH: OnceLock<Regex> = OnceLock::new();
+    static URL: OnceLock<Regex> = OnceLock::new();
+    static BEARER: OnceLock<Regex> = OnceLock::new();
+    let auth = AUTH.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(\bauthorization"?\s*[=:]\s*"?(?:(?:bearer|basic|token|digest)\s+)?)[^\s",;&]+"#,
+        )
+        .expect("authorization regex")
+    });
+    let pair = PAIR.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(\b[\w.-]*(?:password|passwd|passphrase|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential)[\w.-]*"?\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s,;&"]+)"#,
+        )
+        .expect("credential pair regex")
+    });
+    let url = URL.get_or_init(|| {
+        Regex::new(r"(?i)([a-z][a-z0-9+.-]*://)[^/\s@]+@").expect("URL credential regex")
+    });
+    let bearer = BEARER
+        .get_or_init(|| Regex::new(r"(?i)(\bbearer\s+)[a-z0-9._~+/=-]+").expect("bearer regex"));
+    let out = auth.replace_all(line, "${1}[REDACTED]");
+    let out = pair.replace_all(&out, |c: &regex::Captures| {
+        // A value already hidden by the authorization rule stays as it is.
+        match &c[2] {
+            "[REDACTED]" => c[0].to_string(),
+            v if v.starts_with('"') => format!("{}\"[REDACTED]\"", &c[1]),
+            v if v.starts_with('\'') => format!("{}'[REDACTED]'", &c[1]),
+            _ => format!("{}[REDACTED]", &c[1]),
+        }
+    });
+    let out = url.replace_all(&out, "${1}[REDACTED]@");
+    bearer.replace_all(&out, "${1}[REDACTED]").into_owned()
+}
+
 pub fn to_json(snap: &Snapshot) -> String {
     let export = Export { crabmon_version: env!("CARGO_PKG_VERSION"), snapshot: snap };
     serde_json::to_string_pretty(&export).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
@@ -436,5 +486,38 @@ mod redaction_tests {
         let text = to_text(&snap);
         assert!(text.contains("units  cm3-oom.service failed (oom-kill)"), "{text}");
         assert!(!text.contains("fine.service"), "{text}");
+    }
+
+    /// Values go, the words around them stay: a journal line is the reason
+    /// a unit is down, and hiding the rest of it after `token` loses that.
+    #[test]
+    fn journal_lines_lose_credential_values_and_keep_their_reasons() {
+        let cases = [
+            ("api: db password=hunter2 rejected", "api: db password=[REDACTED] rejected"),
+            ("API_TOKEN: abc123, retrying", "API_TOKEN: [REDACTED], retrying"),
+            (
+                r#"{"password": "s3cret", "user": "bob"}"#,
+                r#"{"password": "[REDACTED]", "user": "bob"}"#,
+            ),
+            ("GET /x?api_key=XYZ&page=2 401", "GET /x?api_key=[REDACTED]&page=2 401"),
+            ("Authorization: Basic dXNlcjpwYXNz failed", "Authorization: Basic [REDACTED] failed"),
+            ("sent Bearer eyJhbGciOi.payload.sig", "sent Bearer [REDACTED]"),
+            (
+                "connect postgres://app:pw@db:5432/x refused",
+                "connect postgres://[REDACTED]@db:5432/x refused",
+            ),
+            ("client_secret='a b c' expired", "client_secret='[REDACTED]' expired"),
+        ];
+        for (line, want) in cases {
+            assert_eq!(redact_log(line), want, "{line}");
+        }
+        // Prose about credentials keeps every word: the reason is the point.
+        for line in [
+            "failed to read token file /etc/api.key: permission denied",
+            "password authentication failed for user app",
+            "rotating secrets in 5m",
+        ] {
+            assert_eq!(redact_log(line), line);
+        }
     }
 }

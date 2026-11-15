@@ -25,6 +25,10 @@ pub enum Action {
     IoPriority {
         value: String,
     },
+    /// A `systemctl` verb on a unit: `restart` or `reset-failed`.
+    Unit {
+        verb: String,
+    },
 }
 
 impl fmt::Display for Action {
@@ -34,6 +38,7 @@ impl fmt::Display for Action {
             Action::Renice { nice } => write!(f, "renice {nice}"),
             Action::Affinity { cpus } => write!(f, "affinity {cpus}"),
             Action::IoPriority { value } => write!(f, "ionice {value}"),
+            Action::Unit { verb } => write!(f, "systemctl {verb}"),
         }
     }
 }

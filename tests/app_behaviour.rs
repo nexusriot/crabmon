@@ -1561,3 +1561,214 @@ fn the_fleet_cursor_follows_its_host_on_the_very_first_sort() {
     assert_eq!(hosts[0].target, "db-1");
     assert_eq!(hosts[a.fleet_selected].target, "web-1", "the cursor stayed on row 0");
 }
+
+// -------------------------------------------------------------------- units
+
+use std::sync::Mutex;
+static UNIT_CALLS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn fake_control(verb: crabmon::metrics::units::UnitVerb, unit: &str) -> Result<(), String> {
+    UNIT_CALLS.lock().unwrap().push(format!("{} {unit}", verb.name()));
+    match unit {
+        "denied.service" => Err("Access denied".into()),
+        _ => Ok(()),
+    }
+}
+
+fn fake_journal(unit: &str, n: usize) -> Vec<String> {
+    vec![format!("{unit}: read {n} lines locally")]
+}
+
+fn unit_app(units: Vec<crabmon::metrics::units::UnitHealth>) -> crabmon::App {
+    let mut snap = common::snapshot();
+    snap.units = units;
+    snap.units_unreadable = None;
+    for p in &mut snap.procs {
+        p.service = Some("api.service".into());
+    }
+    let mut a = crabmon::App::new(common::config(), Box::new(FakeSource::single(snap)));
+    a.unit_control = fake_control;
+    a.unit_journal = fake_journal;
+    a.tick();
+    a
+}
+
+/// `u` on a failed service shows why — the journal it carried — and a
+/// restart goes through a confirmation, runs, and is logged.
+#[test]
+fn a_unit_is_explained_restarted_and_logged() {
+    use crabmon::metrics::units::{UnitHealth, UnitState};
+    let path = std::env::temp_dir().join(format!("crabmon-unit-audit-{}.log", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let failed = UnitHealth {
+        name: "api.service".into(),
+        state: UnitState::Failed,
+        log_tail: vec!["api[7]: bind: address already in use".into()],
+        ..Default::default()
+    };
+    let mut a = unit_app(vec![failed]);
+    a.audit_path = Some(path.clone());
+
+    a.on_key(key('u'));
+    assert_eq!(a.mode, Mode::Unit);
+    assert_eq!(a.unit_name, "api.service");
+    assert_eq!(
+        a.unit_log,
+        ["api[7]: bind: address already in use"],
+        "the carried tail, not a re-read"
+    );
+
+    a.on_key(key('r'));
+    assert!(a.unit_confirm.is_some(), "a restart asks first");
+    a.on_key(key('n'));
+    assert!(a.unit_confirm.is_none());
+    assert!(
+        !UNIT_CALLS.lock().unwrap().iter().any(|c| c.contains("api.service")),
+        "n does nothing"
+    );
+
+    a.on_key(key('r'));
+    a.on_key(key('y'));
+    assert!(UNIT_CALLS.lock().unwrap().contains(&"restart api.service".to_string()));
+    a.on_key(key('x'));
+    a.on_key(key('y'));
+    assert!(UNIT_CALLS.lock().unwrap().contains(&"reset-failed api.service".to_string()));
+    let log = std::fs::read_to_string(&path).unwrap_or_default();
+    assert!(log.contains("systemctl restart\tpid=0\tname=api.service\tok"), "{log}");
+    assert!(log.contains("systemctl reset-failed"), "{log}");
+    let _ = std::fs::remove_file(&path);
+
+    a.on_key(code(KeyCode::Esc));
+    assert_eq!(a.mode, Mode::Normal);
+}
+
+/// A healthy unit carries no journal in the snapshot; on this machine it is
+/// read when the popup opens. A refusal from systemctl is said, not hidden.
+#[test]
+fn a_healthy_unit_reads_its_journal_and_a_refusal_is_reported() {
+    let mut a = unit_app(Vec::new());
+    a.on_key(key('u'));
+    assert_eq!(a.unit_log, ["api.service: read 40 lines locally"]);
+    a.unit_name = "denied.service".into();
+    a.on_key(key('r'));
+    a.on_key(key('y'));
+    assert!(a.status_text().is_some_and(|s| s.contains("Access denied")), "{:?}", a.status_text());
+}
+
+/// Another machine's unit — a fleet host, a recording — is never restarted
+/// on this one, though its carried journal is still shown.
+#[test]
+fn a_unit_that_is_not_this_machines_is_read_only() {
+    use crabmon::metrics::units::{UnitHealth, UnitState};
+    let mut snap = common::snapshot();
+    snap.units = vec![UnitHealth {
+        name: "api.service".into(),
+        state: UnitState::CrashLoop,
+        log_tail: vec!["carried from the far end".into()],
+        ..Default::default()
+    }];
+    for p in &mut snap.procs {
+        p.service = Some("api.service".into());
+    }
+    let mut a = crabmon::App::new(
+        common::config(),
+        Box::new(crabmon::record::ReplaySource::from_frames(vec![snap], "rec")),
+    );
+    a.unit_control = fake_control;
+    a.unit_journal = |_: &str, _: usize| panic!("must not read this machine's journal");
+    a.tick();
+    a.on_key(key('u'));
+    assert_eq!(a.unit_log, ["carried from the far end"]);
+    a.on_key(key('r'));
+    assert!(a.unit_confirm.is_none());
+    assert!(a.status_text().is_some_and(|s| s.contains("not on this machine")));
+}
+
+#[test]
+fn u_without_a_unit_says_so() {
+    let mut snap = common::snapshot();
+    for p in &mut snap.procs {
+        p.service = None;
+    }
+    let mut a = crabmon::App::new(common::config(), Box::new(FakeSource::single(snap)));
+    a.tick();
+    a.on_key(key('u'));
+    assert_eq!(a.mode, Mode::Normal);
+    assert!(a.status_text().is_some_and(|s| s.contains("no systemd unit")));
+}
+
+// ------------------------------------------------------------------ silences
+
+/// `S` silences every rule for the typed duration: the alert still shows,
+/// marked, but no hook runs; `off` lifts it and the held page goes out.
+#[test]
+fn s_silences_rules_and_off_lifts_them_releasing_the_held_page() {
+    let mut cfg = common::config();
+    let mut rule = crabmon::watch::parse_rule("cpu>=0", 0).unwrap();
+    rule.name = "always".into();
+    cfg.alerts = vec![rule];
+    let mut a = crabmon::App::new(cfg, Box::new(FakeSource::single(common::snapshot())));
+
+    a.on_key(key('S'));
+    assert_eq!(a.mode, Mode::Silence);
+    assert_eq!(a.input, "1h", "an hour for every rule is the default");
+    a.on_key(code(KeyCode::Enter));
+    assert_eq!(a.mode, Mode::Normal);
+    assert!(a.status_text().is_some_and(|s| s.contains("silenced every rule until")));
+
+    a.tick();
+    assert!(a.active_alerts[0].silenced.is_some(), "still firing, marked silenced");
+    assert!(a.alerts.take_notices().is_empty(), "and paging nobody");
+
+    // A rule that does not exist is refused in the prompt, not silently.
+    a.on_key(key('S'));
+    a.input = "30m nope".into();
+    a.on_key(code(KeyCode::Enter));
+    assert_eq!(a.mode, Mode::Silence);
+    assert!(a.input_error.as_deref().is_some_and(|e| e.contains("no rule named")));
+    a.input = "off".into();
+    a.on_key(code(KeyCode::Enter));
+    assert!(a.muted.is_empty());
+
+    a.tick();
+    assert!(a.active_alerts[0].silenced.is_none());
+    let pages = a.alerts.take_notices();
+    assert_eq!(pages.len(), 1, "the page held by the silence goes out once it is lifted");
+    assert!(pages[0].firing);
+}
+
+/// The fleet's ALERT column counts what pages somebody; a muted rule does
+/// not make a host look like it needs attention.
+#[test]
+fn silenced_rules_are_not_counted_in_the_fleet_alert_column() {
+    let mut cfg = common::config();
+    cfg.alerts = vec![crabmon::watch::parse_rule("cpu>=90", 0).unwrap()];
+    let mut a = fleet_app_with(cfg, &[("web-1", 10.0), ("db-1", 95.0)]);
+    a.tick();
+    let count = |a: &crabmon::App| {
+        let hosts = a.fleet();
+        a.fleet_alert_count(hosts.iter().find(|h| h.target == "db-1").unwrap())
+    };
+    assert_eq!(count(&a), 1);
+    a.apply_silence(crabmon::silence::SilenceRequest::For { secs: 600, rule: None });
+    assert_eq!(count(&a), 0, "at once, not at the parked host's next frame");
+    a.apply_silence(crabmon::silence::SilenceRequest::Lift { rule: None });
+    assert_eq!(count(&a), 1);
+}
+
+/// A journal read on the spot for the `u` popup is redacted like the ones
+/// carried in snapshots, unless `[units] redact_logs` is off.
+#[test]
+fn a_journal_read_for_the_popup_is_redacted_unless_switched_off() {
+    let leaky = |_: &str, _: usize| vec!["api: db password=hunter2 rejected".to_string()];
+    let mut a = unit_app(Vec::new());
+    a.unit_journal = leaky;
+    a.on_key(key('u'));
+    assert_eq!(a.unit_log, ["api: db password=[REDACTED] rejected"]);
+
+    let mut a = unit_app(Vec::new());
+    a.cfg.units.redact_logs = false;
+    a.unit_journal = leaky;
+    a.on_key(key('u'));
+    assert_eq!(a.unit_log, ["api: db password=hunter2 rejected"], "asked for raw lines");
+}

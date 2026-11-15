@@ -9,44 +9,44 @@ process table with a tree view and per-process disk IO, network throughput,
 per-mount disk usage and IO, temperature sensors, GPU load and cgroup limits —
 and it can print all of it as JSON or CSV for scripts.
 
-![crabmon screenshot](docs/crabmon.png)
+![crabmon, the mascot](docs/crabmon.png)
 
-The same thing as text, captured from a one-core VPS with
+This is what it looks like, captured from a one-core VPS with
 `make snapshot` — which drives a real pty through tmux, so this is the
 interface as drawn rather than a description of it:
 
 <!-- snapshot:begin -->
 ```text
 ┌ crabmon ─────────────────────────────────────────────────────────────────────────────────────────┐
-│vps3639009.trouble-free.net  Linux (Ubuntu 26.04)      1 cpu  load 0.92 1.16 1.07  up 31d 04:44:57│
+│vps3639009.trouble-free.net  Linux (Ubuntu 26.04)      1 cpu  load 0.29 0.27 0.28  up 12d 19:53:22│
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ CPU   5.0%  2.10 GHz  ───────────────────────────────────┐┌ Network [phys]  ↓ 1.0 KiB/s  ↑ 67 B/s┐
-│100│                                                      ││Iface     ↓ rate    ↑ rate   total    │
-│   │                                                      ││eth0      1.0 KiB/s 67 B/s   6.4 GiB  │
-│   │                                                      ││                                      │
-│   │                                                      ││                                      │
-│0  │⣀⣀⡠⠤⠤⠤⠤⠒⠒⠒⠒⠒⠒⠒⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⢄⣀⣀⣀⣀⣀⣀⣀⣀⡠⠤⠤⠤⠤││                                      │
-│                                                          │└──────────────────────────────────────┘
-└──────────────────────────────────────────────────────────┘┌ Pressure ────────────────────────────┐
-┌ Memory ──────────────────────────────────────────────────┐│     some    full    10s              │
-│ 43.2%  710.0 MiB / 1.6 GiB  (932.9 MiB avail, 976.1 MiB c││cpu    2.4%    0.0%  ░░░░░░░░░░░░░░░░ │
-└──────────────────────────────────────────────────────────┘│mem    0.1%    0.0%  ░░░░░░░░░░░░░░░░ │
-┌ Swap ────────────────────────────────────────────────────┐│io     2.4%    2.1%  ░░░░░░░░░░░░░░░░ │
-│██████████████ 75.9%  776.7 MiB / 1024.0 MiB              │└──────────────────────────────────────┘
-└──────────────────────────────────────────────────────────┘┌ Sensors (°C) ────────────────────────┐
-┌─ Processes ──────────────────────────────────────────────┐│no temperature sensors                │
-│  PID     USER      S CPU%↓  MEM     DISK      COMMAND    ││                                      │
-│  947116  root      S   2.5    7.6M          - crabmon    ││                                      │
-│  895846  -         S   1.2    139M          - uvicorn    ││                                      │
-│  1       root      S   0.0   10.6M          - systemd    ││                                      │
-│  2       root      S   0.0      0B          - kthreadd   │└──────────────────────────────────────┘
-│  3       root      S   0.0      0B          - pool_workq…│┌ Disks ───────────────────────────────┐
-│  4       root      I   0.0      0B          - kworker/R-…││████████/  23.1 GiB / 37.3 GiB        │
-│  5       root      I   0.0      0B          - kworker/R-…││█████/boot  245.2 MiB / 973.4 MiB     │
-│  6       root      I   0.0      0B          - kworker/R-…││██/var/lib/do…  23.1 GiB / 37.3 GiB   │
-│  7       root      I   0.0      0B          - kworker/R-…││██/var/lib/do…  23.1 GiB / 37.3 GiB   │
+┌ CPU  61.5%  2.10 GHz  usr 48.7 sys 12.8 io 20.5 ─────────┐┌ Network [phys]  ↓ 16.3 KiB/s  ↑ 9.7 K┐
+│100│⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠢⢄                                         ││Iface     ↓ rate    ↑ rate   total    │
+│   │             ⠑⠢⡀               ⢀⣀                    ⣀││eth0      16.3 KiB/ 9.7 KiB/ 20.3 GiB │
+│   │               ⠈⠑⢄         ⢀⡠⠔⠊⠁ ⠉⠉⠒⠒⠤⢄⣀⡀     ⣀⡠⠤⠔⠒⠉⠉ ││                                      │
+│   │                  ⠉⠢⣀  ⢀⡠⠔⠊⠁            ⠈⠉⠑⠒⠉⠉        ││tcp 7 est 0 tw                        │
+│0  │                     ⠑⠊⠁                              │└──────────────────────────────────────┘
+│▅                                                         │┌ Pressure ────────────────────────────┐
+└──────────────────────────────────────────────────────────┘│     some    full    10s              │
+┌ Memory ──────────────────────────────────────────────────┐│cpu    8.4%    0.0%  █░░░░░░░░░░░░░░░ │
+│ 38.0%  623.8 MiB / 1.6 GiB  (1019.0 MiB avail, 1.1 GiB ca││mem    0.0%    0.0%  ░░░░░░░░░░░░░░░░ │
 └──────────────────────────────────────────────────────────┘└──────────────────────────────────────┘
- 127 shown of 265 tasks · sort CPU%↓ · 800 ms · [?] help
+┌ Swap ────────────────────────────────────────────────────┐┌ Kernel ──────────────────────────────┐
+│ 49.3%  504.7 MiB / 1024.0 MiB  in 10.0 KiB/s out 0 B/s  1││OOM  python3 (482060)       28:27 ago │
+└──────────────────────────────────────────────────────────┘│OOM  python3 (480464)       33:07 ago │
+┌─ Processes ──────────────────────────────────────────────┐│OOM  python3 (478455)       38:58 ago │
+│  PID     USER      S CPU%↓  MEM     DISK      COMMAND    ││OOM  python3 (477047)       47:21 ago │
+│  443796  root      S  28.2   70.2M          - retroshare…│└──────────────────────────────────────┘
+│  1619    usbmux    S  23.1    197M      935K  minio      │┌ Sensors (°C) ────────────────────────┐
+│  484507  root      S   3.8    8.5M          - crabmon    ││no temperature sensors                │
+│  316     root      S   2.6      0B      1.2M  jbd2/sda4-8││                                      │
+│  443783  retrosha… S   1.3   12.0M          - retroshare…││                                      │
+│  1       root      S   0.0   11.0M          - systemd    │└──────────────────────────────────────┘
+│  2       root      S   0.0      0B          - kthreadd   │┌ Disks  R 0 B/s  W 15.7 MiB/s ────────┐
+│  3       root      S   0.0      0B          - pool_workq…││/  16.3 GiB / 37.3 GiB  R 0 B/s  W 15.│
+│  4       root      I   0.0      0B          - kworker/R-…││█████/boot  245.5 MiB / 973.4 MiB     │
+└──────────────────────────────────────────────────────────┘└──────────────────────────────────────┘
+ 125 shown of 284 tasks · sort CPU%↓ · 800 ms · [?] help
 ```
 <!-- snapshot:end -->
 
@@ -176,6 +176,24 @@ interface as drawn rather than a description of it:
   crabmon finds already high when it starts is history, not a loop: only
   restarts it sees happen count. User units (`systemctl --user`) are not
   read.
+
+  A unit in trouble also brings its own account of why: its last twelve
+  journal lines, read with `journalctl --unit=` on the unit's own machine
+  (for the five worst units at a time, and again only when the unit restarts
+  or changes state) and with credential values redacted there (see
+  "Freshness, alert hysteresis and credential redaction"), so they arrive
+  over `--remote`, land in recordings and flight-dump summaries, and ride
+  along in a `unit` alert's notification. `u` opens a unit — the selected group when grouping by
+  service, or the selected process's unit otherwise — with what systemd
+  says about it, its journal (read on the spot for any local unit that did not bring one),
+  and `r` to restart it or `x` to `reset-failed` it. Both ask `y`/`n` first,
+  are written to the action log, and run `systemctl --no-ask-password`, so
+  without the privilege they fail and say so instead of prompting for a
+  password inside the interface; a restart is queued (`--no-block`) rather
+  than waited on, and the units are read again at once so its effect shows
+  within a second rather than at the next five-second reading. A unit on another machine — a fleet host, a recording —
+  is read-only. Reading other units' journals needs root or the
+  `systemd-journal` group.
 - **Kernel events** — OOM kills, segfaults, kernel oopses and block-IO
   errors, read from `/dev/kmsg`. The dashboard shows memory *now*, and the
   process the OOM killer chose is by definition no longer in the table, so
@@ -211,7 +229,7 @@ interface as drawn rather than a description of it:
   (`kind = "unit"`). `--serve --alerts` and `--stream --alerts` run the same
   rules with no terminal at all, exporting each one firing or not — which is
   what puts pressure stall, device saturation and descriptor exhaustion within
-  reach of a pager. `[[notify]]` posts every transition to Slack, Discord,
+  reach of a pager. `[[notify]]` posts every transition outside a silence to Slack, Discord,
   ntfy or any JSON webhook without a script, and the `!` popup keeps what
   delivering them said.
 - **File descriptors** — an optional FD column with each process's count
@@ -274,8 +292,9 @@ interface as drawn rather than a description of it:
   rules. The filter, tags, pins, selection, layout and sort are session state
   and survive. Editing a config mid-incident is exactly when restarting costs
   the most.
-- **Action log** — every signal, renice and affinity change is recorded to a
-  local file, viewable in the TUI with `L`.
+- **Action log** — every signal, renice, affinity and IO-priority change, and
+  every unit restart or `reset-failed`, is recorded to a local file, viewable
+  in the TUI with `L`.
 - **Self-check** — `crabmon --doctor` says what this machine will and will not
   let crabmon see, and exits non-zero when the config asks for something that
   cannot work here. crabmon never reports zero for a thing it could not read,
@@ -423,6 +442,8 @@ run of stuck workers.
 | `A` | CPU affinity *(Linux)* |
 | `I` | IO priority (ionice) *(Linux)* |
 | `P` | Export a snapshot |
+| `u` | A systemd unit: its state and journal; `r` restart, `x` reset-failed, `l` reload |
+| `S` | Silence alert rules for a while: `1h`, `30m <rule>`, `off` (also in the `!` popup) |
 | `!` | Active alerts and the rules behind them |
 | `Ctrl-R` | Reload the config file, keeping the session |
 | `?`, `F1` | Show all key bindings |
@@ -755,8 +776,12 @@ Under `--serve` each rule is also exported, firing or not:
 ```text
 crabmon_alert_active{rule="cpu-saturated",kind="cpu"} 1
 crabmon_alert_value{rule="cpu-saturated",kind="cpu"} 97.5
+crabmon_alert_silenced{rule="cpu-saturated",kind="cpu"} 0
 crabmon_alert_threshold{rule="cpu-saturated",kind="cpu"} 90
 ```
+
+`crabmon_alert_silenced` is 1 inside a silence (see "Silencing" below), so
+`crabmon_alert_active == 1 and crabmon_alert_silenced == 0` is what pages.
 
 That is what makes crabmon's own measurements — pressure stall, the busiest
 device's utilisation, how close a process is to *its own* descriptor limit —
@@ -836,7 +861,8 @@ Settings live at `$XDG_CONFIG_HOME/crabmon/config.toml`, typically
 changes and on exit — except for the active filter, which is session state and
 is never written back, so a query typed at `/` cannot silently narrow later
 runs. Missing or malformed files fall back to defaults, and out-of-range values
-are clamped rather than rejected.
+are clamped rather than rejected — except `[[notify]]` and `[[silence]]` entries
+that cannot work, which stop crabmon at start (and fail `--doctor`).
 
 ```toml
 refresh_ms = 800            # clamped to 200..=10000
@@ -904,6 +930,7 @@ pin_marker = true           # show the ▸ pinned / • tagged marker column
 enabled = true
 crash_loop = 3              # automatic restarts within window_secs that make a loop
 window_secs = 600
+redact_logs = true          # hide credential values in units' journal lines
 
 [remote]
 # Hold one SSH session open and read a stream of frames instead of starting a
@@ -956,6 +983,11 @@ max_bytes = 1048576         # then moved to <path>.1 and started again; 0 never
 # [[fleet]]
 # name = "db"
 # hosts = ["db-1", "db-2"]
+
+# Maintenance windows in which rules page nobody; see "Silencing".
+# [[silence]]
+# comment = "nightly backup"
+# daily = "02:00-03:30"      # UTC
 
 # Where alert transitions are posted; see "Notifications without a script".
 # [[notify]]
@@ -1171,7 +1203,9 @@ five-minute default. Any other kind refuses a window rather than ignoring it.
 A `disk` or `fillin` rule naming a mount crabmon does not measure is refused
 with the list of mounts it does, rather than waiting out its timeout and
 exiting 0 as if the disk had never filled. The disk list leaves out tmpfs and
-the other memory filesystems.
+the other memory filesystems. A `unit` rule where systemd is not read
+(`[units] enabled = false`, or no systemd) and a `kernel` rule where
+`/dev/kmsg` is not readable are refused the same way, with the reason.
 
 Per-process series are only kept when a `trend` rule has a `query`, only for
 the series some rule actually names, and for at most a few thousand processes
@@ -1246,6 +1280,7 @@ script serves every rule instead of each rule carrying its own message:
 | `CRABMON_AT` | the sample's Unix time |
 | `CRABMON_DUMP` | the flight recording this firing opened, if any |
 | `CRABMON_SUMMARY` | the readable summary beside it |
+| `CRABMON_DETAIL` | for a `unit` rule, the failing unit's last journal lines |
 
 Every one is always set, empty where it does not apply, so a hook written with
 `set -u` does not have to guess which exist.
@@ -1282,13 +1317,55 @@ that fires at 03:12 and clears at 03:14 says both — followed by the last fifty
 things delivering them said: a notification that failed and why, a hook killed
 for running too long, a flight recording written. Those also flash on the
 status line, ahead of the ALERT banner, which otherwise owns the line for as
-long as the alert holds.
+long as the alert holds (or, when every firing rule is silenced, the quieter
+list of silenced rules).
+
+### Silencing
+
+A deploy that crash-loops a service for ten minutes on purpose should page
+nobody, and one that leaves it broken should page the moment it is over. A
+silence does exactly that: the rule is still evaluated, drawn and recorded —
+the flight recorder keeps its evidence — but its hooks and notifications are
+held back, and the summary written beside a flight dump says nobody was
+paged, and why. When the silence ends, crabmon catches up: a rule still firing
+pages then, one that fired and recovered unseen says nothing, and one that
+had paged before the silence and recovered during it says it recovered.
+
+`S` (in the interface, or in the `!` popup) silences for a while: `1h` every
+rule, `30m cpu-saturated` one rule; `off` lifts every silence set with `S`
+(the config's windows stay), and `off cpu-saturated` lifts one set on that
+rule — an every-rule silence still covers it. A silence covers every host of
+a fleet. The
+status line keeps the red banner for rules paging somebody and lists the
+silenced ones after it, quietly; the `!` popup marks them `MUTED`, and their
+transitions `·m`; the fleet's ALERT column stops counting them.
+
+Scheduled maintenance goes in the config, in UTC like every time crabmon
+writes, and applies headlessly too:
+
+```toml
+[[silence]]
+comment = "nightly backup"  # said wherever the silence is
+rules = ["disk-busy"]       # empty means every rule
+hosts = ["db-1"]            # fleet target or hostname; empty means every host
+daily = "02:00-03:30"       # every day, UTC; may cross midnight
+
+[[silence]]
+comment = "kernel upgrade"
+start = "2026-11-20T02:00Z" # a one-off window, UTC
+end = "2026-11-20T04:00Z"
+```
+
+A window that could never open — a typo in a time, an end before its start,
+both `daily` and `start` — stops crabmon at start and fails `--doctor`, and a
+reload with `Ctrl-R` keeps the old ones, rather than letting the pager go off in the middle of the
+maintenance it was written for.
 
 ### Notifications without a script
 
 That script is what nearly everybody writes, so crabmon has it built in.
 Each `[[notify]]` posts every transition — of every rule, with or without a
-`command` — to one destination:
+`command`, and outside a silence (see Silencing) — to one destination:
 
 ```toml
 [[notify]]
@@ -1310,7 +1387,9 @@ chat message, which Mattermost and Rocket.Chat's Slack-compatible hooks take
 too. `ntfy` sends the message with a title, a priority (high when firing) and
 a tag. `webhook` posts JSON carrying everything a hook is told — `rule`,
 `kind`, `state`, `value`, `threshold`, `message`, `host`, `at`, `dump`,
-`summary` — for anything else to route.
+`summary`, `detail` — for anything else to route. A `unit` rule's firing
+carries the failing unit's last journal lines as `detail`: a code block
+under the chat message, the body's second paragraph for ntfy.
 
 The post is made by `curl`, which has to be installed. Nothing about it is on
 a command line: the URL — which for Slack and Discord *is* the credential —
@@ -1416,7 +1495,8 @@ measurement's own unit. An above rule with `threshold = 90` fires at 90 and
 recovers strictly below 85; a below rule with threshold 10 recovers at 15.
 The default is 0; values must be finite and nonnegative. The margin applies
 after firing; `for_secs` still measures
-continuous time beyond the original threshold. Hooks run once per transition.
+continuous time beyond the original threshold. Hooks run once per announced
+transition — inside a silence, not at all until it ends (see Silencing).
 
 `[export] redact_commands = true` and `[record] redact_commands = true` are
 the defaults. They hide common credential arguments (`--password`, `--token`,
@@ -1430,6 +1510,19 @@ cannot distinguish spaces inside a secret from argument boundaries. Set either
 setting to `false` to retain raw commands for that output. Positional secrets
 and unrecognized credential names still require `[record] omit_paths = true`
 or care before sharing exports; this is not a general secret scanner.
+
+Journal lines are redacted where they are read — on the unit's own machine,
+before they reach a snapshot — so they travel into `--remote`, recordings,
+incident summaries, `unit` notifications and the `u` popup already
+redacted. The rules are narrower than for command lines, because a journal
+line is the reason a unit is down: only a *value* goes, the one after a
+credential-looking `key=`, `key:` or `"key": ` (up to the next space, comma,
+semicolon or `&`), the credential after an `Authorization:` header's scheme,
+a bearer token, and a URL's user and password. `password=hunter2 rejected`
+becomes `password=[REDACTED] rejected`, while `failed to read token file
+/etc/api.key` keeps every word. A secret logged with no key in front of it
+is not recognisable and is not hidden. `[units] redact_logs = false` carries
+the lines as they are.
 
 ## Development
 

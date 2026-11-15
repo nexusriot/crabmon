@@ -86,6 +86,13 @@ pub struct UnitHealth {
     /// which the near end's config knows nothing about. 0 in frames that
     /// predate it, read as the default ten minutes.
     pub window_secs: u64,
+    /// The unit's last journal lines, oldest first, for units in trouble
+    /// only: "crash-looping" says *that* it is broken, and these say why.
+    /// Read by the crabmon on the unit's own machine, so they travel over
+    /// `--remote`, into recordings and into notifications. Empty where the
+    /// journal cannot be read, or the unit is healthy.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub log_tail: Vec<String>,
 }
 
 impl UnitHealth {
@@ -128,6 +135,165 @@ impl UnitHealth {
             UnitState::Ok => format!("{} restarts", self.restarts),
         }
     }
+}
+
+/// What crabmon can do to a unit from the interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnitVerb {
+    Restart,
+    ResetFailed,
+}
+
+impl UnitVerb {
+    /// The `systemctl` verb, which is also how the action log spells it.
+    pub fn name(self) -> &'static str {
+        match self {
+            UnitVerb::Restart => "restart",
+            UnitVerb::ResetFailed => "reset-failed",
+        }
+    }
+}
+
+/// Run `systemctl <verb> <unit>`.
+///
+/// `--no-block` queues a restart rather than waiting for the unit to come
+/// up, which can take a minute and would freeze the interface; whether it
+/// worked shows in the next readings. `--no-ask-password`, because a polkit
+/// password prompt would land in the middle of a full-screen interface that
+/// is not reading the terminal — without the privilege the call fails, and
+/// says so. `--` keeps a unit name from ever being read as an option.
+pub fn control(verb: UnitVerb, unit: &str) -> Result<(), String> {
+    let mut cmd = std::process::Command::new("systemctl");
+    cmd.arg("--no-ask-password");
+    if verb == UnitVerb::Restart {
+        cmd.arg("--no-block");
+    }
+    let out = cmd
+        .args([verb.name(), "--", unit])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("systemctl: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    Err(err.lines().find(|l| !l.trim().is_empty()).unwrap_or("systemctl failed").trim().to_string())
+}
+
+/// Journal lines carried per unit in trouble.
+pub const LOG_LINES: usize = 12;
+/// Units whose journal is read per pass, worst first: each read is a
+/// `journalctl` run, and a machine with forty failed units needs the first
+/// few explained, not all of them every five seconds.
+pub const LOG_UNITS: usize = 5;
+/// A journal line longer than this is cut: a stack trace on one line is
+/// still evidence, but not a kilobyte of it in every frame.
+const LOG_LINE_MAX: usize = 300;
+
+/// The last `lines` journal lines of `unit`, oldest first. `--unit=` rather
+/// than `-u NAME`, so a unit name can never be read as an option, and
+/// without a pager or a prompt. A journal crabmon may not read — another
+/// user's, without the `systemd-journal` group — is an empty answer, not an
+/// error: the unit's state is still worth showing.
+pub fn read_log(unit: &str, lines: usize) -> Vec<String> {
+    let out = std::process::Command::new("journalctl")
+        .arg(format!("--unit={unit}"))
+        .args(["-n", &lines.to_string(), "-o", "short-iso", "--no-pager", "-q"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| crate::format::truncate_fit(&without_hostname(l), LOG_LINE_MAX))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A `short-iso` journal line without its second field, the hostname: every
+/// line names the same machine, and on a real host it took a third of the
+/// width a popup or a chat message has for the part that says why.
+fn without_hostname(line: &str) -> String {
+    let mut parts = line.splitn(3, ' ');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(when), Some(_host), Some(rest)) if when.contains('T') => format!("{when} {rest}"),
+        _ => line.to_string(),
+    }
+}
+
+/// `lines` with credentials hidden when `redact` is on.
+pub fn redact_lines(lines: Vec<String>, redact: bool) -> Vec<String> {
+    match redact {
+        true => lines.iter().map(|l| crate::export::redact_log(l)).collect(),
+        false => lines,
+    }
+}
+
+/// Fill in the log tails of the worst units in trouble.
+pub fn attach_logs(
+    units: &mut [UnitHealth],
+    cache: &mut LogCache,
+    read: &impl Fn(&str) -> Vec<String>,
+) {
+    for unit in units.iter_mut().filter(|u| u.state != UnitState::Ok).take(LOG_UNITS) {
+        let key = LogCache::key(unit);
+        unit.log_tail = match cache.0.get(&unit.name) {
+            Some((k, tail)) if *k == key => tail.clone(),
+            _ => {
+                let tail = read(&unit.name);
+                cache.0.insert(unit.name.clone(), (key, tail.clone()));
+                tail
+            }
+        };
+    }
+    let names: std::collections::HashSet<&str> = units.iter().map(|u| u.name.as_str()).collect();
+    cache.0.retain(|name, _| names.contains(name.as_str()));
+}
+
+/// Fill the log tails that the cache already holds for the units' current
+/// state, and say whether any is missing — so the new states can be
+/// published before the slow part.
+pub fn attach_cached_logs(units: &mut [UnitHealth], cache: &LogCache) -> bool {
+    let mut missing = false;
+    for unit in units.iter_mut().filter(|u| u.state != UnitState::Ok).take(LOG_UNITS) {
+        match cache.0.get(&unit.name) {
+            Some((k, tail)) if *k == LogCache::key(unit) => unit.log_tail = tail.clone(),
+            _ => missing = true,
+        }
+    }
+    missing
+}
+
+/// Journal tails already read, by unit, with the state they were read in.
+///
+/// A unit's journal only says something new when the unit did something
+/// new: it restarted again, changed state, or exited differently. Reading
+/// it every five seconds regardless cost a second a unit on a busy one-core
+/// host, and the fresh unit states waited behind every read.
+#[derive(Debug, Default)]
+pub struct LogCache(std::collections::HashMap<String, (String, Vec<String>)>);
+
+impl LogCache {
+    fn key(u: &UnitHealth) -> String {
+        format!("{}|{}|{}|{}|{:?}", u.restarts, u.active, u.sub, u.result, u.exit_status)
+    }
+}
+
+/// What an alert about units adds to its notification: the log tail of the
+/// first unit it names, under the unit's name. Empty when there is none.
+pub fn detail(units: &[UnitHealth], figure: &str, query: &str) -> String {
+    let named = subject(units, figure, query);
+    let Some(unit) = units
+        .iter()
+        .filter(|u| names(u, query) && !u.log_tail.is_empty())
+        .find(|u| named.contains(&u.name))
+    else {
+        return String::new();
+    };
+    let tail = &unit.log_tail[unit.log_tail.len().saturating_sub(5)..];
+    format!("{}:\n{}", unit.name, tail.join("\n"))
 }
 
 /// The figures a `unit` alert can measure.
@@ -276,36 +442,88 @@ pub struct UnitSettings {
     pub interval: Duration,
     pub window: Duration,
     pub crash_loop: u64,
+    /// Hide credentials in journal lines before they leave this thread —
+    /// and so before they reach a snapshot, `--remote`, a recording or a
+    /// notification. See `export::redact_log`.
+    pub redact: bool,
 }
 
 #[derive(Default)]
 struct Shared {
-    /// `None` until the first reading has been taken.
-    latest: std::sync::Mutex<Option<(Vec<UnitHealth>, Option<String>)>>,
+    /// `None` until the first reading has been taken. The flag says whether
+    /// its journals have been read too.
+    latest: std::sync::Mutex<Option<Reading>>,
     ready: std::sync::Condvar,
+}
+
+/// One published reading: the notable units, why there are none when they
+/// could not be read, and whether their journals are in yet.
+type Reading = (Vec<UnitHealth>, Option<String>, bool);
+
+/// Why there are no units yet on a host where they will be: temporary, so a
+/// rule that waits on them is not refused for it.
+pub const STILL_READING: &str = "systemd units are still being read";
+
+/// How long the first reading is waited for, so `--once` has one.
+const FIRST_WAIT: Duration = Duration::from_secs(2);
+
+/// How to wake every unit watcher in the process for an immediate reading.
+static WAKE: std::sync::Mutex<Vec<std::sync::mpsc::SyncSender<()>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Read the units again now rather than at the next interval. Called after
+/// crabmon restarts or resets a unit: the status line said `ok` while the
+/// unit was still drawn failed for up to five seconds, found on a real host.
+pub fn refresh_now() {
+    if let Ok(mut all) = WAKE.lock() {
+        // A full channel already has a reading queued; a closed one belongs
+        // to a watcher that has stopped.
+        all.retain(|w| {
+            !matches!(w.try_send(()), Err(std::sync::mpsc::TrySendError::Disconnected(_)))
+        });
+    }
 }
 
 /// `systemctl show` on a thread of its own, every `interval`.
 pub struct UnitWatcher {
     shared: std::sync::Arc<Shared>,
+    started: Instant,
     /// Dropped with the watcher, which is how the thread learns to stop.
     _stop: std::sync::mpsc::Sender<()>,
 }
 
 impl UnitWatcher {
     pub fn spawn(settings: UnitSettings) -> UnitWatcher {
-        Self::spawn_with(settings, query_systemctl)
+        let redact = settings.redact;
+        Self::spawn_with(settings, query_systemctl, move |unit: &str| {
+            redact_lines(read_log(unit, LOG_LINES), redact)
+        })
     }
 
     fn spawn_with(
         settings: UnitSettings,
         query: impl Fn() -> Result<String, String> + Send + 'static,
+        logs: impl Fn(&str) -> Vec<String> + Send + 'static,
     ) -> UnitWatcher {
         let shared = std::sync::Arc::new(Shared::default());
         let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let (wake, woken) = std::sync::mpsc::sync_channel::<()>(1);
+        if let Ok(mut all) = WAKE.lock() {
+            all.push(wake);
+        }
         let worker = shared.clone();
         let _ = std::thread::Builder::new().name("crabmon-units".into()).spawn(move || {
             let mut tracker = RestartTracker::default();
+            let mut cache = LogCache::default();
+            let publish = |result: Result<Vec<UnitHealth>, String>, complete: bool| {
+                if let Ok(mut latest) = worker.latest.lock() {
+                    *latest = Some(match result {
+                        Ok(units) => (units, None, complete),
+                        Err(e) => (Vec::new(), Some(e), true),
+                    });
+                }
+                worker.ready.notify_all();
+            };
             loop {
                 let result = query().map(|out| {
                     let mut units = parse_show(&out);
@@ -325,34 +543,57 @@ impl UnitWatcher {
                     });
                     units
                 });
-                if let Ok(mut latest) = worker.latest.lock() {
-                    *latest = Some(match result {
-                        Ok(units) => (units, None),
-                        Err(e) => (Vec::new(), Some(e)),
-                    });
+                match result {
+                    Ok(mut units) => {
+                        // The states first, with whatever journal is already
+                        // known; then the journals that changed, if any.
+                        if attach_cached_logs(&mut units, &cache) {
+                            publish(Ok(units.clone()), false);
+                            attach_logs(&mut units, &mut cache, &logs);
+                        }
+                        publish(Ok(units), true);
+                    }
+                    Err(e) => publish(Err(e), true),
                 }
-                worker.ready.notify_all();
-                match stopped.recv_timeout(settings.interval) {
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                    _ => break,
+                // Asleep until the next reading is due, or until something
+                // changed a unit and wants it read now.
+                if let Err(std::sync::mpsc::RecvTimeoutError::Disconnected) =
+                    woken.recv_timeout(settings.interval)
+                {
+                    std::thread::sleep(settings.interval);
+                }
+                if let Err(std::sync::mpsc::TryRecvError::Disconnected) = stopped.try_recv() {
+                    break;
                 }
             }
         });
-        UnitWatcher { shared, _stop: stop }
+        UnitWatcher { shared, started: Instant::now(), _stop: stop }
     }
 
     /// The last reading: the notable units, worst first, and why there is
     /// none when it could not be taken. Waits up to two seconds for the very
     /// first reading, so `--once` has one; never after that.
+    ///
+    /// For its first two seconds a watcher waits for a complete first
+    /// reading, journals included, and settles for the states without them
+    /// when they are slower than that. With nothing at all by then it says
+    /// so: an empty list here read as "no unit has failed", which is what a
+    /// busy host printed for a unit that had.
     pub fn latest(&self) -> (Vec<UnitHealth>, Option<String>) {
-        let Ok(mut latest) = self.shared.latest.lock() else { return Default::default() };
-        if latest.is_none() {
-            latest = match self.shared.ready.wait_timeout(latest, Duration::from_secs(2)) {
+        let not_yet = || (Vec::new(), Some(STILL_READING.to_string()));
+        let Ok(mut latest) = self.shared.latest.lock() else { return not_yet() };
+        let deadline = self.started + FIRST_WAIT;
+        while !matches!(&*latest, Some((_, _, true))) {
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else { break };
+            latest = match self.shared.ready.wait_timeout(latest, left) {
                 Ok((guard, _)) => guard,
-                Err(_) => return Default::default(),
+                Err(_) => return not_yet(),
             };
         }
-        latest.clone().unwrap_or_default()
+        match &*latest {
+            Some((units, err, _)) => (units.clone(), err.clone()),
+            None => not_yet(),
+        }
     }
 }
 
@@ -521,6 +762,136 @@ ExecMainStatus=2\n";
     }
 
     #[test]
+    fn logs_are_read_for_the_worst_units_only_and_quoted_in_alerts() {
+        let mk = |name: &str, state| UnitHealth { name: name.into(), state, ..Default::default() };
+        let mut units: Vec<UnitHealth> =
+            (0..8).map(|i| mk(&format!("u{i}.service"), UnitState::Failed)).collect();
+        units.push(mk("fine.service", UnitState::Ok));
+        let read = |unit: &str| (1..=8).map(|n| format!("{unit} line {n}")).collect::<Vec<_>>();
+        attach_logs(&mut units, &mut LogCache::default(), &read);
+        assert_eq!(units.iter().filter(|u| !u.log_tail.is_empty()).count(), LOG_UNITS);
+        assert!(units.last().unwrap().log_tail.is_empty(), "a healthy unit is not read");
+
+        let d = detail(&units, "failed", "u0");
+        assert_eq!(
+            d,
+            "u0.service:\nu0.service line 4\nu0.service line 5\nu0.service line 6\nu0.service line 7\nu0.service line 8"
+        );
+        assert_eq!(detail(&units, "failed", "u7"), "", "no tail was read for it");
+        assert_eq!(detail(&units, "crashloop", ""), "", "nothing crash-looping");
+    }
+
+    #[test]
+    fn journal_lines_lose_the_hostname_and_nothing_else() {
+        assert_eq!(
+            without_hostname(
+                "2026-11-15T08:05:04+00:00 vps3639009.example.net api[7]: bind: in use"
+            ),
+            "2026-11-15T08:05:04+00:00 api[7]: bind: in use"
+        );
+        // Anything not shaped like a short-iso line is kept as it is.
+        assert_eq!(without_hostname("-- Boot 1a2b --"), "-- Boot 1a2b --");
+    }
+
+    /// Found on a real host, where each `journalctl` took a second: a unit's
+    /// journal is read again only when the unit did something new.
+    #[test]
+    fn a_journal_is_reread_only_when_its_unit_changes() {
+        let reads = std::cell::Cell::new(0);
+        let read = |unit: &str| {
+            reads.set(reads.get() + 1);
+            vec![format!("{unit} @ read {}", reads.get())]
+        };
+        let mut cache = LogCache::default();
+        let mut units = vec![UnitHealth {
+            name: "api.service".into(),
+            state: UnitState::CrashLoop,
+            restarts: 7,
+            ..Default::default()
+        }];
+        attach_logs(&mut units, &mut cache, &read);
+        attach_logs(&mut units, &mut cache, &read);
+        assert_eq!(reads.get(), 1, "nothing changed, nothing read");
+        assert!(!attach_cached_logs(&mut units, &cache), "and the cache can answer");
+        units[0].restarts = 8;
+        assert!(attach_cached_logs(&mut units, &cache), "a restart is news");
+        attach_logs(&mut units, &mut cache, &read);
+        assert_eq!(reads.get(), 2);
+        assert_eq!(units[0].log_tail, ["api.service @ read 2"]);
+        // A unit that has left is forgotten.
+        attach_logs(&mut [], &mut cache, &read);
+        assert!(cache.0.is_empty());
+    }
+
+    /// Found on a busy real host: the first reading took longer than the
+    /// two seconds `--once` waits, and the empty answer read as "nothing has
+    /// failed". The states come first; and nothing at all says so.
+    #[test]
+    fn a_slow_first_reading_is_never_reported_as_healthy() {
+        let settings = UnitSettings {
+            interval: Duration::from_secs(600),
+            window: Duration::from_secs(600),
+            crash_loop: 3,
+            redact: true,
+        };
+        // Journals slower than the wait: the states arrive without them.
+        let slow_logs = UnitWatcher::spawn_with(
+            settings,
+            || Ok(SHOW.to_string()),
+            |_: &str| {
+                std::thread::sleep(Duration::from_secs(4));
+                vec!["late".into()]
+            },
+        );
+        let (units, err) = slow_logs.latest();
+        assert_eq!(err, None);
+        assert!(units.iter().any(|u| u.name == "backup.service" && u.state == UnitState::Failed));
+        assert!(units.iter().all(|u| u.log_tail.is_empty()), "the journals were not waited for");
+
+        // systemd itself slower than the wait: not read, rather than healthy.
+        let slow_show = UnitWatcher::spawn_with(
+            settings,
+            || {
+                std::thread::sleep(Duration::from_secs(4));
+                Ok(SHOW.to_string())
+            },
+            |_: &str| Vec::new(),
+        );
+        let (units, err) = slow_show.latest();
+        assert!(units.is_empty());
+        assert_eq!(err.as_deref(), Some("systemd units are still being read"));
+    }
+
+    #[test]
+    fn a_watcher_reads_again_at_once_when_asked() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let settings = UnitSettings {
+            interval: Duration::from_secs(600),
+            window: Duration::from_secs(600),
+            crash_loop: 3,
+            redact: true,
+        };
+        let w = UnitWatcher::spawn_with(
+            settings,
+            move || {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(SHOW.to_string())
+            },
+            |_: &str| Vec::new(),
+        );
+        w.latest();
+        let before = calls.load(std::sync::atomic::Ordering::SeqCst);
+        refresh_now();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while calls.load(std::sync::atomic::Ordering::SeqCst) == before && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) > before, "not re-read");
+    }
+
+    #[test]
     fn short_forms_keep_the_reason() {
         let mut u = unit("x", "failed", "failed", 0);
         u.state = UnitState::Failed;
@@ -559,8 +930,13 @@ ExecMainStatus=2\n";
             interval: Duration::from_millis(10),
             window: Duration::from_secs(600),
             crash_loop: 3,
+            redact: true,
         };
-        let w = UnitWatcher::spawn_with(settings, || Ok(SHOW.to_string()));
+        let w = UnitWatcher::spawn_with(
+            settings,
+            || Ok(SHOW.to_string()),
+            |unit: &str| vec![format!("{unit} said goodbye")],
+        );
         let deadline = Instant::now() + Duration::from_secs(10);
         while w.latest().0.is_empty() && Instant::now() < deadline {
             // `latest` waits for the first reading itself; this is belt and
@@ -570,7 +946,15 @@ ExecMainStatus=2\n";
         let names: Vec<String> = w.latest().0.into_iter().map(|u| u.name).collect();
         assert_eq!(names, ["backup.service", "nginx.service"]);
 
-        let broken = UnitWatcher::spawn_with(settings, || Err("no systemd".into()));
+        // Both troubled units carry their journal, worst first.
+        let tails: Vec<Vec<String>> = w.latest().0.into_iter().map(|u| u.log_tail).collect();
+        assert_eq!(
+            tails,
+            [vec!["backup.service said goodbye"], vec!["nginx.service said goodbye"]]
+        );
+
+        let broken =
+            UnitWatcher::spawn_with(settings, || Err("no systemd".into()), |_: &str| Vec::new());
         let deadline = Instant::now() + Duration::from_secs(10);
         while broken.latest().1.is_none() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));

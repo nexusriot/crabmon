@@ -3,6 +3,62 @@
 Notable changes to crabmon. Versions follow [semantic versioning](https://semver.org),
 with the usual 0.x caveat that minor releases may change behaviour.
 
+## 0.18.0 — unreleased
+
+The other half of a crash loop: what the unit itself said before it died, and
+a way to restart it without leaving crabmon — and a way to stop being paged
+for one on purpose. The fixes came from another round against a real host.
+
+### Added
+
+- **Why a unit failed, and a way to restart it.** Units in trouble carry
+  their last twelve journal lines, read on their own machine for the five
+  worst at a time, into `--remote`, recordings, incident summaries and
+  `unit` alert notifications (`CRABMON_DETAIL`, a code block in chat). `u`
+  opens a unit — the selected service group, or the selected process's unit
+  — with its state and journal, `r` to restart it and `x` to `reset-failed`
+  it: confirmed, written to the action log, run with `systemctl
+  --no-ask-password` so it fails rather than prompting, and refused for
+  another machine's unit. `--doctor` says whether journals and restarts are
+  within reach. A journal is read again only when its unit restarts or
+  changes state, and a restart or reset re-reads the units at once.
+  Credential values in journal lines are redacted on the unit's own
+  machine before they travel anywhere — `password=[REDACTED] rejected`,
+  with the words that explain the failure kept (`[units] redact_logs`).
+- **Alert silencing.** `S` silences every rule, or one, for a while
+  (`1h`, `30m cpu-saturated`, `off`), across every host of a fleet, and
+  `[[silence]]` schedules maintenance windows — daily or one-off, in UTC,
+  limited to rules and hosts — that apply headlessly too. A silenced rule is
+  still evaluated, shown and recorded; only its hooks and notifications are
+  held, and a rule still firing when the silence ends pages then. Exported
+  as `crabmon_alert_silenced`; muted rules leave the red banner and the
+  fleet's ALERT count, and a flight dump's summary says nobody was paged.
+  A window that cannot open stops crabmon at start and fails `--doctor`.
+
+### Changed
+
+- **Dependencies at their newest releases.** `nix` 0.31 → 0.32 (none of its
+  breaking changes touch the signal, scheduling or process-group calls
+  crabmon makes), plus `cargo update` for the lockfile (`errno`, `mio`).
+  Every other dependency was already current; `libc` stays pinned at
+  `1.0.0-alpha.5`, still the newest.
+
+### Fixed
+
+- **A `unit` or `kernel` watch on a source crabmon cannot read waited out its
+  timeout and exited 0**, as if nothing had happened — `[units]` off, or
+  `/dev/kmsg` unreadable. Like a rule on an unmeasured mount, it now exits 2
+  with the reason.
+- **A slow first reading of systemd said nothing had failed.** `--once`
+  waits two seconds for the first reading, and on a busy host the first
+  pass — `systemctl show` plus a journal read per troubled unit — took
+  longer; the empty answer read as healthy. Unit states are now published
+  before their journals, and a reading that is not there yet says so.
+- **The header ran into its right half on a narrow terminal**: the OS name,
+  and at 50 columns even the compact unit warning (`1 failed, 1 lo1 cpu`).
+  Each part is fitted to the space left, the kernel version going before the
+  OS name is cut, with a gap kept only where the right half is full.
+
 ## 0.17.0 — unreleased
 
 Watching more than one machine, and hearing about it: the fleet table sorts

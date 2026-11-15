@@ -31,6 +31,11 @@ pub fn summary(rule: &ActiveAlert, first: &Snapshot, at: &Snapshot, dump: &str) 
 
     out.push_str(&format!("# {} on {host}\n\n", rule.name));
     out.push_str(&format!("- **Rule**: {}\n", rule.message));
+    // A dump written inside a silence is evidence nobody was paged about,
+    // and whoever opens it should not wonder why the pager stayed quiet.
+    if let Some(why) = &rule.silenced {
+        out.push_str(&format!("- **Paged**: no — {why}\n"));
+    }
     out.push_str(&format!(
         "- **Measured**: {:.1} against a threshold of {:.1}\n",
         rule.value, rule.threshold
@@ -102,6 +107,11 @@ pub fn summary(rule: &ActiveAlert, first: &Snapshot, at: &Snapshot, dump: &str) 
                 u.summary(),
                 u.restarts
             ));
+            // Its own account of why, which is what the ticket is for.
+            if !u.log_tail.is_empty() {
+                let tail = &u.log_tail[u.log_tail.len().saturating_sub(6)..];
+                out.push_str(&format!("\n  ```\n  {}\n  ```\n", tail.join("\n  ")));
+            }
         }
     }
 
@@ -238,6 +248,7 @@ mod tests {
             message: "mem-pressure 96.0% ≥ 90.0%".into(),
             value: 96.0,
             threshold: 90.0,
+            silenced: None,
         }
     }
 
@@ -319,11 +330,16 @@ mod tests {
             message: "loop 1 ≥ 1".into(),
             value: 1.0,
             threshold: 1.0,
+            silenced: None,
         };
         let out = summary(&rule, &s, &s, "d.jsonl");
         assert!(out.contains("## systemd services"), "{out}");
         assert!(out.contains("`api.service` crash-loop 5×/10m — 40 automatic restarts"), "{out}");
         assert!(!out.contains("old.service"), "a healthy unit is not news: {out}");
+        let mut with_log = s.clone();
+        with_log.units[0].log_tail = vec!["api[1]: config error on line 3".into()];
+        let out = summary(&rule, &with_log, &with_log, "d.jsonl");
+        assert!(out.contains("  ```\n  api[1]: config error on line 3\n  ```"), "{out}");
         assert!(
             !summary(&rule, &Snapshot::default(), &Snapshot::default(), "d").contains("systemd")
         );
@@ -363,5 +379,20 @@ mod tests {
     fn a_negative_delta_keeps_its_sign() {
         assert!(signed_bytes(-1024).starts_with('-'));
         assert!(signed_bytes(1024).starts_with('+'));
+    }
+
+    /// Found on a real host: a dump written inside a maintenance window did
+    /// not say that nobody had been paged for it.
+    #[test]
+    fn a_dump_inside_a_silence_says_nobody_was_paged() {
+        let mut rule = alert();
+        let s = Snapshot::default();
+        assert!(!summary(&rule, &s, &s, "d.jsonl").contains("Paged"));
+        rule.silenced = Some("maintenance window \"backup\" until 03:30 UTC".into());
+        let out = summary(&rule, &s, &s, "d.jsonl");
+        assert!(
+            out.contains("- **Paged**: no — maintenance window \"backup\" until 03:30 UTC"),
+            "{out}"
+        );
     }
 }

@@ -283,6 +283,28 @@ pub fn parse_rule(expr: &str, for_secs: u64) -> Result<AlertRule, String> {
 /// only; the disk list is sysinfo's, which leaves out tmpfs and the other
 /// memory filesystems.
 pub fn unmeasured_mount(rule: &AlertRule, snap: &crate::metrics::Snapshot) -> Option<String> {
+    // A source that can never be read here makes the rule wait for nothing,
+    // and a watch that times out exits 0 — "it never happened". Found with
+    // `unit:failed>=1` on a host with `[units]` off.
+    let unreadable = match rule.kind {
+        // "Still being read" passes: the first reading on a busy host can
+        // outlast the first sample, and the watch will see it on the next.
+        AlertKind::Unit => snap
+            .units_unreadable
+            .as_deref()
+            .filter(|why| *why != crate::metrics::units::STILL_READING)
+            .map(|why| ("systemd units are", why)),
+        AlertKind::Kernel => {
+            snap.kernel_unreadable.as_deref().map(|why| ("the kernel log is", why))
+        }
+        _ => None,
+    };
+    if let Some((what, why)) = unreadable {
+        return Some(format!(
+            "{} cannot measure anything here: {what} not read ({why})",
+            rule.name
+        ));
+    }
     if !matches!(rule.kind, AlertKind::Disk | AlertKind::FillIn) || rule.target.is_empty() {
         return None;
     }
@@ -459,6 +481,25 @@ mod tests {
         assert!(unmeasured_mount(&parse_rule("disk:/>=90", 0).unwrap(), &snap).is_none());
         assert!(unmeasured_mount(&parse_rule("disk>=90", 0).unwrap(), &snap).is_none(), "any");
         assert!(unmeasured_mount(&parse_rule("cpu>=90", 0).unwrap(), &snap).is_none());
+
+        // Found on a real host with `[units]` off: the watch timed out with
+        // exit 0. A source that is not read refuses the rule the same way.
+        let mut off = snap.clone();
+        off.units_unreadable = Some("[units] enabled is off".into());
+        off.kernel_unreadable = Some("needs root or dmesg_restrict=0".into());
+        let e = unmeasured_mount(&parse_rule("unit:failed>=1", 0).unwrap(), &off).unwrap();
+        assert!(e.contains("systemd units are not read ([units] enabled is off)"), "{e}");
+        let e = unmeasured_mount(&parse_rule("kernel:oom>=1", 0).unwrap(), &off).unwrap();
+        assert!(e.contains("the kernel log is not read (needs root"), "{e}");
+        let mut reading = snap.clone();
+        reading.units_unreadable = Some(crate::metrics::units::STILL_READING.into());
+        assert!(
+            unmeasured_mount(&parse_rule("unit:failed>=1", 0).unwrap(), &reading).is_none(),
+            "a first reading still in progress is not a reason to refuse"
+        );
+        let mut on = snap.clone();
+        on.units_unreadable = None;
+        assert!(unmeasured_mount(&parse_rule("unit:failed>=1", 0).unwrap(), &on).is_none());
     }
 
     /// The window an `[[alert]]` sets as `over_secs`, from a shell.

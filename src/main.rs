@@ -61,6 +61,12 @@ fn main() -> Result<()> {
         eprintln!("crabmon: {}: {e}", path.display());
         std::process::exit(2);
     }
+    // A maintenance window that can never open would let the pager go off
+    // in the middle of the maintenance it was written for.
+    if let Err(e) = crabmon::silence::validate(&cfg.silences) {
+        eprintln!("crabmon: {}: {e}", path.display());
+        std::process::exit(2);
+    }
     // The headless modes. `cli::parse` refuses to combine any of them with
     // `--remote` or `--replay`, so each one here samples this host.
     if let Some((a, b)) = &args.diff {
@@ -567,8 +573,13 @@ fn report(obs: crabmon::supervisor::Observation, notify: &[crabmon::notify::Noti
     for note in obs.notes {
         eprintln!("crabmon: {note}");
     }
-    for name in obs.active.iter().map(|a| &a.message) {
-        eprintln!("crabmon: {name}");
+    // A silenced rule is still said, as silenced: the same line with nothing
+    // to tell it apart read as a rule paging nobody for no reason.
+    for alert in &obs.active {
+        match &alert.silenced {
+            Some(why) => eprintln!("crabmon: {} ({why})", alert.message),
+            None => eprintln!("crabmon: {}", alert.message),
+        }
     }
     for err in supervisor::spawn_hooks(&obs.commands) {
         eprintln!("crabmon: {err}");

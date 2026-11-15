@@ -1,4 +1,4 @@
-.TH CRABMON 1 "2026-11-12" "crabmon 0.17.0" "User Commands"
+.TH CRABMON 1 "2026-11-15" "crabmon 0.18.0" "User Commands"
 .SH NAME
 crabmon \- terminal system monitor
 .SH SYNOPSIS
@@ -18,7 +18,8 @@ It also reports systemd services that have failed or are restarting in a loop,
 kernel events such as OOM kills, and storage redundancy; evaluates alert rules
 with hooks and built-in notifications, in the interface or headlessly; records
 and replays sessions; exports Prometheus metrics; and watches other machines,
-singly or as a fleet, over SSH.
+singly or as a fleet, over SSH. A unit's journal can be read, and the unit
+restarted or reset, from the interface.
 .PP
 With
 .B \-\-once
@@ -186,7 +187,8 @@ usable on its own as a collector. Samples this host only.
 With \fB\-\-serve\fR or \fB\-\-stream\fR, evaluate the \fB[[alert]]\fR rules
 on every sample: run the hook commands, write flight recordings, and — under
 \fB\-\-serve\fR — export each rule as \fBcrabmon_alert_active\fR,
-\fBcrabmon_alert_value\fR and \fBcrabmon_alert_threshold\fR. Without it those
+\fBcrabmon_alert_value\fR, \fBcrabmon_alert_silenced\fR and
+\fBcrabmon_alert_threshold\fR. \fB[[silence]]\fR windows apply. Without it those
 rules run only in the full-screen interface, which means the flight recorder
 depends on someone watching at the moment the incident happens. Notices go to
 standard error, so \fB\-\-stream\fR's output stays one frame per line.
@@ -250,7 +252,8 @@ quietly read as \fB<\fR. The operator is taken from the right, so a
 than one process over 5% CPU". A rule that cannot be parsed is an error, not a
 watch that blocks until its timeout and then reports nothing happened; so is
 a \fBdisk\fR or \fBfillin\fR rule naming a mount crabmon does not measure
-(tmpfs and other memory filesystems are not).
+(tmpfs and other memory filesystems are not), and a \fBunit\fR or
+\fBkernel\fR rule whose source cannot be read here.
 .TP
 .B \-\-watch\-for " " \fISECS\fR
 Require the match to hold this many consecutive seconds. A condition that
@@ -401,6 +404,23 @@ A file that does not parse changes nothing.
 .B P
 Write a snapshot to the export directory.
 .TP
+.B S
+Silence alert rules for a while: \fB1h\fR for every rule, \fB30m\fR
+\fIrule\fR for one, \fBoff\fR [\fIrule\fR] to lift silences set this way
+(\fB[[silence]]\fR windows stay). Also in the \fB!\fR popup. A silenced rule
+is still evaluated and shown, but its hooks and notifications are held; a
+rule still firing when the silence ends pages then, and one that fired and
+recovered inside it says nothing.
+.TP
+.B u
+Open a systemd unit: the selected group when grouping by service, else the
+selected process's. Shows what systemd says, the unit's recent journal
+(carried in the snapshot for units in trouble, read on the spot for any local
+unit that did not bring one), and offers \fBr\fR to restart it and \fBx\fR to
+\fBreset\-failed\fR it, each confirmed with \fBy\fR, logged, and run with
+\fBsystemctl \-\-no\-ask\-password\fR; \fBl\fR reloads the journal. Read-only
+for a unit on another machine.
+.TP
 .B !
 Show the alert rules and their state, every transition, and the last fifty
 notes from running hooks and notifications \(em a post that failed, a hook
@@ -453,7 +473,9 @@ The file is written when the refresh interval changes and on exit. The active
 filter is session state and is not written back, so a query typed at
 .B /
 does not silently narrow later runs. Missing or malformed files fall back to
-defaults; out-of-range values are clamped rather than rejected.
+defaults; out-of-range values are clamped rather than rejected \(em except
+\fB[[notify]]\fR and \fB[[silence]]\fR entries that cannot work, which stop
+crabmon at start.
 .SS Top-level keys
 .TP
 .B refresh_ms
@@ -616,6 +638,14 @@ seconds make a unit crash-looping (defaults 3 and 600). A unit with
 fleet table's STATUS column; grouping by service gives such units a row, with
 a \fBUNIT\fR column, even when nothing of theirs is running. Restarts that
 happened before crabmon started are not counted toward a loop.
+.PP
+.B redact_logs
+(default true) hides credential values in the journal lines units in trouble
+carry, on the unit's own machine before they reach a snapshot: the value
+after a credential-looking \fIkey\fB=\fR, \fIkey\fB:\fR or quoted JSON
+key, the credential after an \fBAuthorization:\fR scheme, bearer tokens,
+and URL user and password. The words around them are kept, since a journal
+line is the reason a unit is down.
 .SS [remote]
 .B stream
 holds one SSH session open and reads a stream of frames instead of starting a
@@ -641,7 +671,8 @@ and process names and PIDs; it does not include command arguments. \fB/healthz\f
 exempt, and the comparison is constant-time.
 .SS [audit]
 .B enabled
-records every signal, renice and affinity change; \fBpath\fR overrides the
+records every signal, renice, affinity and IO-priority change and every unit
+restart or \fBreset\-failed\fR; \fBpath\fR overrides the
 default location under the platform state directory.
 .B max_bytes
 bounds it: at that size the log is moved to \fIpath\fB.1\fR, replacing the
@@ -669,9 +700,26 @@ Each table names a host list for \fB\-\-remote @\fR\fIname\fR:
 and
 .BR hosts ,
 a list of SSH targets.
+.SS [[silence]]
+Each table is a maintenance window in which rules page nobody: they are
+still evaluated, shown and recorded, but hooks and notifications are held,
+and sent when the window closes if the rule is still firing.
+.B comment
+says what it is for;
+.B rules
+and
+.B hosts
+(fleet target or hostname) limit it, empty meaning all; and it is either
+.BR daily ,
+\fBHH:MM\-HH:MM\fR every day, or
+.B start
+and
+.BR end ,
+like \fB2026\-11\-20T02:00Z\fR \(em all in UTC. A window that cannot open
+stops crabmon at start; a reload keeps the old windows instead.
 .SS [[notify]]
 Each table posts every alert transition \(em of every rule, with or without a
-\fBcommand\fR \(em to one destination.
+\fBcommand\fR, outside a silence \(em to one destination.
 .B kind
 is \fBwebhook\fR (JSON carrying the hook variables, lower-cased without the
 prefix), \fBslack\fR or \fBdiscord\fR (a chat message), or \fBntfy\fR (the
@@ -766,7 +814,8 @@ processes' series to follow: \fBrss\fR (the default), \fBcpu\fR or
 quietly reporting \fBrss\fR under another name.
 A rule fires only once its condition has held for \fIfor_secs\fR seconds, and
 its \fIcommand\fR runs once per activation. \fIcommand_clear\fR runs once when
-it recovers, and the alert popup (\fB!\fR) logs every transition,
+it recovers \(em both only outside a silence (see \fB[[silence]]\fR) \(em and
+the alert popup (\fB!\fR) logs every transition,
 so an alert that fired at 03:12 and cleared at 03:14 says both.
 .PP
 A hook runs as \fBsh \-c\fR \fIcommand\fR with the context in its
@@ -785,7 +834,11 @@ and
 .B CRABMON_DUMP
 and
 .B CRABMON_SUMMARY
-for the flight recording a firing opened and the readable summary beside it.
+for the flight recording a firing opened and the readable summary beside it,
+and
+.B CRABMON_DETAIL
+\(em for a \fBunit\fR rule, the failing unit's last journal lines, which
+\fB[[notify]]\fR posts under the message.
 Every one is always set, empty where it does not apply, so a hook written with
 \fBset \-u\fR need not guess which exist. Output goes nowhere and the hook is
 not waited on: one that blocks the sampler is worse than no hook at all.
@@ -904,6 +957,14 @@ receive the remote host's exported, possibly redacted command. Unquoted
 credential values conservatively hide the rest of the command, since joined
 argv cannot preserve argument boundaries. Positional
 secrets and unrecognized credential names cannot be detected automatically.
+.PP
+Journal lines carried for units in trouble are redacted separately, by
+\fB[units] redact_logs\fR (true by default), on the unit's own machine before
+they reach a snapshot, so recordings, \fB\-\-remote\fR, notifications and the
+\fBu\fR popup all get them redacted. Only a credential's value is hidden
+\(em after a credential-looking \fIkey\fB=\fR, \fIkey\fB:\fR or quoted key, an
+\fBAuthorization:\fR scheme, \fBBearer\fR, or in a URL's user and password
+\(em and the rest of the line is kept, since it says why the unit failed.
 .SH EXIT STATUS
 .TP
 .B 0
@@ -914,16 +975,19 @@ Success. For \fB\-\-watch\fR, this means the condition was never met before
 A \fB\-\-watch\fR condition matched, or the run failed.
 .TP
 .B 2
-Invalid command line; a \fB[[notify]]\fR target that cannot deliver; or a
+Invalid command line; a \fB[[notify]]\fR target that cannot deliver; a
+\fB[[silence]]\fR window that cannot open; or a
 \fB\-\-watch\fR that cannot be run \(em a malformed query or rule, or a
-\fBdisk\fR or \fBfillin\fR rule naming a mount crabmon does not measure.
+\fBdisk\fR or \fBfillin\fR rule naming a mount crabmon does not measure, or a
+\fBunit\fR or \fBkernel\fR rule whose source cannot be read here.
 .SH FILES
 .TP
 .I ~/.config/crabmon/config.toml
 Configuration.
 .TP
 .I ~/.local/state/crabmon/actions.log
-The action log of signals, renices, affinity and IO-priority changes, unless
+The action log of signals, renices, affinity and IO-priority changes, and unit
+restarts and \fBreset\-failed\fRs, unless
 \fB[audit] path\fR says otherwise; moved to \fIactions.log.1\fR at
 \fB[audit] max_bytes\fR.
 .SH SEE ALSO

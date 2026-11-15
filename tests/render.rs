@@ -1239,3 +1239,127 @@ fn unit_trouble_survives_a_narrow_terminal() {
     assert!(row.contains("oom-kill"), "the reason survives: {row}\n{s}");
     assert!(!header.contains("failed2c") && !header.contains("failed1 cpu"), "{header}");
 }
+
+/// Found at 50 columns against a real host: even the compact warning was
+/// wider than the left half and ran into the CPU count, `1 failed, 1 lo1 cpu`.
+#[test]
+fn a_very_narrow_header_keeps_a_gap_after_the_unit_warning() {
+    use crabmon::metrics::units::{UnitHealth, UnitState};
+    let mut snap = common::snapshot();
+    snap.host.hostname = "vps3639009.trouble-free.net".into();
+    let unit = |name: &str, state| UnitHealth { name: name.into(), state, ..Default::default() };
+    snap.units =
+        vec![unit("a.service", UnitState::Failed), unit("b.service", UnitState::CrashLoop)];
+    let mut a = crabmon::App::new(common::config(), Box::new(common::FakeSource::single(snap)));
+    a.tick();
+    for width in [50u16, 60, 80, 120] {
+        let s = screen(&mut a, width, 24);
+        let header = s.lines().nth(1).unwrap_or_default().to_string();
+        let cores = header.find("2c/4t").expect(&header);
+        let before: String = header.chars().take(header[..cores].chars().count()).collect();
+        assert!(before.ends_with(' '), "{width} columns, no gap before the right half: {header}");
+        assert!(header.contains("failed"), "{width} columns: {header}");
+    }
+
+    // Found regenerating the README snapshot: at 100 columns the OS name was
+    // cut to `Debian 1…` for a gap the right half did not need.
+    let mut quiet = common::snapshot();
+    quiet.host.hostname = "vps3639009.trouble-free.net".into();
+    quiet.host.os = "Linux (Ubuntu 26.04)".into();
+    quiet.host.kernel = "7.0.0-42-generic".into();
+    let mut a = crabmon::App::new(common::config(), Box::new(common::FakeSource::single(quiet)));
+    a.tick();
+    let s = screen(&mut a, 100, 24);
+    let header = s.lines().nth(1).unwrap_or_default();
+    assert!(header.contains("Linux (Ubuntu 26.04)"), "{header}");
+    assert!(!header.contains('…'), "the kernel goes before the OS name is cut: {header}");
+}
+
+/// The unit popup says what systemd says, then why — the journal — and asks
+/// before it restarts anything.
+#[test]
+fn the_unit_popup_shows_state_journal_and_the_confirmation() {
+    use crabmon::metrics::units::{UnitHealth, UnitState};
+    let mut snap = common::snapshot();
+    snap.units_unreadable = None;
+    snap.units = vec![UnitHealth {
+        name: "api.service".into(),
+        active: "failed".into(),
+        sub: "failed".into(),
+        result: "exit-code".into(),
+        exit_status: Some(3),
+        restarts: 41,
+        recent_restarts: 7,
+        window_secs: 600,
+        state: UnitState::Failed,
+        log_tail: vec!["2026-11-15T07:45:06 api[7]: bind: address already in use".into()],
+    }];
+    for p in &mut snap.procs {
+        p.service = Some("api.service".into());
+    }
+    let mut a = crabmon::App::new(common::config(), Box::new(common::FakeSource::single(snap)));
+    a.unit_journal = |_: &str, _: usize| Vec::new();
+    a.tick();
+    a.on_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('u'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    let s = screen(&mut a, 140, 40);
+    for want in [
+        "api.service",
+        "failed (exit 3)",
+        "failed (failed) · result exit-code · exit status 3",
+        "41 since it was last started by hand, 7 in the last 10m",
+        "Recent journal",
+        "bind: address already in use",
+        "[r] restart",
+    ] {
+        assert!(s.contains(want), "missing {want:?}:\n{s}");
+    }
+    a.on_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('r'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    let s = screen(&mut a, 140, 40);
+    assert!(s.contains("systemctl restart api.service?  [y] yes   [n] no"), "{s}");
+}
+
+/// A silenced rule leaves the red banner to the rules paging somebody, and
+/// is still said, quietly, with when its silence ends.
+#[test]
+fn silenced_alerts_leave_the_red_banner_but_are_still_shown() {
+    let mut cfg = common::config();
+    let rule = |expr: &str, name: &str| {
+        let mut r = crabmon::watch::parse_rule(expr, 0).unwrap();
+        r.name = name.into();
+        r
+    };
+    cfg.alerts = vec![rule("cpu>=0", "always"), rule("load>=0", "loaded")];
+    let mut a = crabmon::App::new(cfg, Box::new(common::FakeSource::single(common::snapshot())));
+    a.apply_silence(crabmon::silence::SilenceRequest::For {
+        secs: 3600,
+        rule: Some("always".into()),
+    });
+    a.status = None;
+    a.tick();
+    let s = screen(&mut a, 160, 30);
+    let status = s.lines().last().unwrap_or_default();
+    assert!(status.contains("ALERT  loaded"), "{status}");
+    assert!(!status.contains("ALERT  always"), "{status}");
+    assert!(status.contains("+1 silenced"), "{status}");
+
+    a.apply_silence(crabmon::silence::SilenceRequest::For { secs: 3600, rule: None });
+    a.status = None;
+    a.tick();
+    let s = screen(&mut a, 160, 30);
+    let status = s.lines().last().unwrap_or_default();
+    assert!(!status.contains("ALERT"), "{status}");
+    assert!(status.contains("silenced  always (silenced until"), "{status}");
+
+    a.on_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('!'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    let s = screen(&mut a, 160, 30);
+    assert!(s.contains("S to silence") && s.contains("MUTED"), "{s}");
+}

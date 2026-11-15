@@ -161,6 +161,7 @@ pub fn run(cfg: &crate::config::Config, path: &Path) -> Report {
         config_file(cfg, path).with_required(true),
         alert_rules(cfg).with_required(true),
         notifications(cfg).with_required(!cfg.notify.is_empty()),
+        silences(cfg).with_required(!cfg.silences.is_empty()),
     ];
     Report { checks }
 }
@@ -242,16 +243,61 @@ fn systemd_units(cfg: &crate::config::Config) -> Check {
         return Check::new("systemd-units", Status::Unavailable, "[units] enabled is off");
     }
     match crate::metrics::units::probe() {
-        Ok(n) => Check::new(
+        // Reading a unit's journal and restarting it are separate privileges
+        // from listing units, and the ones somebody hitting "Access denied"
+        // in the `u` popup wants explained.
+        Ok(n) if is_root() => Check::new(
             "systemd-units",
             Status::Ok,
             format!(
-                "systemctl show answers for {n} loaded services; failures and restart loops are reported"
+                "systemctl show answers for {n} loaded services; failures, restart loops and \
+                 their journals are reported, and `u` can restart units"
             ),
+        ),
+        Ok(n) => Check::new(
+            "systemd-units",
+            Status::Limited,
+            format!(
+                "systemctl show answers for {n} loaded services; failures and restart loops are \
+                 reported"
+            ),
+        )
+        .with_remedy(
+            "other units' journals need root or the systemd-journal group, and `u` restarts \
+             need root or a polkit rule allowing them",
         ),
         Err(e) => Check::new("systemd-units", Status::Unavailable, e).with_remedy(
             "without systemd there are no units to watch, and `kind = \"unit\"` rules measure nothing",
         ),
+    }
+}
+
+fn is_root() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: `geteuid` reads a property of this process and touches nothing.
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// `[[silence]]` windows, checked the way a start checks them: one that can
+/// never open stops crabmon, so `--doctor` must not pass it.
+fn silences(cfg: &crate::config::Config) -> Check {
+    if cfg.silences.is_empty() {
+        return Check::new("silences", Status::Ok, "no [[silence]] windows configured");
+    }
+    match crate::silence::validate(&cfg.silences) {
+        Ok(()) => Check::new(
+            "silences",
+            Status::Ok,
+            format!("{} [[silence]] windows, all in UTC", cfg.silences.len()),
+        ),
+        Err(e) => Check::new("silences", Status::Unavailable, e)
+            .with_remedy("fix the window: crabmon refuses to start with it"),
     }
 }
 

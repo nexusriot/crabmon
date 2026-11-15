@@ -21,7 +21,7 @@ docs/
   crabmon.1          the man page
   DESIGN.md          this document
   CHANGELOG.md       the release history
-  crabmon.png        the screenshot the README embeds
+  crabmon.png        the mascot the README leads with
 completions/         bash, zsh and fish
 scripts/build.sh     the build driver; build-deb.sh is an alias CI still uses
 scripts/embed-snapshot.py  puts a captured frame into README.md
@@ -63,6 +63,7 @@ src/
   supervisor.rs      alert rules and the flight recorder, outside the TUI
   fleet.rs           several hosts behind one metric source, host groups, sorting
   notify.rs          `[[notify]]`: alert transitions posted via curl
+  silence.rs         `[[silence]]` windows and `S` silences, in UTC
   serve.rs           the Prometheus exporter
   incident.rs        the readable summary written beside a flight dump
   audit.rs           the local log of actions taken
@@ -79,7 +80,8 @@ src/
     netstat.rs       TCP health from /proc/net/snmp, netstat and sockstat
     containers.rs    container names from the runtimes' own files
     storage.rs       md RAID, ZFS pool and btrfs device health
-    units.rs         systemd failures and restart loops, via `systemctl show`
+    units.rs         systemd failures and restart loops via `systemctl show`,
+                     journal tails via `journalctl`, restart and reset
     power.rs         batteries, mains and RAPL
     smaps.rs         proportional and unique memory per process
     kmsg.rs          OOM kills, crashes and IO errors from /dev/kmsg
@@ -106,8 +108,8 @@ src/
     sensors.rs       grouped temperatures
     gpu.rs           GPU rows
     fleet.rs         one row per host, when several are being watched
-    popups.rs        signal, confirm, renice, affinity, ionice, detail,
-                     help, alerts, audit log
+    popups.rs        signal, confirm, renice, affinity, ionice, seek, unit,
+                     silence, detail, help, alerts, audit log
 ```
 
 ## The metric boundary
@@ -191,6 +193,8 @@ Two details matter:
 | `Alerts` | `!` | rules, transitions and delivery notes |
 | `AuditLog` | `L` | the local record of actions taken |
 | `Seek` | `:` in a replay | frame or time prompt |
+| `Unit` | `u` | unit state, journal, restart/reset with `y`/`n` |
+| `Silence` | `S`, or `S` in the `!` popup | duration and rule prompt |
 
 Sending a signal is two-step by construction: `SignalMenu` → `ConfirmKill`.
 Every action that targets a process — signal, renice, affinity and IO priority
@@ -384,7 +388,22 @@ counters produces a gap rather than an absurd spike.
   history again. A snapshot carries only units that are not healthy or have
   restarted at all — the rest would be in every frame of every recording —
   and `units_unreadable` says why there are none where systemd could not be
-  read, or was not asked.
+  read, or was not asked. The five worst units in trouble also carry their
+  last journal lines (`journalctl --unit=… -n 12 -o short-iso`), read on the
+  same thread and cached by the unit's restart count, state, result and exit
+  status (`units::LogCache`) — each read cost a second on a busy one-core
+  host, and the fresh states waited behind every one — so a pass publishes
+  the new states first and the changed journals after. `UnitWatcher::latest`
+  waits up to two seconds from start for a complete first reading, settles
+  for the states without journals after that, and with nothing at all
+  reports `units::STILL_READING` rather than an empty, healthy-looking list. `units::refresh_now`
+  wakes the watcher for an immediate reading after `u` restarts or resets a
+  unit: the evidence travels with the snapshot, so `--remote`,
+  recordings, notifications (`HookCall::detail`) and incident summaries get
+  it without a second connection. `u` restarts and resets through
+  `units::control` — `systemctl --no-ask-password`, `--no-block` for a
+  restart, `--` before the name — swapped in tests via `App::unit_control`
+  and `App::unit_journal`, and refused unless `samples_this_host()`.
 - **cgroups** — the panel appears only when the process is actually confined,
   since a limitless root cgroup is noise.
 
@@ -422,6 +441,20 @@ with `set -u` need not guess which exist. The two that cannot come from the
 engine — which machine the rule was about, and which flight recording this
 pass opened for it — are filled in by `supervisor::attach_context`, because
 the dump does not exist until `drain` has written it.
+
+Hooks and notices follow what was last *announced* rather than the edge just
+crossed. Each rule's `Tracked` state keeps `announced` beside `fired`, and a
+call is queued whenever the two differ and no silence covers the rule. Without
+a silence they move together and nothing changes; across one they come apart,
+and the first unsilenced evaluation reconciles them — the held firing page
+when the rule is still over, the recovery when it was announced and has since
+cleared, nothing when it came and went unseen. `pending_fired`, which the
+flight recorder reads, is still pushed on the edge itself: silencing a page
+does not discard its evidence. Silences come from `[[silence]]` windows,
+loaded by `AlertEngine::configured`, and from `App::muted`, which the
+interface hands to every engine it runs — the selected host's and each
+parked one — before evaluating it; the fleet's ALERT column checks them at
+draw time, so a new silence empties it at once.
 
 Every transition is also queued, hook or no hook, as a *notice* — the same
 `HookCall`, with the same context attached — which is what `[[notify]]`
@@ -488,6 +521,13 @@ userinfo are hidden. Unquoted credential values hide the remainder of the
 command because the joined command cannot recover argv boundaries. Positional
 secrets and unknown credential names are outside this heuristic. Local live
 filters retain raw data; remote filters see what the remote host exported.
+Unit journal tails get `export::redact_log`, applied where they are read
+(`units::redact_lines`, from `[units] redact_logs`) so nothing leaves the
+unit's machine unredacted. It is deliberately narrower than
+`redact_command`: a log line is prose, not argv, so it hides a credential's
+*value* — after `key=`, `key:` or `"key": `, up to a space, comma,
+semicolon or `&` — rather than the rest of the line, which would erase the
+reason the unit failed along with the secret.
 
 ### Where a recording comes from
 
@@ -1005,7 +1045,7 @@ reads as a quiet machine.
   exercises real SSH: exports, redaction, hooks, recordings, stale/failure
   handling and recovery, and with `--units` systemd failure and crash-loop
   detection. This passed against the Linux test server (Ubuntu 26.04,
-  systemd 259) for 0.17.0, `--units` included;
+  systemd 259) for 0.18.0, `--units` included;
   it does not establish coverage for every SSH or remote-platform setup.
 - Kernel events are matched on message text, because the kernel has no
   structured form of "this is an OOM kill". The patterns are ones that have

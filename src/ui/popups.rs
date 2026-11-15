@@ -133,6 +133,17 @@ pub fn renice(f: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
+pub fn silence(f: &mut Frame<'_>, area: Rect, app: &App) {
+    input_popup(
+        f,
+        area,
+        app,
+        " Silence ".to_string(),
+        "1h for every rule, 30m <rule> for one, off [<rule>] to lift:",
+        "[Enter] apply   [Esc] cancel",
+    );
+}
+
 pub fn seek(f: &mut Frame<'_>, area: Rect, app: &App) {
     input_popup(
         f,
@@ -419,7 +430,7 @@ fn fd_field(p: &crate::metrics::ProcRow) -> String {
 }
 
 /// Every binding, in one place, so the help and the README cannot drift.
-pub const KEYS: [(&str, &str); 44] = [
+pub const KEYS: [(&str, &str); 46] = [
     ("q / Ctrl-C", "quit"),
     ("↑ ↓ / k j", "move selection"),
     ("PgUp PgDn", "move a page"),
@@ -457,7 +468,9 @@ pub const KEYS: [(&str, &str); 44] = [
     ("A", "CPU affinity (Linux)"),
     ("I", "IO priority / ionice (Linux)"),
     ("P", "export a snapshot"),
+    ("u", "a systemd unit: state, journal, restart, reset-failed"),
     ("!", "active alerts"),
+    ("S", "silence alert rules for a while (also in the ! popup)"),
     ("o / O", "fold / unfold a subtree (tree view)"),
     ("Ctrl-R", "reload the config file"),
     ("?", "this help"),
@@ -483,7 +496,7 @@ pub fn help(f: &mut Frame<'_>, area: Rect, app: &mut App) {
 
 pub fn alerts(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     let total = app.alerts.rules.len() + app.alerts.history_len() + app.alert_notes.len();
-    let inner = scroll_frame(f, area, app, " Alerts ", total, (72, 60));
+    let inner = scroll_frame(f, area, app, " Alerts · S to silence ", total, (72, 60));
     if app.alerts.rules.is_empty() {
         f.render_widget(
             Paragraph::new("no alert rules configured\n\nAdd [[alert]] blocks to the config file.")
@@ -499,10 +512,11 @@ pub fn alerts(f: &mut Frame<'_>, area: Rect, app: &mut App) {
         .iter()
         .map(|r| {
             let firing = active.contains(&r.name.as_str());
-            let style = if firing {
-                Style::default().fg(app.theme.crit).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(app.theme.dim)
+            let muted = app.alerts.silence_note(&r.name, &app.snap).is_some();
+            let style = match (firing, muted) {
+                (true, false) => Style::default().fg(app.theme.crit).add_modifier(Modifier::BOLD),
+                (true, true) => Style::default().fg(app.theme.warn),
+                _ => Style::default().fg(app.theme.dim),
             };
             Row::new(vec![
                 Cell::from(Span::styled(r.name.clone(), style)),
@@ -510,7 +524,12 @@ pub fn alerts(f: &mut Frame<'_>, area: Rect, app: &mut App) {
                 Cell::from(format!("{:.0}", r.threshold)),
                 Cell::from(format!("{}s", r.for_secs)),
                 Cell::from(if r.target.is_empty() { "any".to_string() } else { r.target.clone() }),
-                Cell::from(if firing { "FIRING" } else { "ok" }),
+                Cell::from(match (firing, muted) {
+                    (true, false) => "FIRING",
+                    (true, true) => "MUTED",
+                    (false, true) => "muted",
+                    (false, false) => "ok",
+                }),
             ])
         })
         .collect();
@@ -522,10 +541,12 @@ pub fn alerts(f: &mut Frame<'_>, area: Rect, app: &mut App) {
         .alerts
         .history()
         .map(|e| {
-            let (label, style) = if e.fired {
-                ("FIRED", Style::default().fg(app.theme.crit))
-            } else {
-                ("cleared", Style::default().fg(app.theme.ok))
+            // Inside a silence nobody was paged for it, and the log says so.
+            let (label, style) = match (e.fired, e.silenced) {
+                (true, false) => ("FIRED", Style::default().fg(app.theme.crit)),
+                (true, true) => ("FIRED·m", Style::default().fg(app.theme.warn)),
+                (false, false) => ("cleared", Style::default().fg(app.theme.ok)),
+                (false, true) => ("clear·m", Style::default().fg(app.theme.dim)),
             };
             Row::new(vec![
                 Cell::from(Span::styled(e.name.clone(), Style::default().fg(app.theme.text))),
@@ -580,7 +601,104 @@ pub fn alerts(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     f.render_widget(Table::new(rows, widths).header(header), inner);
 }
 
-/// The local record of every signal, renice and affinity change crabmon made.
+/// Rows above the journal in the unit popup: state, detail, restarts, and
+/// the journal's heading with a blank line before it.
+pub const UNIT_FIELDS: usize = 5;
+
+/// A systemd unit: what systemd says about it, its last journal lines, and
+/// what can be done — the half of a crash loop the grouped view cannot show,
+/// which is *why*.
+pub fn unit(f: &mut Frame<'_>, area: Rect, app: &mut App) {
+    use crate::metrics::units::{UnitState, UnitVerb};
+    let total = UNIT_FIELDS + app.unit_log.len();
+    let inner = scroll_frame(f, area, app, &format!(" {} ", app.unit_name), total, (84, 70));
+    let health = app.snap.unit(&app.unit_name).cloned();
+    let label = |s: &str| Span::styled(format!("{s:<10}"), Style::default().fg(app.theme.dim));
+
+    let mut lines: Vec<Line> = Vec::new();
+    match &health {
+        Some(u) => {
+            let colour = match u.state {
+                UnitState::Ok => app.theme.ok,
+                UnitState::Restarting => app.theme.warn,
+                UnitState::CrashLoop | UnitState::Failed => app.theme.crit,
+            };
+            lines.push(Line::from(vec![
+                label("state"),
+                Span::styled(u.summary(), Style::default().fg(colour).add_modifier(Modifier::BOLD)),
+            ]));
+            let exit = u.exit_status.map(|c| format!(" · exit status {c}")).unwrap_or_default();
+            lines.push(Line::from(vec![
+                label("systemd"),
+                Span::raw(format!("{} ({}) · result {}{exit}", u.active, u.sub, u.result)),
+            ]));
+            let window = if u.window_secs == 0 { 600 } else { u.window_secs };
+            lines.push(Line::from(vec![
+                label("restarts"),
+                Span::raw(format!(
+                    "{} since it was last started by hand, {} in the last {}m",
+                    u.restarts,
+                    u.recent_restarts,
+                    (window / 60).max(1)
+                )),
+            ]));
+        }
+        None => {
+            // Healthy units are not carried in the snapshot, and units are
+            // not read at all where systemd cannot be.
+            let why = app
+                .snap
+                .units_unreadable
+                .clone()
+                .unwrap_or_else(|| "no failures or restarts to report".into());
+            lines.push(Line::from(vec![label("state"), Span::raw(why)]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(""));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        match app.unit_log.is_empty() {
+            false => "Recent journal".to_string(),
+            true if app.samples_this_host() => {
+                "Recent journal: nothing readable (journalctl needs root or the systemd-journal group)"
+                    .to_string()
+            }
+            true => "Recent journal: only carried for units in trouble on another machine".to_string(),
+        },
+        Style::default().fg(app.theme.title).add_modifier(Modifier::BOLD),
+    )));
+    for l in &app.unit_log {
+        lines.push(Line::from(Span::styled(l.clone(), Style::default().fg(app.theme.text))));
+    }
+
+    let body_h = inner.height.saturating_sub(1) as usize;
+    let shown: Vec<Line> = lines.into_iter().skip(app.popup_scroll).take(body_h).collect();
+    let body = Rect { height: inner.height.saturating_sub(1), ..inner };
+    f.render_widget(Paragraph::new(shown), body);
+
+    let footer = Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner };
+    let hint = match app.unit_confirm {
+        Some(verb) => Span::styled(
+            format!("systemctl {} {}?  [y] yes   [n] no", verb.name(), app.unit_name),
+            Style::default().fg(app.theme.sel_fg).bg(match verb {
+                UnitVerb::Restart => app.theme.warn,
+                UnitVerb::ResetFailed => app.theme.accent,
+            }),
+        ),
+        None if app.samples_this_host() => Span::styled(
+            "[r] restart   [x] reset-failed   [l] reload journal   [j/k] scroll   [Esc] close",
+            Style::default().fg(app.theme.dim),
+        ),
+        None => Span::styled(
+            "read-only: not this machine's unit   [j/k] scroll   [Esc] close",
+            Style::default().fg(app.theme.dim),
+        ),
+    };
+    f.render_widget(Paragraph::new(Line::from(hint)), footer);
+}
+
+/// The local record of every process change and unit restart crabmon made.
 pub fn audit_log(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     let total = app.audit_entries.len();
     let inner = scroll_frame(f, area, app, " Action log ", total, (76, 70));

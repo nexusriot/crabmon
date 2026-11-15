@@ -251,6 +251,13 @@ pub fn render_host(
         );
         metric(
             &mut out,
+            "alert_silenced",
+            "1 while a rule is silenced: still evaluated, but paging nobody.",
+            "gauge",
+            &alerts.iter().map(|r| (label(r), r.silenced as u8 as f64)).collect::<Vec<_>>(),
+        );
+        metric(
+            &mut out,
             "alert_threshold",
             "The threshold a rule compares against.",
             "gauge",
@@ -1774,6 +1781,7 @@ mod tests {
                 threshold: 90.0,
                 value: Some(97.5),
                 active: true,
+                silenced: false,
             },
             RuleState {
                 name: "nginx gone".into(),
@@ -1781,9 +1789,17 @@ mod tests {
                 threshold: 1.0,
                 value: Some(3.0),
                 active: false,
+                silenced: true,
             },
         ];
         let text = render_with_alerts(&snap(), 10, &states);
+        // A silence is exported on its own, so a dashboard can tell "quiet"
+        // from "muted" and `crabmon_alert_active == 1` keeps its meaning.
+        assert!(
+            text.contains("crabmon_alert_silenced{rule=\"nginx gone\",kind=\"proc\"} 1"),
+            "{text}"
+        );
+        assert!(text.contains("crabmon_alert_silenced{rule=\"cpu-saturated\",kind=\"cpu\"} 0"));
 
         assert!(
             text.contains("crabmon_alert_active{rule=\"cpu-saturated\",kind=\"cpu\"} 1"),
@@ -1819,6 +1835,7 @@ mod tests {
             threshold: 90.0,
             value: None,
             active: false,
+            silenced: false,
         }];
         let text = render_with_alerts(&snap(), 0, &states);
         assert!(text.contains("crabmon_alert_active{rule=\"gpu-hot\""), "{text}");

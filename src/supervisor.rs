@@ -282,7 +282,7 @@ impl Supervisor {
 
     pub fn with_flight_dir(cfg: &Config, dir: &Path) -> Supervisor {
         Supervisor {
-            alerts: AlertEngine::new(cfg.alerts.clone()),
+            alerts: AlertEngine::configured(cfg),
             flight: FlightRecorder::new(
                 dir,
                 cfg.record.flight,
@@ -305,6 +305,7 @@ impl Supervisor {
     /// machine they are about.
     pub fn for_host(mut self, host: &str) -> Supervisor {
         self.label = host.to_string();
+        self.alerts.host = host.to_string();
         self
     }
 

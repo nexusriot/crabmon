@@ -121,6 +121,18 @@ fn headline(call: &HookCall) -> String {
     }
 }
 
+/// A chat message with the rule's evidence — a failing unit's last journal
+/// lines — under it as a code block, so the page says why and not only what.
+/// Discord refuses a message over 2000 characters, so the block is kept
+/// well inside that, and a fence inside the log cannot close it early.
+fn with_detail(text: String, call: &HookCall) -> String {
+    if call.detail.is_empty() {
+        return text;
+    }
+    let detail = crate::format::truncate_fit(&call.detail.replace("```", "'''"), 1500);
+    format!("{text}\n```\n{detail}\n```")
+}
+
 /// The JSON a generic webhook receives: the hook's variables, lower-cased
 /// and without the prefix, with the two numbers as numbers.
 pub fn webhook_body(call: &HookCall) -> String {
@@ -151,11 +163,11 @@ pub fn curl_config(target: &NotifyTarget, call: &HookCall) -> String {
     let body = match target.kind.as_str() {
         "slack" => {
             headers.push("Content-Type: application/json".into());
-            serde_json::json!({ "text": headline(call) }).to_string()
+            serde_json::json!({ "text": with_detail(headline(call), call) }).to_string()
         }
         "discord" => {
             headers.push("Content-Type: application/json".into());
-            serde_json::json!({ "content": headline(call) }).to_string()
+            serde_json::json!({ "content": with_detail(headline(call), call) }).to_string()
         }
         "ntfy" => {
             let host =
@@ -167,7 +179,10 @@ pub fn curl_config(target: &NotifyTarget, call: &HookCall) -> String {
                 "Tags: {}",
                 if call.firing { "warning" } else { "white_check_mark" }
             ));
-            call.message.clone()
+            match call.detail.is_empty() {
+                true => call.message.clone(),
+                false => format!("{}\n\n{}", call.message, call.detail),
+            }
         }
         _ => {
             headers.push("Content-Type: application/json".into());
@@ -220,6 +235,7 @@ mod tests {
             host: "web-1".into(),
             dump: String::new(),
             summary: String::new(),
+            detail: String::new(),
         }
     }
 
@@ -274,6 +290,34 @@ mod tests {
         let mut c = call(true);
         c.message = format!("web-1: {}", c.message);
         assert!(!curl_config(&target("slack"), &c).contains("web-1: web-1"));
+    }
+
+    /// A unit alert carries the unit's last journal lines, so the page says
+    /// why it failed and not only that it did.
+    #[test]
+    fn the_evidence_rides_along_in_every_format() {
+        let mut c = call(true);
+        c.detail = "api.service:\nNov 15 api[9]: bind: address in use ```".into();
+        let slack: serde_json::Value =
+            serde_json::from_str(&body_of(&target("slack"), &c)).unwrap();
+        let text = slack["text"].as_str().unwrap();
+        assert!(
+            text.ends_with("```\napi.service:\nNov 15 api[9]: bind: address in use '''\n```"),
+            "{text}"
+        );
+        assert!(body_of(&target("ntfy"), &c).ends_with("address in use ```"));
+        let hook: serde_json::Value = serde_json::from_str(&webhook_body(&c)).unwrap();
+        assert!(hook["detail"].as_str().unwrap().contains("address in use"));
+        // Without any, the message is as it was.
+        assert!(!body_of(&target("slack"), &call(true)).contains("```"));
+    }
+
+    /// The body a target is sent, read back out of its curl config.
+    fn body_of(t: &NotifyTarget, c: &HookCall) -> String {
+        let cfg = curl_config(t, c);
+        let line = cfg.lines().find(|l| l.starts_with("data-binary = ")).unwrap();
+        let quoted = &line["data-binary = ".len()..];
+        serde_json::from_str::<String>(quoted).unwrap_or_else(|_| quoted.to_string())
     }
 
     #[test]

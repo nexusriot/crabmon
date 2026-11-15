@@ -259,11 +259,15 @@ pub struct UnitsConfig {
     /// This many automatic restarts within `window_secs` is a crash loop.
     pub crash_loop: u64,
     pub window_secs: u64,
+    /// Hide credentials in the journal lines units in trouble carry. On by
+    /// default: those lines go over `--remote`, into recordings and into
+    /// notifications.
+    pub redact_logs: bool,
 }
 
 impl Default for UnitsConfig {
     fn default() -> Self {
-        Self { enabled: true, crash_loop: 3, window_secs: 600 }
+        Self { enabled: true, crash_loop: 3, window_secs: 600, redact_logs: true }
     }
 }
 
@@ -277,6 +281,7 @@ impl UnitsConfig {
             interval: Self::INTERVAL,
             window: self.window(),
             crash_loop: self.crash_loop,
+            redact: self.redact_logs,
         })
     }
 
@@ -361,6 +366,9 @@ pub struct Config {
     /// Where alert transitions are posted, besides any hook.
     #[serde(rename = "notify")]
     pub notify: Vec<crate::notify::NotifyTarget>,
+    /// Maintenance windows in which rules page nobody.
+    #[serde(rename = "silence")]
+    pub silences: Vec<crate::silence::SilenceWindow>,
 }
 
 impl Default for Config {
@@ -395,6 +403,7 @@ impl Default for Config {
             alerts: crate::alerts::default_rules(),
             fleet_groups: Vec::new(),
             notify: Vec::new(),
+            silences: Vec::new(),
         }
     }
 }

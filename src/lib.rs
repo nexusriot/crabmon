@@ -24,6 +24,7 @@ pub mod record;
 pub mod remote;
 pub mod sampler;
 pub mod serve;
+pub mod silence;
 pub mod sort;
 pub mod supervisor;
 pub mod theme;

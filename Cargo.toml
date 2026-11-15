@@ -1,6 +1,6 @@
 [package]
 name = "crabmon"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2024"
 # The floor is the highest any dependency asks for, not the edition's own
 # 1.85: sysinfo 0.40 wants 1.95. Declared so cargo refuses an older toolchain
@@ -32,7 +32,7 @@ regex = "1"
 
 # Unix-only: signals, priorities, affinity, graceful shutdown
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", default-features = false, features = ["signal", "sched"] }
+nix = { version = "0.32", default-features = false, features = ["signal", "sched"] }
 # Pinned exactly, because it is a pre-release: a plain `"1.0.0-alpha.5"`
 # requirement also matches `alpha.6` and anything else before 1.0.0 final, so
 # a routine `cargo update` could swap the libc under this crate's `unsafe`
@@ -48,7 +48,7 @@ libc = "=1.0.0-alpha.5"
 signal-hook = "0.4"
 
 [target.'cfg(unix)'.dev-dependencies]
-nix = { version = "0.31", default-features = false, features = ["signal", "sched"] }
+nix = { version = "0.32", default-features = false, features = ["signal", "sched"] }
 
 [package.metadata.deb]
 maintainer = "Vladislav Ananyev <nexus.riot@gmail.com>"

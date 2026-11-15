@@ -253,6 +253,9 @@ pub struct HookCall {
     /// crossing that triggered a dump.
     pub dump: String,
     pub summary: String,
+    /// Evidence the rule itself can give: for a `unit` rule, the last lines
+    /// of the failing unit's journal. Empty for every other kind.
+    pub detail: String,
 }
 
 /// OOM kills in a group crabmon has no cgroup for any more.
@@ -297,7 +300,7 @@ fn oom_kills_after_the_cgroup_is_gone(snap: &Snapshot, name: &str, window: u64) 
 /// Every one is always set, empty where it does not apply, so a hook written
 /// with `set -u` does not have to guess which of them exist. All are plain
 /// strings: a shell should not have to parse anything to use them.
-pub const HOOK_VARS: [&str; 10] = [
+pub const HOOK_VARS: [&str; 11] = [
     "CRABMON_RULE",
     "CRABMON_KIND",
     "CRABMON_STATE",
@@ -308,6 +311,7 @@ pub const HOOK_VARS: [&str; 10] = [
     "CRABMON_AT",
     "CRABMON_DUMP",
     "CRABMON_SUMMARY",
+    "CRABMON_DETAIL",
 ];
 
 impl HookCall {
@@ -325,6 +329,7 @@ impl HookCall {
             host: String::new(),
             dump: String::new(),
             summary: String::new(),
+            detail: String::new(),
         }
     }
 
@@ -341,6 +346,7 @@ impl HookCall {
             ("CRABMON_AT", self.at_unix.to_string()),
             ("CRABMON_DUMP", self.dump.clone()),
             ("CRABMON_SUMMARY", self.summary.clone()),
+            ("CRABMON_DETAIL", self.detail.clone()),
         ]
     }
 }
@@ -365,6 +371,9 @@ pub struct ActiveAlert {
     pub message: String,
     pub value: f64,
     pub threshold: f64,
+    /// Why it pages nobody right now — `silenced until 14:05 UTC`, or a
+    /// maintenance window — when it does not.
+    pub silenced: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -372,6 +381,9 @@ struct Tracked {
     /// Monotonic seconds at which the condition first held.
     over_since: Option<u64>,
     fired: bool,
+    /// Whether hooks and notifications were last told it is firing. Apart
+    /// from `fired` only across a silence.
+    announced: bool,
     /// What the firing message named, for the recovery message: by the
     /// time a failed unit is reset it has left the snapshot, and "recovered"
     /// on its own does not say what did.
@@ -386,6 +398,8 @@ pub struct AlertEvent {
     /// Wall-clock time of the snapshot that caused the transition, for display.
     pub at_unix: u64,
     pub value: f64,
+    /// It happened inside a silence, so nobody was paged for it then.
+    pub silenced: bool,
 }
 
 fn push_notice(notices: &mut Vec<HookCall>, call: HookCall) {
@@ -431,6 +445,14 @@ pub struct AlertEngine {
     /// the TUI so that a leak is detected identically under `--serve
     /// --alerts` and `--stream --alerts`, where there is no `App` at all.
     trends: TrendTracker,
+    /// `[[silence]]` windows from the config.
+    pub windows: Vec<crate::silence::SilenceWindow>,
+    /// Silences set from the interface, which the interface keeps and
+    /// hands to every engine it runs.
+    pub muted: Vec<crate::silence::Muted>,
+    /// The fleet target this engine is about, for a window naming hosts;
+    /// the snapshot's hostname is matched as well.
+    pub host: String,
 }
 
 impl AlertEngine {
@@ -467,6 +489,9 @@ impl AlertEngine {
             pending_fired: Vec::new(),
             history: Vec::new(),
             trends: TrendTracker::default(),
+            windows: Vec::new(),
+            muted: Vec::new(),
+            host: String::new(),
         }
     }
 
@@ -476,7 +501,11 @@ impl AlertEngine {
         let mut active = Vec::new();
         let at_unix = snap.taken_at_unix;
         let mut events: Vec<AlertEvent> = Vec::new();
+        // Hooks and notifications to send, gathered here and queued after
+        // the loop, which holds the rule state borrowed.
+        let mut calls: Vec<HookCall> = Vec::new();
         self.observe_trends(snap);
+        let hosts = [self.host.as_str(), snap.host.hostname.as_str()];
         for (i, rule) in self.rules.iter().enumerate() {
             let Some((value, unit)) = measure(
                 rule,
@@ -486,6 +515,8 @@ impl AlertEngine {
             ) else {
                 continue;
             };
+            let silenced =
+                crate::silence::covering(&self.windows, &self.muted, &rule.name, &hosts, at_unix);
             let st = &mut self.state[i];
             // `below` inverts the comparison, so one code path covers "too
             // much CPU" and "fewer than one nginx". Strict, so that the
@@ -493,55 +524,67 @@ impl AlertEngine {
             // rather than firing while the one process is still running.
             let threshold = if st.fired { rule.recovery_threshold() } else { rule.threshold };
             let over = if rule.below { value < threshold } else { value >= threshold };
+            let held = over && {
+                let since = *st.over_since.get_or_insert(now_secs);
+                st.fired || now_secs.saturating_sub(since) >= rule.for_secs
+            };
             if !over {
                 st.over_since = None;
+            }
+            if !held {
                 // Recovering is a transition worth reporting: an alert that
                 // only ever says "started" leaves you guessing when it ended.
                 if std::mem::take(&mut st.fired) {
-                    {
-                        let call = HookCall {
-                            command: rule.command_clear.clone(),
-                            rule: rule.name.clone(),
-                            kind: rule.kind,
-                            value,
-                            threshold: rule.threshold,
-                            firing: false,
-                            message: format!(
-                                "{} recovered: {} {} {}{}",
-                                rule.name,
-                                quantity(value, unit),
-                                if rule.below { "≥" } else { "<" },
-                                quantity(threshold, unit),
-                                std::mem::take(&mut st.subject),
-                            ),
-                            at_unix,
-                            host: String::new(),
-                            dump: String::new(),
-                            summary: String::new(),
-                        };
-                        if !call.command.is_empty() {
-                            self.pending_commands.push(call.clone());
-                        }
-                        push_notice(&mut self.pending_notices, call);
-                    }
                     events.push(AlertEvent {
                         name: rule.name.clone(),
                         fired: false,
                         at_unix,
                         value,
+                        silenced: silenced.is_some(),
                     });
                 }
-                continue;
-            }
-            let since = *st.over_since.get_or_insert(now_secs);
-            if now_secs.saturating_sub(since) < rule.for_secs {
+                // Hooks follow what was last *announced*, not the edge just
+                // crossed: a rule that fired and recovered inside a silence
+                // was never announced and says nothing, and one announced
+                // before the silence says it recovered once the silence ends.
+                if st.announced && silenced.is_none() {
+                    st.announced = false;
+                    calls.push(HookCall {
+                        command: rule.command_clear.clone(),
+                        rule: rule.name.clone(),
+                        kind: rule.kind,
+                        value,
+                        threshold: rule.threshold,
+                        firing: false,
+                        message: format!(
+                            "{} recovered: {} {} {}{}",
+                            rule.name,
+                            quantity(value, unit),
+                            if rule.below { "≥" } else { "<" },
+                            quantity(threshold, unit),
+                            std::mem::take(&mut st.subject),
+                        ),
+                        at_unix,
+                        host: String::new(),
+                        dump: String::new(),
+                        summary: String::new(),
+                        detail: String::new(),
+                    });
+                }
                 continue;
             }
             let just_fired = !st.fired;
             if just_fired {
                 st.fired = true;
+                // The evidence is kept whether or not anybody is paged.
                 self.pending_fired.push(rule.name.clone());
-                events.push(AlertEvent { name: rule.name.clone(), fired: true, at_unix, value });
+                events.push(AlertEvent {
+                    name: rule.name.clone(),
+                    fired: true,
+                    at_unix,
+                    value,
+                    silenced: silenced.is_some(),
+                });
             }
             // The process that is actually growing, when the rule is about
             // processes: "leak ≥ 200 MiB" is a fact about the machine, and
@@ -565,8 +608,9 @@ impl AlertEngine {
                 }
                 _ => String::new(),
             };
+            let st = &mut self.state[i];
             if just_fired && rule.kind == AlertKind::Unit {
-                self.state[i].subject = subject.clone();
+                st.subject = subject.clone();
             }
             // Built before the hook so the hook is told the same line the
             // status bar and the `!` popup show, subject and all.
@@ -588,8 +632,11 @@ impl AlertEngine {
                     quantity(rule.recovery_threshold(), unit)
                 );
             }
-            if just_fired {
-                let call = HookCall {
+            // Announced when it fires, or when a silence it fired inside
+            // ends with it still firing — the page the silence held back.
+            if !st.announced && silenced.is_none() {
+                st.announced = true;
+                calls.push(HookCall {
                     command: rule.command.clone(),
                     rule: rule.name.clone(),
                     kind: rule.kind,
@@ -601,18 +648,27 @@ impl AlertEngine {
                     host: String::new(),
                     dump: String::new(),
                     summary: String::new(),
-                };
-                if !call.command.is_empty() {
-                    self.pending_commands.push(call.clone());
-                }
-                push_notice(&mut self.pending_notices, call);
+                    detail: match rule.kind {
+                        AlertKind::Unit => {
+                            crate::metrics::units::detail(&snap.units, &rule.target, &rule.query)
+                        }
+                        _ => String::new(),
+                    },
+                });
             }
             active.push(ActiveAlert {
                 name: rule.name.clone(),
                 message,
                 value,
                 threshold: rule.threshold,
+                silenced,
             });
+        }
+        for call in calls {
+            if !call.command.is_empty() {
+                self.pending_commands.push(call.clone());
+            }
+            push_notice(&mut self.pending_notices, call);
         }
         self.record(events);
         active
@@ -680,6 +736,24 @@ impl AlertEngine {
 
     /// Every transition since the last call, whether or not its rule has a
     /// hook, for `[[notify]]`.
+    /// The engine a config describes: its rules and its `[[silence]]`
+    /// windows. Every engine that pages anybody is built this way.
+    pub fn configured(cfg: &crate::config::Config) -> Self {
+        AlertEngine::new(cfg.alerts.clone()).with_windows(cfg.silences.clone())
+    }
+
+    /// Load `[[silence]]` windows.
+    pub fn with_windows(mut self, windows: Vec<crate::silence::SilenceWindow>) -> Self {
+        self.windows = windows;
+        self
+    }
+
+    /// Why `rule` is silenced for `snap`, or `None`.
+    pub fn silence_note(&self, rule: &str, snap: &Snapshot) -> Option<String> {
+        let hosts = [self.host.as_str(), snap.host.hostname.as_str()];
+        crate::silence::covering(&self.windows, &self.muted, rule, &hosts, snap.taken_at_unix)
+    }
+
     pub fn take_notices(&mut self) -> Vec<HookCall> {
         std::mem::take(&mut self.pending_notices)
     }
@@ -716,6 +790,8 @@ pub struct RuleState {
     /// kernel without pressure-stall accounting.
     pub value: Option<f64>,
     pub active: bool,
+    /// Covered by a silence now, whether or not it is firing.
+    pub silenced: bool,
 }
 
 impl AlertEngine {
@@ -739,6 +815,7 @@ impl AlertEngine {
                 )
                 .map(|(v, _)| v),
                 active: self.state.get(i).is_some_and(|s| s.fired),
+                silenced: self.silence_note(&rule.name, snap).is_some(),
             })
             .collect()
     }
@@ -2754,5 +2831,103 @@ mod hook_number_tests {
         snap.host.uptime_secs = 1000;
         snap.kernel[0].text = snap.kernel[0].text.replace("cm3-oom", "other");
         assert!(!fires(&snap));
+    }
+
+    fn silenced_engine() -> crate::alerts::AlertEngine {
+        let mut r = crate::watch::parse_rule("cpu>=90", 0).unwrap();
+        r.name = "hot".into();
+        r.command = "page".into();
+        r.command_clear = "unpage".into();
+        crate::alerts::AlertEngine::new(vec![r])
+    }
+
+    fn cpu_at(pct: f32, at: u64) -> crate::metrics::Snapshot {
+        crate::metrics::Snapshot {
+            cpu: crate::metrics::CpuSample { per_core: vec![pct], freq_mhz: vec![] },
+            taken_at_unix: at,
+            ..Default::default()
+        }
+    }
+
+    fn pages(e: &mut crate::alerts::AlertEngine) -> Vec<String> {
+        let notices: Vec<String> = e
+            .take_notices()
+            .into_iter()
+            .map(|c| format!("{} {}", if c.firing { "firing" } else { "cleared" }, c.rule))
+            .collect();
+        let commands: Vec<String> = e.take_commands().into_iter().map(|c| c.command).collect();
+        assert_eq!(notices.len(), commands.len(), "hooks and notices agree");
+        notices
+    }
+
+    /// A rule that fires inside a silence pages nobody, keeps its evidence,
+    /// and pages once the silence ends if it is still firing.
+    #[test]
+    fn a_silence_holds_the_page_until_it_ends() {
+        use crate::silence::Muted;
+        let mut e = silenced_engine();
+        e.muted = vec![Muted { rule: None, until_unix: 1_000 }];
+        let active = e.evaluate(&cpu_at(95.0, 900), 0);
+        assert_eq!(active[0].silenced.as_deref(), Some("silenced until 00:16 UTC"));
+        assert!(pages(&mut e).is_empty(), "paged inside the silence");
+        assert_eq!(e.take_fired(), ["hot"], "the flight recorder still gets it");
+        e.evaluate(&cpu_at(95.0, 950), 1);
+        assert!(pages(&mut e).is_empty());
+        // The silence is over and it is still firing: the held page goes now.
+        let active = e.evaluate(&cpu_at(95.0, 1_000), 2);
+        assert_eq!(active[0].silenced, None);
+        assert_eq!(pages(&mut e), ["firing hot"]);
+        e.evaluate(&cpu_at(95.0, 1_010), 3);
+        assert!(pages(&mut e).is_empty(), "once");
+        e.evaluate(&cpu_at(10.0, 1_020), 4);
+        assert_eq!(pages(&mut e), ["cleared hot"]);
+    }
+
+    /// Fired and recovered inside a silence: nothing to say afterwards.
+    #[test]
+    fn what_comes_and_goes_inside_a_silence_says_nothing() {
+        use crate::silence::Muted;
+        let mut e = silenced_engine();
+        e.muted = vec![Muted { rule: Some("hot".into()), until_unix: 1_000 }];
+        e.evaluate(&cpu_at(95.0, 900), 0);
+        e.evaluate(&cpu_at(10.0, 950), 1);
+        e.evaluate(&cpu_at(10.0, 1_100), 2);
+        assert!(pages(&mut e).is_empty());
+        assert_eq!(e.history().filter(|ev| ev.silenced).count(), 2, "the popup still shows both");
+    }
+
+    /// Announced before a silence, recovered inside it: the recovery is said
+    /// when the silence ends, so nobody is left believing it is still broken.
+    #[test]
+    fn a_recovery_inside_a_silence_is_said_when_it_ends() {
+        use crate::silence::Muted;
+        let mut e = silenced_engine();
+        e.evaluate(&cpu_at(95.0, 900), 0);
+        assert_eq!(pages(&mut e), ["firing hot"]);
+        e.muted = vec![Muted { rule: None, until_unix: 1_000 }];
+        e.evaluate(&cpu_at(10.0, 950), 1);
+        assert!(pages(&mut e).is_empty());
+        e.evaluate(&cpu_at(10.0, 1_000), 2);
+        assert_eq!(pages(&mut e), ["cleared hot"]);
+    }
+
+    /// A window naming hosts silences those hosts only, by fleet target or
+    /// by the snapshot's hostname.
+    #[test]
+    fn a_window_naming_hosts_silences_only_those() {
+        let window = crate::silence::SilenceWindow {
+            hosts: vec!["db-1".into()],
+            daily: "00:00-23:59".into(),
+            ..Default::default()
+        };
+        let mut e = silenced_engine().with_windows(vec![window]);
+        e.host = "web-1".into();
+        e.evaluate(&cpu_at(95.0, 900), 0);
+        assert_eq!(pages(&mut e), ["firing hot"]);
+        let mut e = silenced_engine().with_windows(e.windows.clone());
+        let mut snap = cpu_at(95.0, 900);
+        snap.host.hostname = "db-1".into();
+        e.evaluate(&snap, 0);
+        assert!(pages(&mut e).is_empty());
     }
 }
