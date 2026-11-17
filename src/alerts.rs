@@ -400,7 +400,16 @@ pub struct AlertEvent {
     pub value: f64,
     /// It happened inside a silence, so nobody was paged for it then.
     pub silenced: bool,
+    /// Process-wide order of transitions, assigned when recorded, so the
+    /// events timeline can tell what it has not seen yet even across an
+    /// engine replaced by a reload, a replay seek or a fleet host switch.
+    pub seq: u64,
+    /// What it was about, where the rule says: ` (sdb degraded)`,
+    /// ` (api.service)`. Empty otherwise.
+    pub subject: String,
 }
+
+static TRANSITIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn push_notice(notices: &mut Vec<HookCall>, call: HookCall) {
     if notices.len() >= MAX_HISTORY {
@@ -541,6 +550,8 @@ impl AlertEngine {
                         at_unix,
                         value,
                         silenced: silenced.is_some(),
+                        seq: 0,
+                        subject: st.subject.clone(),
                     });
                 }
                 // Hooks follow what was last *announced*, not the edge just
@@ -584,6 +595,8 @@ impl AlertEngine {
                     at_unix,
                     value,
                     silenced: silenced.is_some(),
+                    seq: 0,
+                    subject: String::new(),
                 });
             }
             // The process that is actually growing, when the rule is about
@@ -606,11 +619,19 @@ impl AlertEngine {
                 AlertKind::Unit => {
                     crate::metrics::units::subject(&snap.units, &rule.target, &rule.query)
                 }
+                // Which array or disk: "disk-health 1 ≥ 1" sent to a pager
+                // left the one thing worth knowing to a second login.
+                AlertKind::Storage => {
+                    crate::metrics::storage::subject(&snap.storage, rule.target.trim())
+                }
                 _ => String::new(),
             };
             let st = &mut self.state[i];
-            if just_fired && rule.kind == AlertKind::Unit {
+            if just_fired && matches!(rule.kind, AlertKind::Unit | AlertKind::Storage) {
                 st.subject = subject.clone();
+            }
+            if just_fired && let Some(event) = events.last_mut() {
+                event.subject = subject.clone();
             }
             // Built before the hook so the hook is told the same line the
             // status bar and the `!` popup show, subject and all.
@@ -674,9 +695,12 @@ impl AlertEngine {
         active
     }
 
-    fn record(&mut self, events: Vec<AlertEvent>) {
+    fn record(&mut self, mut events: Vec<AlertEvent>) {
         if events.is_empty() {
             return;
+        }
+        for e in &mut events {
+            e.seq = TRANSITIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         }
         self.history.extend(events);
         let overflow = self.history.len().saturating_sub(MAX_HISTORY);
@@ -2596,6 +2620,31 @@ mod tests {
         assert!(fires(&degraded, "md0"));
         assert!(!fires(&degraded, "md1"));
         assert!(!fires(&checking, ""), "a scrub of a whole array is upkeep");
+    }
+
+    /// Found on a real host: the page said `disk-health 1 ≥ 1` and nothing
+    /// about which disk.
+    #[test]
+    fn a_storage_alert_names_the_disk_or_array_and_its_reasons() {
+        use crate::metrics::storage::{ArrayState, StorageArray, parse_mdstat};
+        let mut storage =
+            parse_mdstat("md0 : active raid1 sda1[0]\n      1000 blocks [2/1] [U_]\n");
+        storage.push(StorageArray {
+            kind: "smart".into(),
+            name: "sdz".into(),
+            state: ArrayState::Degraded,
+            detail: "8 reallocated 38°C wear 3%".into(),
+            ..Default::default()
+        });
+        let snap = Snapshot { storage, ..Default::default() };
+        let active =
+            AlertEngine::new(vec![rule("disks", AlertKind::Storage, 1.0, 0)]).evaluate(&snap, 0);
+        assert_eq!(active.len(), 1);
+        assert!(
+            active[0].message.ends_with("(md0 degraded, sdz degraded 8 reallocated)"),
+            "{}",
+            active[0].message
+        );
     }
 
     #[test]

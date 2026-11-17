@@ -105,6 +105,11 @@ pub struct Observation {
     /// Lines worth telling the user: a recording started, a recording
     /// finished, a recording that could not be written.
     pub notes: Vec<String>,
+    /// What changed about the active rules since the last observation: one
+    /// started firing, its silence began or ended, or it recovered. Filled by
+    /// `Supervisor::observe`; a headless mode prints these rather than every
+    /// active rule on every sample.
+    pub changes: Vec<String>,
 }
 
 impl Observation {
@@ -146,7 +151,7 @@ pub fn observe_with_label(
     attach_context(&mut commands, &drained.dumps, label, snap);
     let mut notices = engine.take_notices();
     attach_context(&mut notices, &drained.dumps, label, snap);
-    Observation { active, commands, notices, notes: drained.notes }
+    Observation { active, commands, notices, notes: drained.notes, changes: Vec::new() }
 }
 
 /// Fill in the parts of a hook's context that the engine cannot know: which
@@ -267,6 +272,8 @@ pub struct Supervisor {
     /// one supervisor per host, and `cpu-saturated` firing on three machines
     /// at once would otherwise be three writers opening the same file.
     label: String,
+    /// Each rule active at the last observation, and whether it was silenced.
+    said: Vec<(String, bool)>,
 }
 
 impl Supervisor {
@@ -291,6 +298,7 @@ impl Supervisor {
             ),
             started: Instant::now(),
             label: String::new(),
+            said: Vec::new(),
         }
     }
 
@@ -334,7 +342,36 @@ impl Supervisor {
                 call.message = format!("{}: {}", self.label, call.message);
             }
         }
+        obs.changes = self.changes(&obs.active);
         obs
+    }
+
+    /// Lines for what changed since the last observation. `--serve --alerts`
+    /// printed every active rule on every fresh sample: a disk alert scraped
+    /// every 15 s wrote the same line 5760 times a day into the journal.
+    /// Found against a real host. Into a state and out of it, like the
+    /// recording errors.
+    fn changes(&mut self, active: &[ActiveAlert]) -> Vec<String> {
+        let mut lines = Vec::new();
+        for a in active {
+            let silenced = a.silenced.is_some();
+            let before = self.said.iter().find(|(n, _)| *n == a.name).map(|(_, s)| *s);
+            if before != Some(silenced) {
+                lines.push(match &a.silenced {
+                    Some(why) => format!("{} ({why})", a.message),
+                    None => a.message.clone(),
+                });
+            }
+        }
+        let prefix =
+            if self.label.is_empty() { String::new() } else { format!("{}: ", self.label) };
+        for (name, _) in &self.said {
+            if !active.iter().any(|a| a.name == *name) {
+                lines.push(format!("{prefix}{name} recovered"));
+            }
+        }
+        self.said = active.iter().map(|a| (a.name.clone(), a.silenced.is_some())).collect();
+        lines
     }
 
     pub fn is_dumping(&self) -> bool {
@@ -608,6 +645,24 @@ mod tests {
         let recovered = sup.observe(&cpu(1.0));
         assert_eq!(ran(&recovered), vec!["all-clear"]);
         assert!(recovered.active.is_empty());
+    }
+
+    /// A headless mode prints a rule when it starts firing and when it
+    /// recovers, not on every sample in between. Found against a real host,
+    /// where a firing disk alert was printed on every scrape.
+    #[test]
+    fn a_firing_rule_is_said_once_and_its_recovery_once() {
+        let cfg = cfg_with(vec![rule("hot", 90.0, 0, "")]);
+        let mut sup = Supervisor::new(&cfg).for_host("db-1");
+        assert!(sup.observe(&cpu(1.0)).changes.is_empty());
+        let fired = sup.observe(&cpu(95.0)).changes;
+        assert_eq!(fired.len(), 1, "{fired:?}");
+        assert!(fired[0].starts_with("db-1: hot "), "{fired:?}");
+        for _ in 0..3 {
+            assert!(sup.observe(&cpu(96.0)).changes.is_empty(), "said again while firing");
+        }
+        assert_eq!(sup.observe(&cpu(1.0)).changes, ["db-1: hot recovered"]);
+        assert!(sup.observe(&cpu(1.0)).changes.is_empty());
     }
 
     /// The ordering the flight recorder depends on: the ring must already

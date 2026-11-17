@@ -133,6 +133,7 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
         Mode::Help => popups::help(f, size, app),
         Mode::Alerts => popups::alerts(f, size, app),
         Mode::AuditLog => popups::audit_log(f, size, app),
+        Mode::Events => popups::events(f, size, app),
         Mode::Seek => popups::seek(f, size, app),
         Mode::Unit => popups::unit(f, size, app),
         Mode::Silence => popups::silence(f, size, app),

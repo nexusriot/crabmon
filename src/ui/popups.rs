@@ -430,7 +430,7 @@ fn fd_field(p: &crate::metrics::ProcRow) -> String {
 }
 
 /// Every binding, in one place, so the help and the README cannot drift.
-pub const KEYS: [(&str, &str); 46] = [
+pub const KEYS: [(&str, &str); 47] = [
     ("q / Ctrl-C", "quit"),
     ("↑ ↓ / k j", "move selection"),
     ("PgUp PgDn", "move a page"),
@@ -470,6 +470,7 @@ pub const KEYS: [(&str, &str); 46] = [
     ("P", "export a snapshot"),
     ("u", "a systemd unit: state, journal, restart, reset-failed"),
     ("!", "active alerts"),
+    ("E", "events timeline: alerts, kernel, units, disks, hosts, actions"),
     ("S", "silence alert rules for a while (also in the ! popup)"),
     ("o / O", "fold / unfold a subtree (tree view)"),
     ("Ctrl-R", "reload the config file"),
@@ -699,6 +700,64 @@ pub fn unit(f: &mut Frame<'_>, area: Rect, app: &mut App) {
 }
 
 /// The local record of every process change and unit restart crabmon made.
+/// The events timeline, newest first.
+pub fn events(f: &mut Frame<'_>, area: Rect, app: &mut App) {
+    use crate::events::{Level, ago, clock};
+    let total = app.events.len();
+    let inner = scroll_frame(f, area, app, " Events · newest first · UTC ", total, (84, 70));
+    if app.events.is_empty() {
+        f.render_widget(
+            Paragraph::new(
+                "nothing has happened yet\n\nAlerts, kernel events, unit and disk changes,\n\
+                 hosts coming and going and actions taken are listed here.",
+            )
+            .alignment(Alignment::Center),
+            inner,
+        );
+        return;
+    }
+    let now = app.snap.taken_at_unix;
+    let fleet = !app.fleet().is_empty();
+    let rows: Vec<Row> = app
+        .events
+        .newest_first()
+        .skip(app.popup_scroll)
+        .take(inner.height.saturating_sub(1) as usize)
+        .map(|e| {
+            let color = match e.level {
+                Level::Ok => app.theme.ok,
+                Level::Info => app.theme.text,
+                Level::Warn => app.theme.warn,
+                Level::Crit => app.theme.crit,
+            };
+            let mut cells = vec![
+                Cell::from(Span::styled(clock(e.at_unix), Style::default().fg(app.theme.dim))),
+                Cell::from(Span::styled(ago(e.at_unix, now), Style::default().fg(app.theme.dim))),
+            ];
+            if fleet {
+                cells.push(Cell::from(truncate_fit(&e.host, 14)));
+            }
+            cells.push(Cell::from(Span::styled(
+                e.source.label(),
+                Style::default().fg(app.theme.accent),
+            )));
+            cells.push(Cell::from(Span::styled(e.text.clone(), Style::default().fg(color))));
+            Row::new(cells)
+        })
+        .collect();
+    let mut widths = vec![Constraint::Length(8), Constraint::Length(4)];
+    let mut names = vec!["When", "Ago"];
+    if fleet {
+        widths.push(Constraint::Length(14));
+        names.push("Host");
+    }
+    widths.extend([Constraint::Length(7), Constraint::Min(10)]);
+    names.extend(["Source", "Event"]);
+    let header =
+        Row::new(names).style(Style::default().add_modifier(Modifier::BOLD).fg(app.theme.title));
+    f.render_widget(Table::new(rows, widths).header(header), inner);
+}
+
 pub fn audit_log(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     let total = app.audit_entries.len();
     let inner = scroll_frame(f, area, app, " Action log ", total, (76, 70));

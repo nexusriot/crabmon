@@ -309,6 +309,12 @@ pub fn to_text_with(snap: &Snapshot, columns: &[String], width: u16) -> String {
     if !troubled.is_empty() {
         out.push_str(&format!("\nunits  {}", troubled.join(", ")));
     }
+    // Likewise a lost mirror or a failing disk, which nothing else in the
+    // report would show. Found against a real host.
+    let storage = crate::metrics::storage::subject(&snap.storage, "");
+    if let Some(list) = storage.strip_prefix(" (").and_then(|s| s.strip_suffix(')')) {
+        out.push_str(&format!("\nstorage  {list}"));
+    }
     out.push_str("\n\n");
     out.push_str(&crate::ui::procs::text_table_with(&snap.procs, columns, width));
     out
@@ -486,6 +492,23 @@ mod redaction_tests {
         let text = to_text(&snap);
         assert!(text.contains("units  cm3-oom.service failed (oom-kill)"), "{text}");
         assert!(!text.contains("fine.service"), "{text}");
+    }
+    #[test]
+    fn the_text_report_names_unhealthy_arrays_and_disks() {
+        use crate::metrics::storage::{ArrayState, StorageArray};
+        let mut snap = crate::metrics::Snapshot::default();
+        let row = |name: &str, state| StorageArray {
+            kind: "smart".into(),
+            name: name.into(),
+            state,
+            detail: "8 reallocated 38°C".into(),
+            ..Default::default()
+        };
+        snap.storage = vec![row("sda", ArrayState::Healthy)];
+        assert!(!to_text(&snap).contains("storage"));
+        snap.storage.push(row("sdz", ArrayState::Degraded));
+        let text = to_text(&snap);
+        assert!(text.contains("storage  sdz degraded 8 reallocated"), "{text}");
     }
 
     /// Values go, the words around them stay: a journal line is the reason

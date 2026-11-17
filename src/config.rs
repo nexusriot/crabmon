@@ -290,6 +290,38 @@ impl UnitsConfig {
     }
 }
 
+/// Disk health from SMART. Off by default: it needs root (or a `sudo` rule)
+/// and runs a program per disk.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SmartConfig {
+    pub enabled: bool,
+    /// How to run smartctl: the program and any leading arguments, split on
+    /// whitespace — `smartctl`, or `sudo -n smartctl` with a sudoers rule.
+    pub command: String,
+    /// Device paths; empty means whatever `smartctl --scan` finds.
+    pub devices: Vec<String>,
+    /// Seconds between readings, at least 60. SMART moves on the scale of
+    /// hours, and a disk in standby is not woken for it.
+    pub interval_secs: u64,
+}
+
+impl Default for SmartConfig {
+    fn default() -> Self {
+        Self { enabled: false, command: "smartctl".into(), devices: Vec::new(), interval_secs: 600 }
+    }
+}
+
+impl SmartConfig {
+    pub fn settings(&self) -> Option<crate::metrics::smart::SmartSettings> {
+        self.enabled.then(|| crate::metrics::smart::SmartSettings {
+            command: self.command.split_whitespace().map(str::to_string).collect(),
+            devices: self.devices.clone(),
+            interval: std::time::Duration::from_secs(self.interval_secs.max(60)),
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GpuConfig {
@@ -354,6 +386,7 @@ pub struct Config {
     pub record: RecordConfig,
     pub remote: RemoteConfig,
     pub units: UnitsConfig,
+    pub smart: SmartConfig,
     pub colors: BTreeMap<String, String>,
     /// Queries bound to the number keys, in order.
     #[serde(rename = "filter_preset")]
@@ -398,6 +431,7 @@ impl Default for Config {
             record: RecordConfig::default(),
             remote: RemoteConfig::default(),
             units: UnitsConfig::default(),
+            smart: SmartConfig::default(),
             colors: BTreeMap::new(),
             saved_filters: default_saved_filters(),
             alerts: crate::alerts::default_rules(),

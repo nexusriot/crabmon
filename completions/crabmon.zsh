@@ -5,7 +5,7 @@ _crabmon() {
         '(-r --refresh)'{-r,--refresh}'[refresh interval in ms]:milliseconds:' \
         '(-s --sort)'{-s,--sort}'[sort column]:key:(pid name cpu mem virt disk time user state threads nice fds pss growth majflt)' \
         '(-g --group)'{-g,--group}'[group processes]:by:(none service container user)' \
-        '--record[append every sample to a JSONL recording]:file:_files' \
+        '--record[write every sample to a JSONL recording, replacing the file]:file:_files' \
         '--record-rotate[keep a rotating recording in a directory]:directory:_files -/' \
         '--replay[replay a recording instead of sampling]:file:_files' \
         '--remote[monitor another host over SSH]:target:_hosts' \
@@ -30,7 +30,7 @@ _crabmon() {
         '--no-color[disable colour]' \
         '--no-mouse[do not capture mouse events]' \
         '(-1 --once)'{-1,--once}'[print one snapshot and exit]' \
-        '--format[output format for --once]:format:(json csv text)' \
+        '--format[output format for --once, --watch, --diff and --doctor]:format:(json csv text)' \
         '(-n --top)'{-n,--top}'[limit --once output to N processes]:count:' \
         '(-c --config)'{-c,--config}'[alternate config file]:file:_files' \
         '(-h --help)'{-h,--help}'[show help]' \

@@ -85,6 +85,8 @@ pub enum Mode {
     Unit,
     /// `S`: silence a rule, or every rule, for a while.
     Silence,
+    /// `E`: what happened, newest first, on every host watched.
+    Events,
 }
 
 /// What `run_app` must do after handling an event.
@@ -195,6 +197,9 @@ pub struct App {
     /// The status line cannot be trusted with these: while the alert that
     /// caused them is firing, the alert has the line.
     pub alert_notes: std::collections::VecDeque<(u64, String)>,
+    /// Alerts, kernel events, unit and storage changes, hosts coming and
+    /// going and actions taken, in one list for the `E` popup.
+    pub events: crate::events::Timeline,
     /// Frame times and markers for a replay, once the background scan of the
     /// recording has finished.
     pub replay_timeline: Option<crate::record::Timeline>,
@@ -213,6 +218,15 @@ pub struct App {
     /// tests and embedders want — an `App` must never write to the user's real
     /// config file just because it was constructed.
     pub config_path: Option<PathBuf>,
+
+    /// The layout `persist` writes while a fleet is being watched. A fleet
+    /// opens on the fleet table and `Enter` on a host switches to that host's
+    /// dashboard; neither is a choice about how crabmon should open next time,
+    /// and saving either meant the next plain `crabmon` opened on an empty
+    /// "no fleet" table, or on a dashboard the config never asked for. Taken
+    /// from the config the session started with, and from the file on a
+    /// reload.
+    pub persisted_layout: Layout,
 
     /// Sampling is suspended; the last snapshot stays on screen.
     pub paused: bool,
@@ -287,6 +301,8 @@ impl App {
         let snap = source.snapshot(Duration::from_secs(0));
         let hist = || History::new(cfg.history_len);
         let mut app = App {
+            events: crate::events::Timeline::default(),
+            persisted_layout: cfg.layout,
             refresh: Duration::from_millis(cfg.refresh_ms),
             filter_text: cfg.filter.clone(),
             filter: filter::parse(&cfg.filter).unwrap_or_default(),
@@ -437,8 +453,11 @@ impl App {
 
         self.record_history();
         self.alerts.muted = self.muted.clone();
-        self.alerts.host = self.fleet_target().unwrap_or_default();
+        let host = self.fleet_target().unwrap_or_default();
+        self.alerts.host = host.clone();
         self.active_alerts = self.alerts.evaluate(&self.snap, self.started.elapsed().as_secs());
+        self.events.observe(&host, &self.snap);
+        self.events.alerts(&host, &self.alerts);
         self.rebuild_view();
     }
 
@@ -651,7 +670,18 @@ impl App {
         }
         let selected = self.source.selected_host();
         let now = self.started.elapsed().as_secs();
+        let now_unix = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         for host in self.source.fleet() {
+            // Still connecting is not news; a host that has never answered
+            // and says why is, or one down from the start never appears.
+            if !host.waiting || host.error.is_some() {
+                self.events.host_live(
+                    &host.target,
+                    host.is_live(),
+                    host.error.as_deref(),
+                    now_unix,
+                );
+            }
             if host.index == selected {
                 continue;
             }
@@ -673,6 +703,8 @@ impl App {
             engine.muted = self.muted.clone();
             engine.host = host.target.clone();
             *active = engine.evaluate(&host.snapshot, now);
+            self.events.observe(&host.target, &host.snapshot);
+            self.events.alerts(&host.target, engine);
         }
     }
 
@@ -1057,7 +1089,7 @@ impl App {
                 self.on_silence_key(key);
                 Action::None
             }
-            Mode::Detail | Mode::Help | Mode::Alerts | Mode::AuditLog => {
+            Mode::Detail | Mode::Help | Mode::Alerts | Mode::AuditLog | Mode::Events => {
                 self.on_popup_key(key);
                 Action::None
             }
@@ -1108,6 +1140,7 @@ impl App {
                 self.alerts.rules.len() + self.alerts.history_len() + self.alert_notes.len()
             }
             Mode::AuditLog => self.audit_entries.len(),
+            Mode::Events => self.events.len(),
             Mode::Unit => crate::ui::popups::UNIT_FIELDS + self.unit_log.len(),
             Mode::Detail => {
                 crate::ui::popups::DETAIL_FIELDS
@@ -1366,6 +1399,7 @@ impl App {
             KeyCode::Char('r') => self.open_renice(),
             KeyCode::Char('t') => self.open_signal_menu(),
             KeyCode::Char('!') => self.open_popup(Mode::Alerts),
+            KeyCode::Char('E') => self.open_popup(Mode::Events),
             KeyCode::Char('S') => self.open_silence(),
             KeyCode::Char('u') => self.open_unit(),
             KeyCode::Char('P') => return Action::Export,
@@ -1381,7 +1415,7 @@ impl App {
             return;
         };
         let next = (pos as isize + delta).clamp(0, len.saturating_sub(1) as isize) as usize;
-        self.go_to_frame(next);
+        self.go_to_frame_from(next, delta == 1);
         self.set_status(format!("frame {}/{}", next + 1, len));
     }
 
@@ -1498,8 +1532,20 @@ impl App {
     /// way switching fleet hosts is, and the alerts of the frame left behind
     /// stayed on the status line describing a moment no longer on screen.
     fn go_to_frame(&mut self, next: usize) {
+        self.go_to_frame_from(next, false);
+    }
+
+    /// `continues`: a single step forward, which is the next frame anyone
+    /// would have watched, so the events timeline carries on rather than
+    /// starting again. Every other jump resets it. Either way the frame
+    /// landed on is observed at once — stepping through an incident with `]`
+    /// used to empty the timeline at every step. Found on a real recording.
+    fn go_to_frame_from(&mut self, next: usize, continues: bool) {
         self.alerts = AlertEngine::configured(&self.cfg);
         self.active_alerts.clear();
+        if !continues {
+            self.events.reset();
+        }
         self.source.seek(next);
         // Scrubbing implies stepping frame by frame rather than playing on.
         self.paused = true;
@@ -1507,6 +1553,8 @@ impl App {
         // sought, so every step forward would move two frames.
         if let Some(snap) = self.source.peek() {
             self.snap = snap;
+            let host = self.fleet_target().unwrap_or_default();
+            self.events.observe(&host, &self.snap);
             self.rebuild_view();
         }
     }
@@ -1538,8 +1586,14 @@ impl App {
         name: &str,
         result: Result<(), &str>,
     ) {
-        let Some(path) = self.audit_path.clone() else { return };
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let outcome = match result {
+            Ok(()) => String::new(),
+            Err(e) => format!(": failed, {e}"),
+        };
+        let subject = if pid == 0 { name.to_string() } else { format!("{name} ({pid})") };
+        self.events.action(now, result.is_ok(), format!("{action} {subject}{outcome}"));
+        let Some(path) = self.audit_path.clone() else { return };
         let line = audit::format_entry(now, &action, pid, name, result);
         audit::append(&path, &line, self.cfg.audit.max_bytes);
     }
@@ -1664,11 +1718,19 @@ impl App {
                     what(&rule),
                     crate::silence::clock(until_unix)
                 ));
+                self.events.action(
+                    now,
+                    true,
+                    format!("silenced {} until {}", what(&rule), crate::silence::clock(until_unix)),
+                );
                 self.muted.push(Muted { rule, until_unix });
             }
             SilenceRequest::Lift { rule } => {
                 let before = self.muted.len();
                 self.muted.retain(|m| rule.is_some() && m.rule != rule);
+                if before > self.muted.len() {
+                    self.events.action(now, true, format!("lifted the silence on {}", what(&rule)));
+                }
                 self.set_status(match before - self.muted.len() {
                     0 => format!("no silence on {} to lift", what(&rule)),
                     _ => format!("lifted the silence on {}", what(&rule)),
@@ -2332,6 +2394,7 @@ impl App {
         let show_threads = self.cfg.show_threads;
 
         let history_changed = loaded.history_len != self.cfg.history_len;
+        self.persisted_layout = loaded.layout;
         self.cfg = loaded;
         self.cfg.filter = filter_text;
         self.cfg.layout = layout;
@@ -2358,9 +2421,18 @@ impl App {
     }
 
     pub fn persist(&self) {
-        if let Some(path) = &self.config_path {
-            crate::config::save_to(path, &self.cfg);
+        let Some(path) = &self.config_path else { return };
+        let mut cfg = self.cfg.clone();
+        // Under a fleet the layout is session state; see `persisted_layout`.
+        if !self.fleet().is_empty() {
+            cfg.layout = self.persisted_layout;
         }
+        // The fleet table means nothing without `--remote` hosts, so it is
+        // never what a later run should open on.
+        if cfg.layout == Layout::Fleet {
+            cfg.layout = Layout::Dashboard;
+        }
+        crate::config::save_to(path, &cfg);
     }
 }
 

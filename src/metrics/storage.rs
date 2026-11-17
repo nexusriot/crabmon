@@ -15,9 +15,9 @@
 //!   flush, corruption and generation errors, kept on disk across mounts) and
 //!   `missing`.
 //!
-//! SMART needs root and a vendor-specific ioctl, so it is out of reach for a
-//! monitor that asks for no privileges; block-layer IO errors are already in
-//! the kernel-events panel.
+//! SMART needs root and a vendor-specific ioctl, so it is not read here but
+//! by the opt-in `smart` watcher, whose disks join these rows as kind
+//! `smart`; block-layer IO errors are already in the kernel-events panel.
 
 use std::fs;
 use std::path::Path;
@@ -73,6 +73,9 @@ pub struct StorageArray {
     /// btrfs device errors summed across devices, since the counters were
     /// last reset.
     pub errors: Option<u64>,
+    /// For a `smart` row: what the disk reported, beyond its state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smart: Option<super::smart::SmartInfo>,
 }
 
 /// Every array `/proc/mdstat` lists.
@@ -245,6 +248,33 @@ pub fn read() -> Vec<StorageArray> {
     // Worst first, so a degraded array is the row the panel cannot cut off.
     out.sort_by_key(|a| std::cmp::Reverse(a.state as u8));
     out
+}
+
+/// What a `storage` alert names: the unhealthy arrays and disks it counted,
+/// `" (sdb degraded 8 reallocated, md0 rebuilding)"`.
+pub fn subject(arrays: &[StorageArray], target: &str) -> String {
+    let named: Vec<String> = arrays
+        .iter()
+        .filter(|a| target.is_empty() || a.name == target)
+        .filter(|a| a.state.is_unhealthy())
+        .map(|a| match a.kind.as_str() {
+            // A disk's reasons are the point; an array's detail is `[2/1] [U_]`.
+            "smart" => {
+                let why: Vec<&str> = a
+                    .detail
+                    .split(' ')
+                    .take_while(|w| !w.ends_with("°C") && *w != "wear")
+                    .collect();
+                format!("{} {} {}", a.name, a.state.label(), why.join(" ")).trim_end().to_string()
+            }
+            _ => format!("{} {}", a.name, a.state.label()),
+        })
+        .collect();
+    match named.len() {
+        0 => String::new(),
+        1..=3 => format!(" ({})", named.join(", ")),
+        n => format!(" ({}, +{} more)", named[..3].join(", "), n - 3),
+    }
 }
 
 /// The figure a `storage` rule measures: how many arrays are unhealthy, of

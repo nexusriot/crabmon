@@ -263,6 +263,27 @@ fn parse_term(body: &str) -> Result<Term, String> {
             .map(Term::State)
             .ok_or_else(|| "state: needs a letter".to_string());
     }
+    // A bare word already matches the name; `name:` is what people type
+    // first, and it used to be read as a name containing "name:..." — which
+    // nothing has, so `!name:crabmon` matched everything. Found on a real
+    // host.
+    if let Some(rest) = body.strip_prefix("name:") {
+        return Ok(Term::Name(rest.to_lowercase()));
+    }
+    // Any other `word:value` is a field that does not exist, and is said so
+    // rather than searched for as a name. A word with anything but letters
+    // before the colon (`kworker/u8:2`), or nothing after it (`sshd:`), is
+    // still a name.
+    if let Some((field, rest)) = body.split_once(':')
+        && !rest.is_empty()
+        && field.len() >= 2
+        && field.chars().all(|c| c.is_ascii_lowercase())
+    {
+        return Err(format!(
+            "unknown field {field}: — known: name: user: cmd: pid: ppid: state: service: \
+             container: re:, and comparisons such as cpu>5"
+        ));
+    }
 
     if let Some((field, cmp, value)) = split_cmp(body) {
         let field = field.to_ascii_lowercase();
@@ -312,6 +333,25 @@ fn parse_term(body: &str) -> Result<Term, String> {
     }
 
     Ok(Term::Name(body.to_lowercase()))
+}
+
+#[cfg(test)]
+mod field_tests {
+    use super::*;
+    use crate::metrics::ProcRow;
+
+    #[test]
+    fn name_is_a_field_and_an_unknown_field_is_an_error() {
+        let p = ProcRow { pid: 1, name: "crabmon".into(), ..Default::default() };
+        assert!(parse("name:crab").unwrap().matches(&p));
+        assert!(!parse("!name:crabmon").unwrap().matches(&p), "negation now excludes it");
+        let e = parse("nmae:crab").unwrap_err();
+        assert!(e.contains("unknown field nmae:") && e.contains("name:"), "{e}");
+        // Names that merely contain a colon are still names.
+        for name in ["kworker/u8:2", "sshd:", "a:b", "Foo:bar"] {
+            assert!(parse(name).is_ok(), "{name}");
+        }
+    }
 }
 
 #[cfg(test)]

@@ -178,6 +178,21 @@ impl Recordings {
         };
         let rotating =
             RotatingRecorder::new(&rotate_dir, per_segment, cfg.rotate_keep, cfg.limits());
+        // Checked now, like an explicit `--record` path. A rotating recorder
+        // pointed at a file announced itself, said "File exists (os error
+        // 17)" and then ran for ever recording nothing — under systemd, the
+        // always-on recorder that is not. Found on a real host.
+        if rotating.is_some() {
+            if rotate_dir.exists() && !rotate_dir.is_dir() {
+                return Err(format!(
+                    "cannot keep a rotating recording in {}: not a directory",
+                    rotate_dir.display()
+                ));
+            }
+            std::fs::create_dir_all(&rotate_dir).map_err(|e| {
+                format!("cannot keep a rotating recording in {}: {e}", rotate_dir.display())
+            })?;
+        }
         Ok(Recordings {
             plain,
             rotating,
@@ -967,7 +982,17 @@ pub fn parse_jsonl(content: &str) -> Result<Vec<Snapshot>, String> {
 }
 
 impl ReplaySource {
+    /// Every error names the file: "stream did not contain valid UTF-8" and
+    /// "no frames in recording" did not, while the rest did.
     pub fn open(path: &Path) -> Result<ReplaySource, String> {
+        let name = path.display().to_string();
+        ReplaySource::open_inner(path).map_err(|e| match e.starts_with(&name) {
+            true => e,
+            false => format!("{name}: {e}"),
+        })
+    }
+
+    fn open_inner(path: &Path) -> Result<ReplaySource, String> {
         let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let size = file.metadata().map(|m| m.len()).unwrap_or(0);
         let label = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -1528,6 +1553,35 @@ mod tests {
         let good = serde_json::to_string(&frame(1)).unwrap();
         let err = parse_jsonl(&format!("{good}\nnot json\n{good}\n")).unwrap_err();
         assert!(err.contains("line 2"), "{err}");
+    }
+
+    /// Found on a real host: pointed at a file, the rotating recorder ran
+    /// for ever recording nothing. And a binary file's error did not say
+    /// which file.
+    #[test]
+    fn a_rotating_recording_needs_a_directory_and_replay_errors_name_the_file() {
+        let dir = std::env::temp_dir().join(format!("crabmon-rotfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a-file");
+        std::fs::write(&file, "x").unwrap();
+        let cfg = crate::config::RecordConfig::default();
+        let err = Recordings::open(None, Some(file.to_str().unwrap()), &cfg).err().unwrap();
+        assert!(err.contains("not a directory"), "{err}");
+        // A directory that does not exist yet is made.
+        let fresh = dir.join("new/sub");
+        assert!(Recordings::open(None, Some(fresh.to_str().unwrap()), &cfg).is_ok());
+        assert!(fresh.is_dir());
+
+        let bin = dir.join("bin.jsonl");
+        std::fs::write(&bin, [0xff, 0xfe, 0x00, 0x80]).unwrap();
+        let err = ReplaySource::open(&bin).err().unwrap();
+        assert!(err.starts_with(bin.to_str().unwrap()), "{err}");
+        let empty = dir.join("empty.jsonl");
+        std::fs::write(&empty, "").unwrap();
+        let err = ReplaySource::open(&empty).err().unwrap();
+        assert!(err.starts_with(empty.to_str().unwrap()) && err.contains("no frames"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

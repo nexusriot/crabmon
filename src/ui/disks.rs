@@ -128,14 +128,21 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     // Arrays first, worst first: they are few, and the one that has lost a
-    // disk is the row that matters most on the panel.
-    let arrays = app.snap.storage.len().min(inner.height as usize);
-    let shown = (inner.height as usize - arrays).min(app.snap.disks.len());
+    // disk is the row that matters most on the panel. A healthy SMART disk
+    // is not news, so it waits until the mounts have had their lines; a
+    // disk that has started to fail is, and goes up with the arrays.
+    let is_quiet_disk =
+        |a: &&crate::metrics::storage::StorageArray| a.kind == "smart" && !a.state.is_unhealthy();
+    let (quiet, loud): (Vec<_>, Vec<_>) = app.snap.storage.iter().partition(is_quiet_disk);
+    let height = inner.height as usize;
+    let arrays = loud.len().min(height);
+    let shown = (height - arrays).min(app.snap.disks.len());
+    let spare = (height - arrays - shown).min(quiet.len());
     let slots = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(vec![Constraint::Length(1); arrays + shown])
+        .constraints(vec![Constraint::Length(1); arrays + shown + spare])
         .split(inner);
-    for (a, slot) in app.snap.storage.iter().take(arrays).zip(slots.iter()) {
+    let draw_array = |f: &mut Frame<'_>, a: &crate::metrics::storage::StorageArray, slot: Rect| {
         let color = match a.state {
             crate::metrics::storage::ArrayState::Healthy => app.theme.ok,
             crate::metrics::storage::ArrayState::Rebuilding => app.theme.warn,
@@ -143,10 +150,16 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &App) {
         };
         f.render_widget(
             Paragraph::new(Span::styled(array_label(a), Style::default().fg(color))),
-            *slot,
+            slot,
         );
+    };
+    for (a, slot) in loud.iter().take(arrays).zip(slots.iter()) {
+        draw_array(f, a, *slot);
     }
-    let slots = &slots[arrays..];
+    for (a, slot) in quiet.iter().take(spare).zip(slots[arrays + shown..].iter()) {
+        draw_array(f, a, *slot);
+    }
+    let slots = &slots[arrays..arrays + shown];
 
     let mount_width = (inner.width as usize / 3).clamp(6, 24);
     for (d, slot) in app.snap.disks.iter().take(shown).zip(slots.iter()) {

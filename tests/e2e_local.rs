@@ -332,3 +332,148 @@ fn fleet_exporter_honors_custom_remote_command_and_exports_freshness() {
         })
     });
 }
+
+/// SMART end to end through the real binary, with a stand-in `smartctl`
+/// behind `[smart] command`: a disk that starts to fail is a degraded storage
+/// row, a line in the text report and a match for a `storage` rule, and a
+/// disk that cannot be opened is a reason — never a healthy row. The same
+/// checks run against a real host in `scripts/e2e-ssh.py`.
+#[test]
+fn smart_disk_health_reaches_every_headless_output() {
+    let dir = Scratch::new("smart");
+    let disk = dir.file("disk.json");
+    let fake = dir.file("smartctl");
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in *\" --scan \"*) echo '{{\"devices\":[{{\"name\":\"/dev/sdz\",\"type\":\"sat\"}}]}}'; exit 0;; esac\ncat {}\n",
+            disk.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+    let json = |realloc: u32| {
+        format!(
+            r#"{{"smartctl":{{"exit_status":0}},"model_name":"WDC WD40EFRX","smart_support":{{"available":true,"enabled":true}},"smart_status":{{"passed":true}},"temperature":{{"current":38}},"ata_smart_attributes":{{"table":[{{"id":5,"raw":{{"value":{realloc}}}}}]}}}}"#
+        )
+    };
+    let cfg = dir.file("config.toml");
+    fs::write(
+        &cfg,
+        format!(
+            "[smart]\nenabled = true\ninterval_secs = 60\ncommand = {:?}\n",
+            fake.display().to_string()
+        ),
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        Command::new(BIN)
+            .args(args)
+            .arg("--config")
+            .arg(&cfg)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let snapshot = || -> serde_json::Value {
+        serde_json::from_slice(&run(&["--once", "--format", "json"]).stdout).unwrap()
+    };
+
+    fs::write(&disk, json(0)).unwrap();
+    let snap = snapshot();
+    assert_eq!(snap["storage"][0]["state"], "healthy", "{}", snap["storage"]);
+    assert!(run(&["--doctor"]).status.success());
+
+    fs::write(&disk, json(8)).unwrap();
+    assert_eq!(snapshot()["storage"][0]["state"], "degraded");
+    let text = String::from_utf8(run(&["--once", "--format", "text"]).stdout).unwrap();
+    assert!(text.contains("storage  sdz degraded 8 reallocated"), "{text}");
+    let watch = run(&["--watch-rule", "storage>=1", "--watch-timeout", "20"]);
+    assert_eq!(watch.status.code(), Some(1), "{}", String::from_utf8_lossy(&watch.stderr));
+
+    fs::write(
+        &disk,
+        r#"{"smartctl":{"exit_status":2,"messages":[{"string":"Smartctl open device: /dev/sdz failed: Permission denied","severity":"error"}]}}"#,
+    )
+    .unwrap();
+    let snap = snapshot();
+    assert_eq!(snap["storage"], serde_json::json!([]));
+    assert!(snap["smart_unreadable"].as_str().unwrap().contains("Permission denied"), "{snap}");
+    let doctor = run(&["--doctor"]);
+    assert_eq!(doctor.status.code(), Some(1), "[smart] on and nothing readable is a failed check");
+    assert!(String::from_utf8_lossy(&doctor.stdout).contains("needs root"));
+}
+
+/// An explicit `--remote-command` that streams — the way to reach a crabmon
+/// that is not on the far end's `PATH` — is read as a stream. Run as a
+/// one-shot it waited 15 s for an exit that never comes and the host never
+/// came up. The stand-in `ssh` prints a frame a second and never exits.
+#[test]
+fn an_explicit_streaming_remote_command_is_read_as_a_stream() {
+    let dir = Scratch::new("stream-command");
+    let ssh = dir.file("ssh");
+    fs::write(
+        &ssh,
+        "#!/bin/sh\nfor arg do last=$arg; done\ncase \"$last\" in *' --stream'*) ;; *) exit 1;; esac\n\
+         n=100; while :; do n=$((n+1)); printf '%s\\n' \"{\\\"taken_at_unix\\\":$n,\\\"host\\\":{\\\"hostname\\\":\\\"s\\\"}}\"; sleep 1; done\n",
+    )
+    .unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+    let cfg = dir.file("config.toml");
+    fs::write(&cfg, "refresh_ms = 200\n").unwrap();
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let addr = format!("127.0.0.1:{port}");
+    let path = format!("{}:{}", dir.0.display(), std::env::var("PATH").unwrap_or_default());
+    let started = Instant::now();
+    let _app = spawn(
+        Command::new(BIN)
+            .args(["--serve", &addr, "--remote", "h", "--remote-command"])
+            .arg("/opt/crabmon/bin/crabmon --stream --refresh 1000")
+            .arg("--config")
+            .arg(cfg)
+            .env("PATH", path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
+    wait_until(|| scrape(&addr).is_some_and(|s| s.contains("crabmon_up{host=\"h\"} 1")));
+    assert!(started.elapsed() < Duration::from_secs(12), "it waited out a one-shot timeout");
+}
+
+/// A watch carries its query in its own command line, so it used to match
+/// itself on the first sample: `--watch 'cmd:backup'` exited 1 with no
+/// backup running. Found on a real host.
+#[test]
+fn a_watch_never_matches_its_own_command_line() {
+    // Made up here, so no other process's command line — the shell that ran
+    // the test suite included — can contain it.
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    let query = format!("cmd:nothing-runs-{}-{}", std::process::id(), nanos.as_nanos());
+    let out = Command::new(BIN)
+        .args(["--watch", &query, "--watch-timeout", "2"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stdout));
+}
+
+/// systemd stops an exporter with SIGTERM; its Unix socket should go with it.
+#[test]
+fn the_exporter_removes_its_unix_socket_on_sigterm() {
+    let dir = Scratch::new("unix-sock");
+    let sock = dir.file("metrics.sock");
+    let cfg = dir.file("config.toml");
+    fs::write(&cfg, "refresh_ms = 200\n").unwrap();
+    let app = spawn(
+        Command::new(BIN)
+            .arg("--serve")
+            .arg(format!("unix:{}", sock.display()))
+            .arg("--config")
+            .arg(&cfg)
+            .stdout(Stdio::null()),
+    );
+    wait_until(|| sock.exists());
+    unsafe {
+        libc::kill(app.0.id() as i32, libc::SIGTERM);
+    }
+    wait_until(|| !sock.exists());
+}

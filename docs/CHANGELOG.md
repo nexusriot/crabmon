@@ -35,8 +35,29 @@ for one on purpose. The fixes came from another round against a real host.
   fleet's ALERT count, and a flight dump's summary says nobody was paged.
   A window that cannot open stops crabmon at start and fails `--doctor`.
 
+- **Disk health from SMART** (`[smart]`, opt-in). `smartctl --json` on a
+  thread of its own every ten minutes, leaving disks in standby asleep:
+  remapped, pending and uncorrectable sectors, NVMe media errors, critical
+  warnings, spare capacity and wear, and the disk's own verdict. Each disk is
+  a storage row of kind `smart`, so a failing one is in the Disks title,
+  fires `storage` rules and is `crabmon_storage_degraded`, with per-disk
+  temperature, power-on hours, wear and sector counts exported. Runs through
+  a configurable command (`sudo -n smartctl`); a disk that cannot be read is
+  reported, by `--doctor` and as `smart_unreadable`, never drawn as healthy.
+- **An events timeline.** `E` lists what happened, newest first: rules
+  firing and clearing, kernel events, units failing, restarting and
+  recovering, arrays and disks changing state, fleet hosts that stop and
+  start answering, and signals, restarts and silences from the interface.
+  Derived from the samples, so a replay rebuilds it and fleet hosts need
+  nothing new.
+
 ### Changed
 
+- **Headless alerts say what changed.** `--serve --alerts` and `--stream
+  --alerts` printed every active rule on every fresh sample — a disk alert
+  under a 15-second scrape, 5760 identical lines a day into the journal. A
+  rule is now said when it starts firing, when its silence changes and when
+  it recovers.
 - **Dependencies at their newest releases.** `nix` 0.31 → 0.32 (none of its
   breaking changes touch the signal, scheduling or process-group calls
   crabmon makes), plus `cargo update` for the lockfile (`errno`, `mio`).
@@ -45,6 +66,65 @@ for one on purpose. The fixes came from another round against a real host.
 
 ### Fixed
 
+Found by a full run against the real test host (Ubuntu 26.04, systemd 259,
+a QEMU disk), each with a test:
+
+- **A disk with no SMART was drawn as a healthy disk at 0°C.** smartctl
+  answers for a virtual disk with `smart_support.available: false` and a
+  placeholder temperature of 0; both are now a reason, not a reading, and
+  `--doctor`'s advice follows the actual error rather than always saying to
+  install smartmontools and run as root.
+- **A streaming `--remote-command` never came up.** Every explicit command
+  was run as a one-shot, so `/opt/crabmon/bin/crabmon --stream` waited 15 s
+  for an exit on every sample. A command with `--stream` is now read as a
+  stream — the only way to stream from a crabmon off the far end's `PATH`.
+- **A `storage` alert did not say which array or disk** —
+  `disk-health 1 ≥ 1`. The message, hook, notification and timeline now name
+  them with their reasons, and the text report gains a `storage` line.
+- **The timeline put a live segfault before the unit failure that preceded
+  it**, timing it by the kernel's drifting printk clock, and listed OOM kills
+  by their raw `oom-kill:constraint=…` line. Live kernel events are now timed
+  by the sample that saw them, and OOM kills read `OOM: python3 (482060) in
+  api.service`.
+- **A fleet host unreachable from the start never appeared in the timeline**,
+  being "still connecting" for ever.
+Then a second round against the same host, also each with a test:
+
+- **`--watch` matched itself.** Its own command line carries the query, so
+  `--watch 'cmd:backup.sh'` exited 1 — "it is running" — with no backup
+  anywhere. The watcher and what it runs are no longer counted.
+- **Threads counted as processes in `--diff` and the fleet table.** A
+  crabmon thread was listed as "started", `procs` read 293 → 296 for one new
+  process, and PROCS showed 286 on a host running 138. Both now count
+  processes, as the interface does.
+- **`name:` was not a filter field, and an unknown field was a name.**
+  `!name:crabmon` searched for a process called `name:crabmon`, found none,
+  and so matched everything. `name:` is now a field, and an unknown
+  `word:value` is an error listing the real ones.
+- **A rotating recording pointed at a file ran for ever recording nothing**,
+  after saying `File exists (os error 17)`. It now stops crabmon at start,
+  like an unwritable `--record`, saying the path is not a directory; replay
+  errors name the file in every case.
+- **Stepping through a replay emptied the timeline at every step.** A step
+  forward now continues it, and any jump observes the frame landed on.
+- **`--serve unix:` left its socket behind** on SIGTERM; it is now removed.
+- **A fleet session left the next plain `crabmon` on an empty fleet
+  table.** A fleet opens on the fleet table, and that layout was saved on
+  exit like any other, so the next run without `--remote` opened on "no
+  fleet". Opening a host saved `dashboard` over whatever the config said.
+  Under a fleet the layout is now session state — the file keeps the one it
+  had — and `fleet` is never written to the config at all.
+- **Documentation that had drifted from the code.** The man page still said
+  `--once`, `--serve`, `--stream` and `--watch` never evaluate rules, that
+  `--serve --remote` refuses `--record`, and that `--remote-command` defaults
+  to the one-shot command; it gave an old `panel_order` default and missed
+  `kernel` in `[panels]`, `fleet` as a layout and `pss`/`growth`/`majflt` as
+  columns. The README said a scrape carries every command line (it carries
+  names and PIDs), left exit status 2 and seven alert kinds out of
+  `--watch-rule`, called the unit popup's journal re-read "reload", and did
+  not say that command-line options are saved with the session. The design
+  notes gain a section on silences, fleets, themes, the clipboard, incident
+  summaries and diffs.
 - **A `unit` or `kernel` watch on a source crabmon cannot read waited out its
   timeout and exited 0**, as if nothing had happened — `[units]` off, or
   `/dev/kmsg` unreadable. Like a rule on an unmeasured mount, it now exits 2

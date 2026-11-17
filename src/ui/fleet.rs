@@ -157,7 +157,7 @@ fn row<'a>(app: &App, h: &FleetHost, name_w: usize) -> Row<'a> {
             None => "    -".to_string(),
         }),
         Cell::from(format!("{:>8}", compact_bytes((rx + tx) as u64))),
-        Cell::from(format!("{:>5}", s.procs.len())),
+        Cell::from(format!("{:>5}", s.processes().count())),
         alert_cell(app, h),
         Cell::from(status),
     ])

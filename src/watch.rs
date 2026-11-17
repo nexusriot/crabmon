@@ -16,6 +16,7 @@
 use std::time::{Duration, Instant};
 
 use crate::alerts::{ALL_ALERT_KINDS, AlertKind, AlertRule};
+use crate::metrics::Snapshot;
 
 /// Exit code when the watch condition was met. 0 means it never was.
 pub const MATCHED: i32 = 1;
@@ -50,6 +51,17 @@ impl Outcome {
 }
 
 /// The rule `--watch <query>` means: at least one process matches.
+/// The snapshot a watch judges: this machine without the watcher itself and
+/// whatever it runs (`systemctl`, `smartctl`). `crabmon --watch 'cmd:backup'`
+/// carries `backup` in its own command line, so it matched itself on the
+/// first sample and exited 1 — "it is running" — with no backup in sight.
+/// Found on a real host.
+pub fn without_self(snap: &Snapshot, me: u32) -> Snapshot {
+    let mut judged = snap.clone();
+    judged.procs.retain(|p| p.pid != me && p.ppid != Some(me));
+    judged
+}
+
 pub fn process_rule(query: &str, for_secs: u64) -> AlertRule {
     AlertRule {
         name: format!("watch {query}"),
@@ -385,6 +397,32 @@ mod tests {
         assert_eq!(rule.threshold, 1.0);
         assert!(!rule.below);
         assert_eq!(rule.query, "state:D");
+    }
+
+    #[test]
+    fn a_watch_does_not_count_itself_or_what_it_runs() {
+        use crate::metrics::ProcRow;
+        let row = |pid, ppid, cmd: &str| ProcRow {
+            pid,
+            ppid,
+            name: cmd.split(' ').next().unwrap().into(),
+            cmd: cmd.into(),
+            ..Default::default()
+        };
+        let snap = Snapshot {
+            procs: vec![
+                row(10, Some(1), "crabmon --watch cmd:backup.sh"),
+                row(11, Some(10), "systemctl show"),
+                row(20, Some(1), "/bin/sh backup.sh"),
+            ],
+            ..Default::default()
+        };
+        let judged = without_self(&snap, 10);
+        assert_eq!(judged.procs.iter().map(|p| p.pid).collect::<Vec<_>>(), [20]);
+        let mut e = AlertEngine::new(vec![process_rule("cmd:backup.sh", 0)]);
+        let mut only_me = snap.clone();
+        only_me.procs.truncate(2);
+        assert!(e.evaluate(&without_self(&only_me, 10), 0).is_empty(), "matched itself");
     }
 
     #[test]

@@ -152,6 +152,7 @@ pub fn run(cfg: &crate::config::Config, path: &Path) -> Report {
         pressure(),
         kernel_events(),
         systemd_units(cfg),
+        disk_health(cfg).with_required(cfg.smart.enabled),
         package_power(),
         cgroups(),
         gpu(cfg),
@@ -269,6 +270,51 @@ fn systemd_units(cfg: &crate::config::Config) -> Check {
         Err(e) => Check::new("systemd-units", Status::Unavailable, e).with_remedy(
             "without systemd there are no units to watch, and `kind = \"unit\"` rules measure nothing",
         ),
+    }
+}
+
+fn disk_health(cfg: &crate::config::Config) -> Check {
+    let Some(settings) = cfg.smart.settings() else {
+        return Check::new("disk-health", Status::Unavailable, "[smart] enabled is off")
+            .with_remedy(
+                "set [smart] enabled = true to read SMART through smartctl (needs root, or \
+                 `command = \"sudo -n smartctl\"` with a sudoers rule)",
+            );
+    };
+    match crate::metrics::smart::probe(&settings) {
+        Ok(n) => Check::new(
+            "disk-health",
+            Status::Ok,
+            format!(
+                "SMART read for {n} {}; failing ones are storage rows and `storage` rules",
+                if n == 1 { "disk" } else { "disks" }
+            ),
+        ),
+        Err(e) => {
+            let remedy = smart_remedy(&e);
+            Check::new("disk-health", Status::Unavailable, e).with_remedy(remedy)
+        }
+    }
+}
+
+/// What to do about a SMART failure depends on which one it is: telling root
+/// on a QEMU guest to install smartmontools and run as root is advice that
+/// cannot be followed.
+fn smart_remedy(error: &str) -> &'static str {
+    let e = error.to_ascii_lowercase();
+    if e.contains("no smart support") || e.contains("smart is off") || e.contains("no disks") {
+        "these disks have no SMART to read (virtual, or behind a USB bridge or RAID \
+         controller); name real ones in [smart] devices, or turn [smart] off"
+    } else if e.contains("permission denied")
+        || e.contains("password")
+        || e.contains("operation not permitted")
+    {
+        "reading SMART needs root: run as root, or set [smart] command to \
+         `sudo -n smartctl` with a sudoers rule for it"
+    } else if e.contains("no such file") || e.contains("not found") || e.contains("no json") {
+        "install smartmontools 7.0 or later (`--json` is needed), or point [smart] command at it"
+    } else {
+        "check that `smartctl --json -i -H -A <disk>` works as the user crabmon runs as"
     }
 }
 
@@ -537,8 +583,10 @@ fn alert_rules(cfg: &crate::config::Config) -> Check {
             AlertKind::Cputime if !readable("/proc/stat") => Some("/proc/stat is unreadable"),
             AlertKind::Vm if !readable("/proc/vmstat") => Some("/proc/vmstat is unreadable"),
             AlertKind::Tcp if !readable("/proc/net/snmp") => Some("/proc/net/snmp is unreadable"),
-            AlertKind::Storage if crate::metrics::storage::read().is_empty() => {
-                Some("no md, ZFS or btrfs volumes")
+            AlertKind::Storage
+                if crate::metrics::storage::read().is_empty() && !cfg.smart.enabled =>
+            {
+                Some("no md, ZFS or btrfs volumes, and [smart] is off")
             }
             AlertKind::Unit if !cfg.units.enabled => Some("[units] enabled is off"),
             AlertKind::Unit if !cfg!(target_os = "linux") => Some("systemd needs Linux"),
@@ -568,6 +616,22 @@ fn alert_rules(cfg: &crate::config::Config) -> Check {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn smart_advice_follows_the_error() {
+        assert!(
+            smart_remedy("sda: no SMART support (a virtual or USB-bridged disk)")
+                .contains("devices")
+        );
+        assert!(
+            smart_remedy("nvme0: Smartctl open device: /dev/nvme0 failed: Permission denied")
+                .contains("root")
+        );
+        assert!(smart_remedy("sudo: a password is required").contains("sudoers"));
+        assert!(
+            smart_remedy("smartctl: No such file or directory (os error 2)").contains("install")
+        );
+    }
+
     use super::*;
     use crate::config::Config;
 

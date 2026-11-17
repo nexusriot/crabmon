@@ -12,6 +12,12 @@ use std::time::Duration;
 
 use crate::metrics::{MetricSource, Snapshot};
 
+/// Whether a `--remote-command` asks crabmon to stream: `--stream` as a word
+/// of its own, `/opt/bin/crabmon --stream --refresh 1000`.
+pub fn command_streams(command: &str) -> bool {
+    command.split_whitespace().any(|w| w == "--stream")
+}
+
 /// What the far end runs when it is only asked for a single frame.
 pub const ONE_SHOT_COMMAND: &str = "crabmon --once --refresh 200 --format json --top 0 --filter=''";
 
@@ -77,9 +83,12 @@ pub struct RemoteSource {
     target: String,
     /// The command run on the far end; overridable for a non-standard path.
     remote_command: String,
-    /// Set when the command was chosen by us and may be swapped for the
-    /// one-shot form. An explicit `--remote-command` is never second-guessed.
+    /// Read the command's output as a stream of frames rather than one.
     stream_wanted: bool,
+    /// The command was chosen by us and may be swapped for the one-shot form
+    /// when the far end is too old to stream. An explicit `--remote-command`
+    /// is never second-guessed.
+    may_fall_back: bool,
     ssh_options: Vec<String>,
     stream: Option<Stream>,
     /// Earliest a dropped stream may be reopened, and how many times in a row
@@ -207,11 +216,18 @@ fn forward_frames(reader: impl BufRead, tx: mpsc::SyncSender<Result<Snapshot, St
 }
 
 impl RemoteSource {
+    /// A process per sample, or — when an explicit command asks for
+    /// `--stream` — one session read as a stream. That is the only way to
+    /// reach a crabmon that is not on the far end's `PATH`, and running such
+    /// a command as a one-shot waited 15 s for an exit that never comes, on
+    /// every sample, reporting "no answer". Found against a real host.
     pub fn new(target: &str, remote_command: Option<String>, ssh_options: Vec<String>) -> Self {
+        let streams = remote_command.as_deref().is_some_and(command_streams);
         RemoteSource {
             target: target.to_string(),
             remote_command: remote_command.unwrap_or_else(|| ONE_SHOT_COMMAND.to_string()),
-            stream_wanted: false,
+            stream_wanted: streams,
+            may_fall_back: false,
             ssh_options,
             stream: None,
             retry_at: None,
@@ -228,6 +244,7 @@ impl RemoteSource {
         RemoteSource {
             remote_command: stream_command(refresh_ms),
             stream_wanted: true,
+            may_fall_back: true,
             ..RemoteSource::new(target, None, ssh_options)
         }
     }
@@ -287,9 +304,10 @@ impl RemoteSource {
                     Ok(Err(e)) => {
                         // A stale crabmon on the far end: drop to one frame per
                         // sample rather than showing nothing at all.
-                        if self.stream_wanted && is_unsupported_flag(&e) {
+                        if self.may_fall_back && is_unsupported_flag(&e) {
                             self.remote_command = ONE_SHOT_COMMAND.to_string();
                             self.stream_wanted = false;
+                            self.may_fall_back = false;
                         } else {
                             self.last_error = Some(format!("{}: {e}", self.target));
                         }
@@ -611,6 +629,24 @@ mod tests {
         let src = RemoteSource::new("host", Some("/opt/crabmon --once".into()), vec![]);
         assert_eq!(src.command(), "/opt/crabmon --once");
         assert!(!src.stream_wanted, "an explicit command must not be swapped out");
+    }
+
+    #[test]
+    fn an_explicit_streaming_command_is_read_as_a_stream_and_kept() {
+        let cmd = "/tmp/cm/crabmon --stream --refresh 1000 --config /tmp/cm/cfg.toml";
+        let mut src = RemoteSource::new("host", Some(cmd.into()), vec![]);
+        assert!(src.stream_wanted, "a --stream command never exits; it is not a one-shot");
+        assert!(!command_streams("/opt/crabmon --once --streaming-is-not-this"));
+
+        // Even a far end that refuses the flag keeps the command it was given.
+        let (tx, rx) = mpsc::channel();
+        tx.send(Err("crabmon: unknown option: --stream".to_string())).unwrap();
+        drop(tx);
+        let child = Command::new("true").spawn().unwrap();
+        src.stream = Some(Stream { child, frames: rx });
+        assert!(src.drain_stream().is_none());
+        assert_eq!(src.command(), cmd);
+        assert!(src.last_error.is_some(), "and says why it has no frames");
     }
 
     #[test]

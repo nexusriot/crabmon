@@ -1279,6 +1279,67 @@ fn the_fleet_sorts_by_column_and_the_cursor_stays_on_its_host() {
     assert_eq!(a.cfg.sort_by, common::config().sort_by);
 }
 
+/// A fleet opens on the fleet table and `Enter` switches to a host's
+/// dashboard. Saving either used to leave `layout = "fleet"` in the config,
+/// so the next plain `crabmon` opened on an empty "no fleet" table.
+#[test]
+fn a_fleet_session_saves_the_layout_it_started_with() {
+    use crabmon::ui::Layout;
+    let path =
+        std::env::temp_dir().join(format!("crabmon-fleet-layout-{}.toml", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    let mut cfg = common::config();
+    cfg.layout = Layout::Processes;
+    let mut a = fleet_app_with(cfg, &[("web-1", 10.0), ("db-1", 90.0)]);
+    a.config_path = Some(path.clone());
+    // What `main` does for a fleet started without `--layout`.
+    a.cfg.layout = Layout::Fleet;
+    a.tick();
+    a.persist();
+    assert_eq!(crabmon::config::load_from(&path).layout, Layout::Processes);
+
+    // Opening a host is not a choice of layout either.
+    a.set_fleet_page(10, 2);
+    a.on_key(code(KeyCode::Enter));
+    assert_eq!(a.cfg.layout, Layout::Dashboard);
+    a.persist();
+    assert_eq!(crabmon::config::load_from(&path).layout, Layout::Processes);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn the_fleet_layout_is_never_saved_even_when_asked_for() {
+    use crabmon::ui::Layout;
+    let path =
+        std::env::temp_dir().join(format!("crabmon-fleet-asked-{}.toml", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    // `crabmon -l fleet` with no hosts, and the same with a fleet.
+    for fleet in [false, true] {
+        let mut cfg = common::config();
+        cfg.layout = Layout::Fleet;
+        let mut a = if fleet {
+            fleet_app_with(cfg, &[("web-1", 10.0)])
+        } else {
+            crabmon::App::new(cfg, Box::new(FakeSource::single(snapshot())))
+        };
+        a.config_path = Some(path.clone());
+        a.persist();
+        assert_eq!(crabmon::config::load_from(&path).layout, Layout::Dashboard, "fleet={fleet}");
+    }
+
+    // Outside a fleet a layout chosen with Tab is still remembered.
+    let mut a = app();
+    a.config_path = Some(path.clone());
+    a.on_key(code(KeyCode::Tab));
+    let chosen = a.cfg.layout;
+    assert_ne!(chosen, Layout::Dashboard);
+    a.persist();
+    assert_eq!(crabmon::config::load_from(&path).layout, chosen);
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn a_single_host_run_has_no_fleet_and_no_fleet_layout_in_the_way() {
     // Everything about `--remote box` has to go on working exactly as before,
@@ -1771,4 +1832,133 @@ fn a_journal_read_for_the_popup_is_redacted_unless_switched_off() {
     a.unit_journal = leaky;
     a.on_key(key('u'));
     assert_eq!(a.unit_log, ["api: db password=hunter2 rejected"], "asked for raw lines");
+}
+
+// ------------------------------------------------------------------ events
+
+/// The timeline is built from consecutive snapshots: a unit that fails and
+/// recovers is two events, and a rule that fires is one, each once.
+#[test]
+fn the_events_timeline_follows_units_and_rules_across_ticks() {
+    use crabmon::metrics::units::{UnitHealth, UnitState};
+    let failed = UnitHealth {
+        name: "db.service".into(),
+        active: "failed".into(),
+        result: "exit-code".into(),
+        state: UnitState::Failed,
+        ..Default::default()
+    };
+    let mut quiet = snapshot();
+    quiet.units_unreadable = None;
+    quiet.units = vec![];
+    let mut broken = quiet.clone();
+    broken.units = vec![failed];
+    broken.taken_at_unix += 1;
+    let mut fixed = quiet.clone();
+    fixed.taken_at_unix += 2;
+
+    let mut cfg = common::config();
+    cfg.alerts = vec![crabmon::watch::parse_rule("unit:failed>=1", 0).unwrap()];
+    // `App::new` takes the first frame itself.
+    let frames = vec![quiet.clone(), quiet, broken, fixed];
+    let mut a = crabmon::App::new(cfg, Box::new(FakeSource::new(frames)));
+    a.tick();
+    assert!(a.events.is_empty(), "{:?}", a.events.newest_first().collect::<Vec<_>>());
+    a.tick();
+    let sources: Vec<_> = a.events.newest_first().map(|e| e.source.label()).collect();
+    assert!(sources.contains(&"unit") && sources.contains(&"alert"), "{sources:?}");
+    let n = a.events.len();
+    a.tick();
+    let texts: Vec<_> = a.events.newest_first().map(|e| e.text.clone()).collect();
+    assert!(texts.iter().any(|t| t == "db.service ok"), "{texts:?}");
+    assert!(texts.iter().any(|t| t.contains("cleared")), "{texts:?}");
+    assert_eq!(a.events.len(), n + 2, "{texts:?}");
+
+    a.on_key(key('E'));
+    assert_eq!(a.mode, Mode::Events);
+    a.on_key(code(KeyCode::Esc));
+    assert_eq!(a.mode, Mode::Normal);
+}
+
+/// A host that is down from the start is the first thing a fleet's timeline
+/// should say. It used to be skipped as "still connecting" for ever, because
+/// it had never answered. Found against a real fleet with a bad hostname.
+#[test]
+fn a_fleet_host_down_from_the_start_is_in_the_timeline() {
+    use crabmon::fleet::FleetSource;
+    use crabmon::metrics::{MetricSource, Snapshot};
+    use std::time::Duration;
+
+    struct Down;
+    impl MetricSource for Down {
+        fn snapshot(&mut self, _dt: Duration) -> Snapshot {
+            Snapshot::default()
+        }
+        fn error(&self) -> Option<String> {
+            Some("ssh: Could not resolve hostname nohost.invalid".into())
+        }
+    }
+    let up: Box<dyn MetricSource> = Box::new(FakeSource::single(snapshot()));
+    let down: Box<dyn MetricSource> = Box::new(Down);
+    let mut a = crabmon::App::new(
+        common::config(),
+        Box::new(FleetSource::new(vec![("web-1".into(), up), ("nohost.invalid".into(), down)])),
+    );
+    a.tick();
+    a.tick();
+    let events: Vec<_> = a.events.newest_first().filter(|e| e.host == "nohost.invalid").collect();
+    assert_eq!(events.len(), 1, "once, not every tick: {events:?}");
+    assert!(events[0].text.starts_with("not answering: ssh: Could not resolve"), "{events:?}");
+    assert!(
+        !a.events.newest_first().any(|e| e.host == "web-1" && e.source.label() == "host"),
+        "a host that answers is not news"
+    );
+}
+
+/// Stepping through an incident with `]` is watching it: the timeline keeps
+/// what it saw. A jump starts again from the frame landed on, which is
+/// observed at once rather than leaving the timeline empty until play
+/// resumes. Found on a real recording.
+#[test]
+fn stepping_a_replay_keeps_the_timeline_and_a_jump_restarts_it() {
+    use crabmon::metrics::units::{UnitHealth, UnitState};
+    let failed = UnitHealth {
+        name: "db.service".into(),
+        active: "failed".into(),
+        state: UnitState::Failed,
+        ..Default::default()
+    };
+    let frame = |at: u64, units: Vec<UnitHealth>| {
+        let mut s = snapshot();
+        s.taken_at_unix = at;
+        s.units_unreadable = None;
+        s.units = units;
+        s
+    };
+    let frames = vec![
+        frame(100, vec![]),
+        frame(101, vec![]),
+        frame(102, vec![failed.clone()]),
+        frame(103, vec![]),
+    ];
+    let source = crabmon::record::ReplaySource::from_frames(frames, "run.jsonl");
+    let mut a = crabmon::App::new(common::config(), Box::new(source));
+    let texts =
+        |a: &crabmon::App| a.events.newest_first().map(|e| e.text.clone()).collect::<Vec<_>>();
+
+    // Ten back, clamped to the first frame: a jump.
+    a.on_key(key('{'));
+    assert_eq!(a.snap.taken_at_unix, 100);
+    assert!(a.events.is_empty(), "{:?}", texts(&a));
+    a.on_key(key(']'));
+    a.on_key(key(']'));
+    assert_eq!(a.snap.taken_at_unix, 102);
+    assert_eq!(texts(&a), ["db.service failed"], "a step is watched, not a jump");
+    a.on_key(key(']'));
+    assert_eq!(texts(&a), ["db.service ok", "db.service failed"]);
+
+    // Back one frame is a jump: the timeline starts again from there, with
+    // what is already wrong said as such.
+    a.on_key(key('['));
+    assert_eq!(texts(&a), ["db.service failed (at start)"]);
 }

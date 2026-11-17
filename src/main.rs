@@ -67,8 +67,9 @@ fn main() -> Result<()> {
         eprintln!("crabmon: {}: {e}", path.display());
         std::process::exit(2);
     }
-    // The headless modes. `cli::parse` refuses to combine any of them with
-    // `--remote` or `--replay`, so each one here samples this host.
+    // The headless modes. `cli::parse` refuses to combine `--once`,
+    // `--stream` and `--watch` with `--remote` or `--replay`, so those sample
+    // this host; `--serve` may take `--remote` and exports a fleet.
     if let Some((a, b)) = &args.diff {
         return print_diff(a, b.as_deref(), &args);
     }
@@ -116,7 +117,8 @@ fn live_source(cfg: &Config) -> Result<SysinfoSource> {
     )?
     .with_fds(cfg.procs.fds)
     .with_pss(cfg.procs.pss)
-    .with_units(cfg.units.settings()))
+    .with_units(cfg.units.settings())
+    .with_smart(cfg.smart.settings()))
 }
 
 /// Where snapshots come from: a recording, another host, or this one.
@@ -327,10 +329,11 @@ fn watch_for(rule: crabmon::alerts::AlertRule, cfg: &Config, args: &Args) -> Res
         let now = Instant::now();
         // The engine's hold time is in seconds since the watch started, which
         // is the same clock `--watch-for` is quoted in.
-        let active = engine.evaluate(&snap, now.duration_since(started).as_secs());
+        let judged = crabmon::watch::without_self(&snap, std::process::id());
+        let active = engine.evaluate(&judged, now.duration_since(started).as_secs());
         if let Some(alert) = active.into_iter().next() {
             let rows = match &rows_of {
-                Some(f) => snap.procs.iter().filter(|p| f.matches(p)).cloned().collect(),
+                Some(f) => judged.procs.iter().filter(|p| f.matches(p)).cloned().collect(),
                 None => Vec::new(),
             };
             break (crabmon::watch::Outcome::Matched(rows), Some(alert), snap);
@@ -573,13 +576,10 @@ fn report(obs: crabmon::supervisor::Observation, notify: &[crabmon::notify::Noti
     for note in obs.notes {
         eprintln!("crabmon: {note}");
     }
-    // A silenced rule is still said, as silenced: the same line with nothing
-    // to tell it apart read as a rule paging nobody for no reason.
-    for alert in &obs.active {
-        match &alert.silenced {
-            Some(why) => eprintln!("crabmon: {} ({why})", alert.message),
-            None => eprintln!("crabmon: {}", alert.message),
-        }
+    // Only what changed: a rule starting to fire, its silence beginning or
+    // ending (a silenced rule is said as silenced), and its recovery.
+    for line in obs.changes {
+        eprintln!("crabmon: {line}");
     }
     for err in supervisor::spawn_hooks(&obs.commands) {
         eprintln!("crabmon: {err}");

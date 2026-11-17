@@ -552,6 +552,7 @@ fn a_degraded_array_is_named_in_the_disks_title_and_listed_first() {
             progress: Some(12.6),
             activity: Some("recovery".into()),
             errors: None,
+            smart: None,
         },
         StorageArray {
             kind: "zfs".into(),
@@ -568,6 +569,56 @@ fn a_degraded_array_is_named_in_the_disks_title_and_listed_first() {
     assert!(s.contains("md0 raid1 rebuilding [2/1] [U_] recovery 12.6%"), "{s}");
     assert!(s.contains("tank zfs ok ONLINE"), "{s}");
     assert!(!s.contains("tank ok,"), "a healthy pool is not in the warning:\n{s}");
+}
+
+/// A healthy SMART disk is not news and waits for room after the mounts; a
+/// failing one goes up with the arrays and into the title.
+#[test]
+fn smart_disks_are_drawn_failing_first_and_healthy_last() {
+    use crabmon::metrics::storage::{ArrayState, StorageArray};
+    let disk = |name: &str, state, detail: &str| StorageArray {
+        kind: "smart".into(),
+        name: name.into(),
+        level: "WDC WD40EFRX".into(),
+        state,
+        detail: detail.into(),
+        ..Default::default()
+    };
+    let mut snap = snapshot();
+    snap.storage = vec![
+        disk("sdb", ArrayState::Degraded, "8 reallocated 38°C"),
+        disk("sda", ArrayState::Healthy, "36°C"),
+    ];
+    let mut a = crabmon::App::new(common::config(), Box::new(FakeSource::single(snap)));
+    a.tick();
+    let lines = render(&mut a, 160, 48);
+    let s = lines.join("\n");
+    assert!(s.contains("! sdb degraded"), "no warning in the title:\n{s}");
+    assert!(!s.contains("sda ok,"), "a healthy disk is not in the warning:\n{s}");
+    let row = |needle: &str| lines.iter().position(|l| l.contains(needle));
+    let failing = row("sdb WDC WD40EFRX degraded 8 reallocated").expect("failing disk drawn");
+    let healthy = row("sda WDC WD40EFRX ok 36°C").expect("healthy disk drawn with room to spare");
+    let mount = row("/boot").expect("a mount drawn");
+    assert!(failing < mount && mount < healthy, "order: {failing} {mount} {healthy}\n{s}");
+}
+
+/// `E` lists what happened, newest first.
+#[test]
+fn the_events_popup_lists_what_happened() {
+    let mut a = app();
+    a.tick();
+    let s = screen(&mut a, 160, 48);
+    assert!(!s.contains("Events"), "{s}");
+    a.on_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('E'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    let s = screen(&mut a, 160, 48);
+    assert!(s.contains("nothing has happened yet"), "{s}");
+    a.apply_silence(crabmon::silence::SilenceRequest::For { secs: 600, rule: None });
+    let s = screen(&mut a, 160, 48);
+    assert!(s.contains("Events · newest first"), "{s}");
+    assert!(s.contains("action") && s.contains("silenced every rule until"), "{s}");
 }
 
 #[test]

@@ -20,6 +20,7 @@ pub mod procdetail;
 pub mod procgroup;
 pub mod psi;
 pub mod smaps;
+pub mod smart;
 pub mod sockets;
 pub mod storage;
 pub mod sysinfo_source;
@@ -403,6 +404,11 @@ pub struct Snapshot {
     /// md arrays, ZFS pools and btrfs filesystems, worst first. Empty on a
     /// machine with none, which is most of them.
     pub storage: Vec<storage::StorageArray>,
+    /// Why `[smart]` produced no disks, when it is on and could read none —
+    /// so a machine whose disks crabmon may not open does not read as one
+    /// with healthy disks. `None` when SMART is off or something was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smart_unreadable: Option<String>,
     /// systemd services that have failed, are restarting, or have restarted:
     /// worst first. Empty where systemd is not running or not readable,
     /// which `units_unreadable` tells apart from a healthy machine.
@@ -416,6 +422,16 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Processes rather than tasks: on Linux the sampler reports every thread
+    /// as a row of its own, and a real process is the row with a task count.
+    /// Where nothing reports one, every row is a process. A fleet's PROCS
+    /// column and `--diff` counted threads — 286 "processes" on a VPS running
+    /// 138, and a crabmon thread "started" in a diff. Found on a real host.
+    pub fn processes(&self) -> impl Iterator<Item = &ProcRow> {
+        let distinguishable = self.procs.iter().any(|p| p.threads.is_some());
+        self.procs.iter().filter(move |p| !distinguishable || p.threads.is_some())
+    }
+
     /// A unit's health by its id, `nginx.service`.
     pub fn unit(&self, name: &str) -> Option<&units::UnitHealth> {
         self.units.iter().find(|u| u.name == name)

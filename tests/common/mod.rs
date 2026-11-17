@@ -282,6 +282,7 @@ pub fn snapshot() -> Snapshot {
             in_errs_ps: 0.0,
         }),
         storage: Vec::new(),
+        smart_unreadable: None,
         units: Vec::new(),
         units_unreadable: None,
         taken_at_unix: 1_788_297_407,

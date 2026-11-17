@@ -74,21 +74,20 @@ fn identity(p: &ProcRow) -> (u32, u64) {
 
 pub fn compare(before: &Snapshot, after: &Snapshot) -> Diff {
     let before_by_id: std::collections::HashMap<(u32, u64), &ProcRow> =
-        before.procs.iter().map(|p| (identity(p), p)).collect();
+        before.processes().map(|p| (identity(p), p)).collect();
     let after_by_id: std::collections::HashMap<(u32, u64), &ProcRow> =
-        after.procs.iter().map(|p| (identity(p), p)).collect();
+        after.processes().map(|p| (identity(p), p)).collect();
 
     let mut appeared: Vec<ProcRow> =
-        after.procs.iter().filter(|p| !before_by_id.contains_key(&identity(p))).cloned().collect();
+        after.processes().filter(|p| !before_by_id.contains_key(&identity(p))).cloned().collect();
     appeared.sort_by_key(|a| std::cmp::Reverse(a.mem));
 
     let mut vanished: Vec<ProcRow> =
-        before.procs.iter().filter(|p| !after_by_id.contains_key(&identity(p))).cloned().collect();
+        before.processes().filter(|p| !after_by_id.contains_key(&identity(p))).cloned().collect();
     vanished.sort_by_key(|a| std::cmp::Reverse(a.mem));
 
     let mut movers: Vec<ProcDelta> = after
-        .procs
-        .iter()
+        .processes()
         .filter_map(|p| {
             before_by_id.get(&identity(p)).map(|was| ProcDelta {
                 pid: p.pid,
@@ -127,7 +126,7 @@ pub fn compare(before: &Snapshot, after: &Snapshot) -> Diff {
         load1: (before.host.load[0], after.host.load[0]),
         mem_used: (before.mem.used, after.mem.used),
         swap_used: (before.mem.swap_used, after.mem.swap_used),
-        procs: (before.procs.len(), after.procs.len()),
+        procs: (before.processes().count(), after.processes().count()),
         appeared,
         vanished,
         movers,
@@ -423,6 +422,27 @@ mod tests {
         assert_eq!(d.movers.len(), 1);
         assert_eq!(d.movers[0].mem_delta(), 800);
         assert_eq!(d.movers[0].cpu_delta(), 8.0);
+    }
+
+    /// A thread starting is not a process starting. Found on a real host,
+    /// where a crabmon thread was listed as started and counted in `procs`.
+    #[test]
+    fn threads_are_not_processes_in_a_diff() {
+        let process = |pid, threads| ProcRow {
+            threads: Some(threads),
+            ..row(pid, pid as u64, "app", 0.0, 10)
+        };
+        let thread = |pid| ProcRow { threads: None, ..row(pid, pid as u64, "app-worker", 0.0, 10) };
+        let before = snap(100, vec![process(1, 1)]);
+        let after = snap(160, vec![process(1, 3), thread(2), thread(3), process(4, 1)]);
+        let d = compare(&before, &after);
+        assert_eq!(d.procs, (1, 2));
+        assert_eq!(d.appeared.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![4]);
+        // Where nothing reports a task count, every row is a process.
+        let d =
+            compare(&snap(1, vec![row(1, 1, "a", 0.0, 1)]), &snap(2, vec![row(2, 2, "b", 0.0, 1)]));
+        assert_eq!(d.procs, (1, 1));
+        assert_eq!(d.appeared.len(), 1);
     }
 
     #[test]

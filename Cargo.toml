@@ -62,7 +62,8 @@ in bulk, network and disk throughput charts, per-container network, \
 temperature sensors, GPU, cgroup, pressure-stall and battery panels, \
 threshold alerts with recovery hooks that also run headlessly, notifications \
 to Slack, Discord, ntfy or a webhook, failed and crash-looping systemd \
-service detection, JSON/CSV snapshot export, snapshot diffing, a headless \
+service detection, opt-in SMART disk health, an events timeline of \
+alerts, kernel events and state changes, JSON/CSV snapshot export, snapshot diffing, a headless \
 watch mode for processes or any measured condition, session recording and \
 replay with a timeline of alerts and kernel events, with or without a \
 terminal, a Prometheus exporter and streaming remote monitoring over SSH of \

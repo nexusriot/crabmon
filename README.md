@@ -157,8 +157,35 @@ interface as drawn rather than a description of it:
   the panel title, where a short panel cannot cut it off. Read from
   `/proc/mdstat`, ZFS's per-pool `state` and btrfs's per-device
   `error_stats` and `missing`, none of which needs root. A routine check or
-  scrub of a complete array is shown as progress, not trouble. SMART is out
-  of reach without root; block-layer IO errors are in the kernel panel.
+  scrub of a complete array is shown as progress, not trouble. Block-layer IO
+  errors are in the kernel panel.
+- **Disk health (SMART)** — the earlier warning: a disk remapping sectors,
+  with sectors pending a rewrite or uncorrectable, an NVMe with media errors,
+  a critical warning, spare capacity under its threshold or its rated
+  endurance used up, and any disk whose own self-assessment says FAILING.
+  `[smart] enabled` reads every disk `smartctl --scan` finds (or
+  `devices`) every ten minutes on a thread of its own, with `-n standby` so a
+  spun-down disk is left asleep and keeps its last reading. Each disk joins
+  the storage rows as kind `smart` — `sdb WDC WD40EFRX degraded 8 reallocated
+  38°C` — so a failing disk is in the Disks title, fires `kind = "storage"`
+  rules, travels over `--remote` and into recordings, and is exported as
+  `crabmon_storage_degraded{kind="smart"}` beside `crabmon_smart_temperature_celsius`,
+  `crabmon_smart_wear_percent`, `crabmon_smart_reallocated_sectors` and the
+  rest. Healthy disks fill whatever room the Disks panel has left. SMART
+  needs root (or `command = "sudo -n smartctl"` with a sudoers rule for that
+  binary), so it is opt-in, and a disk that cannot be opened is reported as
+  unreadable — by `--doctor` and in JSON as `smart_unreadable` — never as
+  healthy. So is a disk with no SMART to give: a virtual disk, or one behind a
+  USB bridge, which smartctl answers for with a placeholder 0°C.
+- **Events timeline** — `E` lists what happened, newest first, in one place:
+  rules firing and clearing, kernel events (OOM kills, segfaults, IO errors),
+  units failing, restarting and recovering, arrays and disks changing state,
+  fleet hosts that stop and start answering, and every signal, renice, unit
+  restart and silence set from the interface — with the time in UTC, how long
+  before the frame on screen, and in a fleet the host. A unit or disk already
+  in trouble when crabmon starts is listed "(at start)". It is worked out from
+  the samples crabmon already takes, so a replay rebuilds it from the
+  recording and a fleet's hosts need nothing new; the last 500 are kept.
 - **Crash-looping services** — a service with `Restart=on-failure` that
   dies on startup lives a second at a time, so at almost every sample there
   is nothing running under it: no row in the grouped view, and a
@@ -240,7 +267,8 @@ interface as drawn rather than a description of it:
   TUI, or run `crabmon --once` headless. `--format text` is the `top -b -n1`
   shape, laid out by the same column planner the interface uses, for when the
   question is "what is this box doing" over SSH and `jq` is not the answer.
-  A `units` line names any service that has failed or is crash-looping.
+  A `units` line names any service that has failed or is crash-looping, and
+  a `storage` line any array or disk that is degraded, rebuilding or failed.
 - **Record & replay** — `--record` writes every sample to a JSONL file (trimmed
   to keep it a sane size) and `--replay` drives the whole UI from one, so "send
   me a recording of the slowdown" is a workable bug report. `--record-rotate`
@@ -271,8 +299,8 @@ interface as drawn rather than a description of it:
   throttling, OOM kills and pressure, load, disks, interfaces, sensors, pressure, power and GPU, plus the busiest
   processes (capped, and configurable), including per-device utilisation and
   request latency and, where `[procs] fds` is on, per-process descriptor counts
-  against their limits. A scrape carries every command line on the machine, so
-  `[serve] token` (or `CRABMON_SERVE_TOKEN`) can require an
+  against their limits. A scrape names the busiest processes and their PIDs
+  (never their arguments), so `[serve] token` (or `CRABMON_SERVE_TOKEN`) can require an
   `Authorization: Bearer` header before crabmon will answer with any of it;
   `/healthz` stays open, because a liveness probe that needs a credential is a
   liveness probe that gets switched off. `--serve unix:/run/crabmon.sock`
@@ -378,16 +406,16 @@ run of stuck workers.
 | `--no-color` | Disable colour (same as `--theme mono`) |
 | `--no-mouse` | Do not capture mouse events |
 | `-1`, `--once` | Print one snapshot and exit (this host only) |
-| `--format <FMT>` | `json` (default), `csv` or `text` for `--once` and `--watch`; `--diff` renders `json`, `csv` or text |
+| `--format <FMT>` | `json` (default), `csv` or `text` for `--once` and `--watch`; `--diff` renders `json`, `csv` or text; `--doctor` takes `json` |
 | `-n`, `--top <N>` | Limit `--once` and `P` snapshot output to the top N processes |
 | `-c`, `--config <PATH>` | Use an alternate config file |
 | `-g`, `--group <BY>` | Group processes: `none`, `service`, `container`, `user` |
 | `--columns <LIST>` | Process-table columns, e.g. `pid,user,cpu,mem,name` |
 | `--record <PATH>` | Record every sample to a JSONL file, replacing it if it exists; works headless too |
-| `--record-rotate <DIR>` | Keep a rotating recording in DIR: `[record] rotate_keep` segments of `rotate_frames` frames, oldest deleted; works headless too |
+| `--record-rotate <DIR>` | Keep a rotating recording in DIR (made if missing; not a directory is an error at start): `[record] rotate_keep` segments of `rotate_frames` frames (1800 if unset), oldest deleted; works headless too |
 | `--replay <PATH>` | Replay a recording instead of sampling this host |
 | `--remote <TARGET>` | Monitor TARGET over SSH; comma-separated for a fleet, `@name` for a `[[fleet]]` group |
-| `--remote-command <C>` | Command to run on the remote host |
+| `--remote-command <C>` | Command to run on the remote host, e.g. `/opt/crabmon/bin/crabmon --stream`; one containing `--stream` is read as a stream, anything else must print one frame and exit |
 | `--ssh-option <OPT>` | Pass `-o OPT` to `ssh` for `--remote`, e.g. `Port=2222`; repeatable; overrides `[remote] ssh_options`, `~/.ssh/config` and the default `ConnectTimeout=5`, but not `BatchMode=yes` |
 | `--serve <ADDR>` | Serve Prometheus metrics on ADDR (`:9100` or `unix:/path.sock`), headless; with `--remote`, a whole fleet |
 | `--stream` | Print one JSON snapshot per line forever (this host only) |
@@ -442,9 +470,10 @@ run of stuck workers.
 | `A` | CPU affinity *(Linux)* |
 | `I` | IO priority (ionice) *(Linux)* |
 | `P` | Export a snapshot |
-| `u` | A systemd unit: its state and journal; `r` restart, `x` reset-failed, `l` reload |
+| `u` | A systemd unit: its state and journal; `r` restart, `x` reset-failed, `l` re-read the journal |
 | `S` | Silence alert rules for a while: `1h`, `30m <rule>`, `off` (also in the `!` popup) |
 | `!` | Active alerts and the rules behind them |
+| `E` | Events timeline: alerts, kernel events, unit and disk changes, hosts and actions, newest first |
 | `Ctrl-R` | Reload the config file, keeping the session |
 | `?`, `F1` | Show all key bindings |
 | mouse wheel | Scroll the process list |
@@ -491,7 +520,7 @@ standalone `|` is OR and binds looser than the implicit AND, so `a b | c` means
 `(a AND b) OR c`.
 
 ```
-firefox            name contains "firefox"
+firefox            name contains "firefox" (name:firefox says the same)
 !kworker           name does not contain "kworker"
 nginx | apache     either one
 user:vlad          user name contains "vlad"
@@ -516,7 +545,9 @@ uss>100M           unique set size — what killing it would free
 
 Only a `|` with whitespace on both sides is an operator, so
 `re:^chrom(e|ium)$` is still one regular expression rather than two broken
-queries.
+queries. A `word:value` term whose word is not one of the fields above is an
+error naming them, rather than a search for a process called `nmae:x`; a name
+that merely contains a colon (`kworker/u8:2`, `sshd:`) is still a name.
 
 A process that does not report a value never satisfies a comparison on it: a
 thread has no thread count, and another user's process reports no descriptors.
@@ -678,9 +709,13 @@ four gigabytes.
 crabmon --watch 'state:D' --watch-for 30 --watch-timeout 600 || notify-send 'stuck IO'
 ```
 
-`--watch` samples headlessly until the query matches. It exits **1** when it
-does, printing the matching processes, and **0** if `--watch-timeout` elapses
-first. A match is the *non-zero* exit, so it is `||` that runs on a match and
+`--watch` samples headlessly until the query matches, leaving itself and
+whatever it runs out of the count — its own command line carries the query.
+It exits **1** when it
+does, printing the matching processes, **0** if `--watch-timeout` elapses
+first, and **2** if the watch cannot run at all — a malformed query or rule, a
+mount crabmon does not measure, a `unit` or `kernel` source it cannot read —
+so a typo is never mistaken for a match by `||`. A match is the *non-zero* exit, so it is `||` that runs on a match and
 `&&` that runs on a clean run — the shell's convention, where zero means
 nothing went wrong. `--watch-for` requires the match to hold that many
 *consecutive* seconds, so a condition that flickers once a minute does not
@@ -696,14 +731,15 @@ crabmon --watch-rule 'proc:nginx<1' --watch-timeout 0 && echo 'nginx came back'
 
 `EXPR` is `kind[:target]op value`, where `kind` is any alert kind — `cpu`,
 `mem`, `swap`, `load`, `disk`, `temp`, `gpu`, `psi`, `io`, `net`, `fd`, `proc`,
-`trend`, `fillin`, `cgroup`, `kernel`.
+`trend`, `fillin`, `cgroup`, `kernel`, `cputime`, `vm`, `throttle`, `oomkill`,
+`tcp`, `storage`, `unit`.
 `>` and `>=` both mean at-or-over and `<` means strictly under, matching the
 way an `[[alert]]` compares; `<=` is refused rather than quietly read as `<`.
 The operator is taken from the right, so a `proc` query may contain one of its
 own: `proc:cpu>5<1` is "fewer than one process over 5% CPU".
 
-The threshold is read in the kind's own units: `net` and `trend` take the
-filter language's size suffixes (`net>=1M`, `trend:postgres>200M`), `fillin`
+The threshold is read in the kind's own units: `net`, `vm` and `trend` take
+the filter language's size suffixes (`net>=1M`, `trend:postgres>200M`), `fillin`
 takes durations (`fillin:/var<3h`), and everything else is a plain number — a
 percentage, a temperature, a load average or a count.
 
@@ -769,7 +805,10 @@ The `[[alert]]` rules, their hooks and the flight recorder used to run only in
 the full-screen interface — which made the flight recorder, whose whole point
 is to have a recording of an incident nobody predicted, depend on someone
 watching at the moment it happened. `--alerts` runs them under `--serve` and
-`--stream` instead.
+`--stream` instead. Standard error says when a rule starts firing, when its
+silence begins or ends, and when it recovers — once each, not on every sample
+in between, so a rule firing for a day under a 15-second scrape does not write
+thousands of identical lines into the journal.
 
 Under `--serve` each rule is also exported, firing or not:
 
@@ -858,9 +897,13 @@ crabmon --stream --refresh 5000 | while read -r frame; do ... ; done
 
 Settings live at `$XDG_CONFIG_HOME/crabmon/config.toml`, typically
 `~/.config/crabmon/config.toml`. The file is written when the refresh interval
-changes and on exit — except for the active filter, which is session state and
-is never written back, so a query typed at `/` cannot silently narrow later
-runs. Missing or malformed files fall back to defaults, and out-of-range values
+changes and on exit, and the options given on the command line of an
+interactive session (`-r`, `-s`, `--theme`/`--no-color`, `--columns`, `-l`,
+`-t`, `-g`, …) are saved with it — except for the active filter, which is
+session state and is never written back, so a query typed at `/` cannot
+silently narrow later runs, and the layout of a fleet session, which keeps
+the layout the file had (the fleet table itself is never saved). A file that
+did not parse is never written over. Missing or malformed files fall back to defaults, and out-of-range values
 are clamped rather than rejected — except `[[notify]]` and `[[silence]]` entries
 that cannot work, which stop crabmon at start (and fail `--doctor`).
 
@@ -932,6 +975,14 @@ crash_loop = 3              # automatic restarts within window_secs that make a 
 window_secs = 600
 redact_logs = true          # hide credential values in units' journal lines
 
+[smart]
+# Disk health from SMART, through smartctl (smartmontools 7.0+) on a thread of
+# its own. Off by default: reading SMART needs root, or a sudoers rule.
+enabled = false
+command = "smartctl"        # or "sudo -n smartctl"; split on whitespace
+devices = []                # e.g. ["/dev/sda", "/dev/nvme0"]; empty = smartctl --scan
+interval_secs = 600         # at least 60; a disk in standby is not woken
+
 [remote]
 # Hold one SSH session open and read a stream of frames instead of starting a
 # process per sample. Falls back automatically if the far end predates --stream.
@@ -957,14 +1008,16 @@ top_n = 100                 # processes kept per frame; 0 keeps all (~1.5 MB/fra
 omit_paths = false          # drop command lines, exe and cwd entirely
 redact_commands = true      # hide credential arguments before truncating
 max_cmd_len = 200           # truncate argv; Chromium's runs to kilobytes
-flight = 0                  # flight recorder: frames of context held in memory
+flight = 0                  # flight recorder: frames of context held in memory (max 5000)
                             # and written out when an alert fires. 0 is off.
                             # At 800 ms, 750 frames is 10 minutes / ~40 MB.
 flight_after = 30           # ...and frames written after the alert
 flight_dir = ""             # empty means the working directory
 rotate_frames = 0           # rotating recording: frames per segment file.
-                            # 0 is off. At 800 ms, 1800 frames is ~24 min.
-rotate_keep = 4             # segments kept, including the one being written
+                            # 0 is off (1800 with --record-rotate); non-zero
+                            # turns rotation on by itself. At 800 ms, 1800
+                            # frames is ~24 min. Capped at 1,000,000.
+rotate_keep = 4             # segments kept, including the one being written (1-64)
 rotate_dir = ""             # empty means flight_dir, then the working dir
 
 [serve]
@@ -1013,8 +1066,10 @@ crit = "#ff5555"
 name = "cpu-saturated"
 kind = "cpu"                # cpu mem swap load disk temp gpu psi io net fd proc trend fillin cgroup kernel cputime vm throttle oomkill tcp storage unit
 threshold = 90.0            # % for most kinds; °C for temp, B/s for net and
-                            # vm (faults/s for vm:majfault), a count for proc
-                            # kernel and oomkill, absolute for load
+                            # vm (faults/s for vm:majfault), a count for proc,
+                            # kernel, oomkill, storage and unit; seconds for
+                            # fillin; bytes for trend; the figure's own unit
+                            # for tcp; absolute for load
 hysteresis = 0.0            # recovery margin in the measurement's unit
 for_secs = 30               # must hold this long before firing
 over_secs = 0               # trend, fillin and oomkill: the window they
@@ -1110,15 +1165,17 @@ target = "listendrops"      # connections dropped at a listener, per second
 threshold = 1
 ```
 
-`kind = "storage"` counts md arrays, ZFS pools and btrfs filesystems that are
-degraded, rebuilding or failed — the one failure that leaves every other
-gauge looking fine:
+`kind = "storage"` counts md arrays, ZFS pools, btrfs filesystems and, with
+`[smart]` on, disks that are degraded, rebuilding or failed — the one failure
+that leaves every other gauge looking fine. Its message names them, reasons
+and all — `raid-degraded 1 ≥ 1 (sdb degraded 8 reallocated)` — and so does
+the recovery:
 
 ```toml
 [[alert]]
 name = "raid-degraded"
 kind = "storage"
-target = ""                 # md0, a pool or btrfs label; empty = any
+target = ""                 # md0, a pool, a btrfs label or a disk (sdb); empty = any
 threshold = 1
 command = "page-oncall"
 ```
@@ -1443,7 +1500,8 @@ thing for something other than a person.
 
 ## Platform notes
 
-- Sending signals and renice are **Unix-only**.
+- Sending signals and renice are **Unix-only**; systemd unit detection, the
+  unit popup and `kind = "unit"` are **Linux-only**.
 - Process control acts on a local PID, so it is refused outright under
   `--remote` and `--replay`: the PIDs on screen belong to another machine or
   another time, and a local process holding the same number is a different

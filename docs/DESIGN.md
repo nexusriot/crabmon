@@ -25,6 +25,7 @@ docs/
 completions/         bash, zsh and fish
 scripts/build.sh     the build driver; build-deb.sh is an alias CI still uses
 scripts/embed-snapshot.py  puts a captured frame into README.md
+scripts/e2e-ssh.py   opt-in checks against a real SSH host
 src/                 the library, plus a thin binary
 tests/               eight integration suites, including local and container E2E
 ```
@@ -42,7 +43,7 @@ for one reason: it makes the whole program testable headlessly.
 src/
   main.rs            terminal setup/teardown, signals, panic hook, event loop
   lib.rs             module tree and the shared refresh bounds
-  cli.rs             argument parsing (hand-rolled, ~400 lines)
+  cli.rs             argument parsing (hand-rolled, ~700 lines)
   config.rs          the on-disk config, with defaults and clamping
   theme.rs           colour themes and threshold→colour mapping
   format.rs          byte/rate/duration formatting
@@ -59,6 +60,7 @@ src/
   sampler.rs         sampling on a worker thread
   diff.rs            comparing two snapshots
   doctor.rs          what this host lets crabmon measure, for `--doctor`
+  events.rs          the `E` timeline, derived from consecutive snapshots
   watch.rs           the headless wait-for-a-condition mode
   supervisor.rs      alert rules and the flight recorder, outside the TUI
   fleet.rs           several hosts behind one metric source, host groups, sorting
@@ -80,6 +82,7 @@ src/
     netstat.rs       TCP health from /proc/net/snmp, netstat and sockstat
     containers.rs    container names from the runtimes' own files
     storage.rs       md RAID, ZFS pool and btrfs device health
+    smart.rs         opt-in SMART disk health via `smartctl --json`
     units.rs         systemd failures and restart loops via `systemctl show`,
                      journal tails via `journalctl`, restart and reset
     power.rs         batteries, mains and RAPL
@@ -109,7 +112,7 @@ src/
     gpu.rs           GPU rows
     fleet.rs         one row per host, when several are being watched
     popups.rs        signal, confirm, renice, affinity, ionice, seek, unit,
-                     silence, detail, help, alerts, audit log
+                     silence, detail, help, alerts, audit log, events
 ```
 
 ## The metric boundary
@@ -157,7 +160,10 @@ unrelated program, so signalling, renicing, affinity, ionice and the detail
 pane's `/proc` reads are all gated on it.
 
 `Snapshot` is plain data (`HostInfo`, `CpuSample`, `MemSample`, `ProcRow`,
-`NetIface`, `DiskRow`, `Sensor`, `GpuInfo`, `CgroupInfo`) and derives
+`NetIface`, `DiskRow`, `Sensor`, `GpuInfo`, `CgroupInfo`, and the newer
+`PsiSample`, `PowerSample`, `NetNamespace`, `CgroupStat`, `KernelEvent`,
+`CpuModes`, `VmActivity`, `TcpHealth`, `StorageArray` and `UnitHealth`, with
+`kernel_unreadable`, `units_unreadable` and `taken_at_unix`) and derives
 `Serialize`, so JSON export is the same type the UI reads rather than a parallel
 representation that can drift.
 
@@ -165,8 +171,11 @@ representation that can drift.
 
 `App` holds the config, the theme, the current `Snapshot`, the derived process
 view, the history buffers, the alert engine and the interaction mode. It owns no
-terminal; its only IO is the metric source, the config file and writing an
-export when the user asks for one.
+terminal. Its IO is limited to what a key asks for: the metric source, the
+config file, exports, the audit log, OSC 52 on `y`, the replay timeline scan
+thread, the detail pane's `/proc` reads, signals through a pidfd, and
+`systemctl`/`journalctl` for the unit popup — the last two injectable
+(`App::unit_control`, `App::unit_journal`) so tests run none of them.
 
 Two details matter:
 
@@ -188,13 +197,14 @@ Two details matter:
 | `Renice` | `r` | numeric prompt |
 | `Affinity` | `A` | CPU-list prompt |
 | `IoPriority` | `I` | IO class and level prompt |
-| `Detail` | `Enter` | process detail |
+| `Detail` | `Enter` on a process row (in the fleet it selects a host, when grouped it drills in) | process detail |
 | `Help` | `?` | key bindings |
 | `Alerts` | `!` | rules, transitions and delivery notes |
 | `AuditLog` | `L` | the local record of actions taken |
 | `Seek` | `:` in a replay | frame or time prompt |
 | `Unit` | `u` | unit state, journal, restart/reset with `y`/`n` |
 | `Silence` | `S`, or `S` in the `!` popup | duration and rule prompt |
+| `Events` | `E` | the events timeline, newest first |
 
 Sending a signal is two-step by construction: `SignalMenu` → `ConfirmKill`.
 Every action that targets a process — signal, renice, affinity and IO priority
@@ -404,6 +414,20 @@ counters produces a gap rather than an absurd spike.
   `units::control` — `systemctl --no-ask-password`, `--no-block` for a
   restart, `--` before the name — swapped in tests via `App::unit_control`
   and `App::unit_journal`, and refused unless `samples_this_host()`.
+- **SMART** — `smart::SmartWatcher` runs `smartctl --json -i -H -A -n standby`
+  per disk (`--scan --json` lists them, with the `-d` type to read each as)
+  every `[smart] interval_secs` on its own thread, through `[smart] command`
+  so `sudo -n smartctl` works, each run bounded at 30 s by
+  `remote::wait_with_timeout`. smartctl's exit status is a bit mask, not a
+  verdict: bits 0 and 1 mean no reading, bit 3 means the disk says it is
+  failing, and the rest describe history, so the JSON is judged, not the
+  status. A disk in standby keeps its last reading rather than being woken.
+  Disks become `StorageArray`s of kind `smart` carrying a `SmartInfo`, so the
+  panel, `storage` rules, the exporter, `--remote`, recordings and incident
+  summaries need no second path; the panel draws failing disks with the
+  arrays and healthy ones only in the room left after the mounts. A pass that
+  reads nothing sets `Snapshot::smart_unreadable` instead of an empty, healthy
+  list, and `--doctor` fails while `[smart]` is on and no disk can be read.
 - **cgroups** — the panel appears only when the process is actually confined,
   since a limitless root cgroup is noise.
 
@@ -554,7 +578,10 @@ nameless host falls back to the unlabelled path and writes among the flight
 dumps, where rotation prunes them. A name already free is kept, so an
 ordinary fleet is unchanged.
 
-A write that fails is reported, never fatal: a full disk under `--serve`
+Where a recording goes is checked at start: an explicit `--record` path that
+cannot be created, or a rotation directory that is not one or cannot be made,
+stops crabmon with the reason rather than running for ever recording nothing.
+After that, a write that fails is reported, never fatal: a full disk under `--serve`
 would otherwise stop the exporter answering, which is worse than a gap in a
 recording. It is reported on the way *into* failure and again on the way out,
 not once a frame — a read-only directory does not improve by itself, and an
@@ -626,7 +653,12 @@ a reader that gets ahead blocks rather than growing a queue without limit.
 Falling back to the old behaviour is deliberately narrow: only the far end's
 argument parser refusing `--stream` triggers it. Falling back on any failure
 would paper over a genuinely broken host, and an explicit `--remote-command` is
-never second-guessed at all.
+never second-guessed at all. It is, however, *read* according to what it asks
+for: one with `--stream` as a word of its own (`remote::command_streams`) is a
+stream with no fallback, anything else a one-shot. Every explicit command used
+to be a one-shot, so the only way to reach a crabmon off the far end's `PATH`
+gave up streaming, and a streaming one waited out `FETCH_TIMEOUT` on every
+sample and never came up.
 
 The one-shot path is bounded by `FETCH_TIMEOUT`. `ConnectTimeout` only covers
 setting the connection up; once SSH is connected, a command that never returns
@@ -654,13 +686,14 @@ panel can be switched off in `[panels]`.
 The process table's columns are chosen to fit the available width: the marker,
 PID, CPU and memory plus the command are always present, and state, user, disk,
 time, nice, the CPU sparkline, virtual size and thread count are added in that
-order as the terminal gets wider (`procs::OPTIONAL`). PORTS and FD are not in
+order as the terminal gets wider (`procs::OPTIONAL`). PORTS, FD and PSS are not in
 that set at any width: each costs syscalls per row or per process, so they join
-only when `[procs] ports` or `[procs] fds` asks for them — and having been
-asked for, they outrank the columns that are free. Whichever subset is chosen
+only when `[procs] ports`, `[procs] fds` or `[procs] pss` asks for them — and
+having been asked for, they outrank the columns that are free. GROWTH and
+MAJFLT appear only when named in `[procs] columns`. Whichever subset is chosen
 is then drawn in one canonical left-to-right order rather than in the order it
 was added. A property test checks the chosen set fits at every width from 20 to
-200 columns.
+199 columns.
 
 ## Terminal lifecycle
 
@@ -688,14 +721,20 @@ the running machine, and `e2e_docker`, which builds and runs a container:
   flattening, diskstats/cgroup/PSI/meminfo/`iostat`/`nvidia-smi`/`limits`
   parsing, GPU and battery sysfs against fabricated trees, socket-table
   decoding, alert state, column planning, base64, the Prometheus exposition
-  format, recording round-trips and config round-trips. Also the arithmetic
+  format, recording round-trips and config round-trips; `systemctl show`
+  parsing, restart tracking and journal caching; kernel-message patterns;
+  mdstat, ZFS and btrfs health; SNMP/netstat counters; container naming and
+  the Engine API reply; silence windows; fleet target expansion and sorting;
+  the notify `curl` config; and incident summaries. Also the arithmetic
   that is easy to get quietly wrong: disk utilisation against a counter reset,
   an idle interval having no average service time, per-device rather than
   per-mount aggregation, and every alert kind against a snapshot built to make
   it fire.
 - **`tests/app_behaviour.rs`** — the interaction model against a fixture source:
   key handling in every mode, selection stability across re-sorts, PID-reuse
-  refusal for all three process actions, tagging and bulk actions, pinning,
+  refusal for signal, renice and affinity (IO priority is covered for prompt
+  validation), the fleet table's sorting, host selection and per-host alerts,
+  the unit popup, `S` silences, tagging and bulk actions, pinning,
   saved filters, grouping and group drill-down, popup scrolling, replay
   scrubbing, audit logging, mouse handling, history bounds, per-process series
   accumulating and being evicted with the process, and that a repeated frame
@@ -718,19 +757,26 @@ the running machine, and `e2e_docker`, which builds and runs a container:
   named, and that it exits 1 for a rule this host cannot measure and 0
   otherwise.
 - **`tests/proc_control.rs`** — renice, CPU affinity and signals against a real
-  spawned child, checked by reading the state back from the kernel. A unit test
+  spawned child, checked by reading the state back from the kernel, plus
+  identity: a process that execs is reported as what it became, and a wrong or
+  exited incarnation is refused. A unit test
   can only prove the arguments were well-formed, not that they were accepted.
 - **`tests/e2e_local.rs`** — the binary on the current Linux host: complete
   streaming with over 100 real child processes, fleet exporter freshness over
-  a controlled SSH transport, and replay in a pseudo-terminal with hook and
-  flight-recording side effects forbidden. Workloads and files are isolated
+  a controlled SSH transport, an explicit `--stream` remote command read as a
+  stream, SMART through a stand-in `smartctl` reaching `--once`, the text
+  report, `--watch-rule` and `--doctor`, and replay in a pseudo-terminal with
+  hook and flight-recording side effects forbidden. Workloads and files are isolated
   and cleaned up by the tests; Docker is not required.
 - **`scripts/e2e-ssh.py`** — opt-in checks on a real Linux SSH host using a
   compatible release binary. Creates a private remote `/tmp` directory and
   temporary workloads, then removes them. Covers credential redaction and
   opt-out, hysteresis hooks, streams, plain/rotating/flight recordings, and a
-  real SSH collector through stalls, failures and recovery, and that a host
-  that never answers exports only `up` and `sample_stale`. `--units` (root on
+  real SSH collector through stalls, failures and recovery, that a host
+  that never answers exports only `up` and `sample_stale`, that an explicit
+  streaming `--remote-command` comes up, and SMART through a stand-in
+  `smartctl` (healthy, degraded, unreadable, the alert naming the disk once)
+  plus, where smartmontools is installed, the real one read-only. `--units` (root on
   the target) adds transient systemd units — one failing, one crash-looping —
   and checks detection, the exit status, `unit` alert messages naming the
   unit, and recovery on `reset-failed`; the units are stopped and reset
@@ -841,7 +887,7 @@ must never write to the user's real config file as a side effect of being used.
 installing under a `PREFIX` and cleaning up after itself. The `Makefile` is a
 front end to it — one line per target — rather than a second implementation, so
 `make test` and `./scripts/build.sh test` cannot come to mean different things.
-A pair of tests in `tests/docs.rs` assert that the two lists agree and that the
+A pair of tests in `tests/build_script.rs` assert that the two lists agree and that the
 script's own help covers every command it accepts.
 
 `make snapshot` redraws the terminal capture the README carries. It drives a
@@ -870,7 +916,10 @@ cfg-gated code paths against aarch64 Linux and FreeBSD.
 
 `--serve` is a hand-rolled `TcpListener` loop rather than a framework, because
 the whole contract is one method and four routes (`/`, `/metrics`, `/healthz`,
-and 404 for everything else). It samples once per scrape, on the connection
+and 404 for everything else); any other method is a 405. With `[serve] token`
+or `CRABMON_SERVE_TOKEN` (which wins) set, every route but `/healthz` needs
+`Authorization: Bearer`, compared in constant time by `secret_eq`; a missing
+or wrong token is a 401 with `WWW-Authenticate`. It samples once per scrape, on the connection
 thread serving it, behind a mutex. Per-process series are capped (default 20) — one series per process on
 a 2000-task machine would dwarf every other metric in the scrape and make the
 exporter the most expensive thing on the box.
@@ -942,6 +991,63 @@ diagnostic advice alone does not cause a failure. An alert rule that cannot
 measure anything still fails the check, because a rule that never fires
 reads as a quiet machine.
 
+## Supporting subsystems
+
+- **The events timeline (`events.rs`)** — `Timeline::observe` compares each
+  host's snapshot with the last one from the same host: kernel events newer
+  than the last sequence number seen (the ring read at start included, timed
+  by boot time plus their monotonic stamp), units changing state, restarting
+  or dropping out of the snapshot (which means healthy again), and storage
+  rows changing state. Rule transitions come from the engine's history by
+  `AlertEvent::seq`, a process-wide counter assigned when a transition is
+  recorded, so an engine rebuilt by a reload, a replay seek or a fleet host
+  switch is neither re-read nor missed. Fleet hosts are observed as their
+  frames arrive in `evaluate_parked_hosts`, which also reports a host that
+  stops or starts answering; actions and silences are added where the action
+  log is written. What a host is already in at its first snapshot is reported
+  "(at start)" rather than as a change. Nothing is sampled for it, so a replay
+  rebuilds the same timeline. A jump in a replay resets it, because the frames
+  skipped are time nobody watched, and a single step forward (`]`) continues
+  it; either way the frame landed on is observed at once. Bounded at `events::CAPACITY` (500), kept in time order.
+
+- **Silences (`silence.rs`)** — a `[[silence]]` window is either one-off
+  (`start`/`end`, like `2026-11-20T02:00Z`) or `daily = "HH:MM-HH:MM"`, which
+  may cross midnight. Everything is UTC; offsets are refused rather than
+  guessed. A window can be narrowed to rule names and to fleet targets or
+  hostnames, and `validate` refuses malformed or empty windows at start. The
+  `S` prompt parses `1h [rule]` or `off [rule]` into a `Muted { rule,
+  until_unix }`; `covering` checks interface silences before configured ones
+  and reports the one that reaches furthest.
+- **Fleets (`fleet.rs`)** — `FleetSource` holds one `ThreadedSource` per
+  target, so hosts are sampled concurrently and a dead one costs the rest
+  nothing. Its `frame_id` advances when any host produces a new frame, and
+  `is_local` is always false. `--remote a,b` lists targets, `@name` expands a
+  `[[fleet]]` group, and duplicates keep their first position. `FleetSort`
+  has ten keys (as named, host, cpu, mem, swap, load, disk, net, procs,
+  alerts), cycled with `>`/`<` and reversed with `s`; figures sort descending,
+  hosts without data sort last except under `alerts`, where an unreachable
+  host ranks worst, and the sort is stable so equal hosts do not jitter.
+- **Themes (`theme.rs`)** — five presets (default, mono, nord, solarized,
+  gruvbox; `--no-color` is mono). `[colors]` overrides individual roles with
+  names, `#rrggbb`, a 256-colour index or `reset`; a bad entry is ignored
+  rather than fatal. Temperatures colour against the sensor's own critical
+  point, or 70/85 °C when it reports none. Selection falls back to REVERSED
+  when both selection colours are `reset`, so it never disappears.
+- **Clipboard (`clipboard.rs`)** — `y` writes OSC 52 straight to stdout, so a
+  copy works through SSH and tmux with no clipboard daemon. The payload is cut
+  to 8 KiB, past which many terminals drop it silently.
+- **Incident summaries (`incident.rs`)** — a Markdown file beside each flight
+  dump (same name, `.md`): the rule, measurement and threshold (and "Paged:
+  no" when silenced), machine state, kernel events, units in trouble, the top
+  eight processes, a `diff::compare` of the dump's first frame against the
+  tripping one, and the command that replays it.
+- **Diffs (`diff.rs`)** — processes are matched by PID *and* start time, so a
+  recycled PID is a start and an exit rather than growth. A process has moved
+  if its memory changed or its CPU moved by more than half a point; lists sort
+  by absolute memory change, and disks compare per mount. `load_ends` takes a
+  single JSON document or a JSONL recording, whose first and last frames are
+  compared.
+
 ## Known limitations
 
 - Process CPU percentages are relative to a single core, as `sysinfo` reports
@@ -1011,16 +1117,31 @@ reads as a quiet machine.
   and kills a hook's whole process group once it has run for
   `HOOK_TIMEOUT` (60 s), reporting that it did. A hook that needs longer has
   to detach itself.
-- `App::ProcSeries::push` drops the oldest sample with `Vec::remove(0)`, which
+- `app::ProcSeries` (through `push_bounded`) drops the oldest sample with `Vec::remove(0)`, which
   is a memmove of `PROC_HIST_LEN` elements per series per process per sample.
   At 120 elements that is under half a kilobyte and does not show up against
   the cost of taking the sample; a `VecDeque` was considered and not taken,
-  because the sparkline and detail pane draw from a contiguous `&[f32]`.
+  because the sparkline and detail pane draw from contiguous slices.
 - Crash-loop detection counts only restarts crabmon has watched happen: a
   loop already under way at start is reported as restarting at once
   (`SubState=auto-restart`) and as a crash loop after `[units] crash_loop`
   more restarts. `--once` therefore never reports a crash loop, only failed
   and restarting units. User units are not read.
+- `[smart]` needs smartmontools 7.0+ (for `--json`) and the privilege to
+  open the disks — root, or a sudoers rule behind `command`. Disks behind a
+  RAID controller are read only where `smartctl --scan` lists them with a
+  type (`megaraid,N`); USB bridges that do not pass SMART through report
+  nothing. It has been unit-tested against smartctl's JSON shapes, not yet
+  run against a failing disk.
+- Kernel events in the timeline are timed by the sample that first saw them,
+  one refresh late at worst; only the ring read at start is timed by boot time
+  plus the kernel's printk stamp, which drifts from wall time (17 s behind on
+  a two-week-old VM), so backlog times are approximate. The Kernel panel's
+  "ago" uses the same stamp and carries the same drift.
+- The events timeline lives in memory for the session: it is not written
+  anywhere, and a restart begins it again (with what is already wrong marked
+  "at start"). Recordings carry everything it is derived from, so a replay
+  rebuilds it.
 - `[[notify]]` needs `curl` on the machine running the rules; crabmon links
   no HTTP or TLS client. A missing `curl` is reported per post, not at start.
 - The replay timeline scan parses every frame once. On a 240 MiB hour that is

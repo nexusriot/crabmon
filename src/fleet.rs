@@ -366,7 +366,7 @@ pub fn sort_hosts(
                 let (rx, tx) = s.net_totals(show_virtual);
                 rx + tx
             }
-            FleetSort::Procs => s.procs.len() as f64,
+            FleetSort::Procs => s.processes().count() as f64,
             _ => 0.0,
         })
     };

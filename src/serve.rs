@@ -479,7 +479,7 @@ pub fn render_host(
     metric(
         &mut out,
         "storage_degraded",
-        "1 when an md array, ZFS pool or btrfs filesystem is degraded, rebuilding or failed.",
+        "1 when an md array, ZFS pool, btrfs filesystem or SMART disk is degraded, rebuilding or failed.",
         "gauge",
         &snap
             .storage
@@ -512,6 +512,56 @@ pub fn render_host(
             .filter_map(|a| a.errors.map(|e| (arr(a), e as f64)))
             .collect::<Vec<_>>(),
     );
+
+    // SMART, per disk, where `[smart]` read one. Each is a gauge: a pending
+    // sector count goes down again when the sector is rewritten.
+    let disks: Vec<_> = snap
+        .storage
+        .iter()
+        .filter_map(|a| a.smart.as_ref().map(|s| (a, s)))
+        .map(|(a, s)| {
+            let labels = format!(
+                "device=\"{}\",model=\"{}\"",
+                escape_label(&a.name),
+                escape_label(&a.level)
+            );
+            (labels, s)
+        })
+        .collect();
+    type Field = fn(&crate::metrics::smart::SmartInfo) -> Option<f64>;
+    let smart_series: [(&str, &str, Field); 8] = [
+        ("smart_passed", "1 when the disk's SMART self-assessment passes.", |s| {
+            s.passed.map(|p| p as u8 as f64)
+        }),
+        ("smart_temperature_celsius", "Disk temperature reported by SMART.", |s| s.temp_c),
+        ("smart_power_on_hours", "Hours the disk has been powered on.", |s| {
+            s.power_on_hours.map(|h| h as f64)
+        }),
+        ("smart_wear_percent", "NVMe percentage of rated endurance used; can exceed 100.", |s| {
+            s.wear_percent
+        }),
+        (
+            "smart_reallocated_sectors",
+            "Sectors the disk has remapped (ATA 5, SCSI grown defects).",
+            |s| s.reallocated.map(|n| n as f64),
+        ),
+        (
+            "smart_pending_sectors",
+            "Sectors awaiting a rewrite after a failed read (ATA 197).",
+            |s| s.pending.map(|n| n as f64),
+        ),
+        ("smart_uncorrectable_sectors", "Uncorrectable sectors (ATA 198, or 187).", |s| {
+            s.uncorrectable.map(|n| n as f64)
+        }),
+        ("smart_media_errors", "NVMe media and data integrity errors.", |s| {
+            s.media_errors.map(|n| n as f64)
+        }),
+    ];
+    for (name, help, field) in smart_series {
+        let rows: Vec<_> =
+            disks.iter().filter_map(|(l, s)| field(s).map(|v| (l.clone(), v))).collect();
+        metric(&mut out, name, help, "gauge", &rows);
+    }
 
     // systemd units. The two counts are always exported where systemd was
     // read — zero is the healthy answer — and never where it was not, which
@@ -1354,7 +1404,7 @@ pub fn serve_rendered(
         (Some(_), _) => eprintln!("crabmon: scrapes need an Authorization: Bearer header"),
         (None, true) => eprintln!(
             "crabmon: {bind} is reachable from the network with no token set; \
-             per-process metrics include command lines"
+             per-process metrics include process names and PIDs"
         ),
         (None, false) => {}
     }
@@ -1427,9 +1477,24 @@ fn serve_unix(
         let _ = std::fs::remove_file(path);
     }
     let listener = UnixListener::bind(path).map_err(|e| unix_bind_error(path, e))?;
-    // Not the umask's business: a scrape carries every command line on the
+    // Not the umask's business: a scrape carries process names and PIDs from the
     // machine, and a permissive umask would hand that to everyone.
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660));
+    // Gone on the way out, not only at the next start: systemd stops a
+    // service with SIGTERM, and the file outlived every stop.
+    let owned = path.to_string();
+    if let Ok(mut signals) = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGHUP,
+    ]) {
+        std::thread::spawn(move || {
+            if signals.forever().next().is_some() {
+                let _ = std::fs::remove_file(&owned);
+                std::process::exit(0);
+            }
+        });
+    }
     eprintln!("crabmon: serving metrics on unix:{path}");
     if token.is_some() {
         eprintln!("crabmon: scrapes need an Authorization: Bearer header");
@@ -2041,7 +2106,7 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
         assert!(response.contains("socket body"), "{response}");
 
-        // A scrape carries every command line on the machine; a permissive
+        // A scrape carries process names and PIDs from the machine; a permissive
         // umask must not hand that to everyone.
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -2110,7 +2175,7 @@ mod tests {
         assert_eq!(unix_socket_path("unix:"), None);
     }
 
-    /// The exporter publishes every command line on the machine. Binding it
+    /// The exporter publishes the busiest processes by name and PID. Binding it
     /// off loopback was one flag away and there was no way to ask for a
     /// password.
     #[test]

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Opt-in real-host checks. Run with --target user@host and --binary path.
 Only creates a private remote /tmp directory and temporary test processes.
+SMART is checked through a stand-in smartctl in that directory, so it needs
+neither root nor smartmontools; a real smartctl, where installed, is also run
+read-only to check that a disk it cannot judge is never reported healthy.
 --units additionally needs root on the target: it starts transient systemd
 units (stopped and reset afterwards) to check failure and crash-loop
 detection end to end.
@@ -151,6 +154,86 @@ finally:
 '''
 
 
+SMART_TEST = r'''
+import json, pathlib, shutil, subprocess, sys, time
+root = pathlib.Path(sys.argv[1])
+binary = str(root / "crabmon")
+disk = root / "disk.json"
+fake = root / "fake-smartctl"
+fake.write_text("#!/bin/sh\ncase \" $* \" in *\" --scan \"*) echo '{\"devices\":[{\"name\":\"/dev/sdz\",\"type\":\"sat\"}]}'; exit 0;; esac\ncat " + str(disk) + "\n")
+fake.chmod(0o700)
+
+def attrs(realloc):
+    return json.dumps({"smartctl": {"exit_status": 0}, "model_name": "WDC WD40EFRX",
+        "smart_support": {"available": True, "enabled": True}, "smart_status": {"passed": True},
+        "temperature": {"current": 38}, "power_on_time": {"hours": 31337},
+        "ata_smart_attributes": {"table": [{"id": 5, "raw": {"value": realloc}}, {"id": 197, "raw": {"value": 0}}]}})
+
+def config(name, command, extra=""):
+    path = root / name
+    path.write_text("refresh_ms=300\n[smart]\nenabled=true\ninterval_secs=60\ncommand=" + json.dumps(command) + "\n" + extra)
+    return str(path)
+
+def once(cfg, fmt="json"):
+    return subprocess.run([binary, "--once", "--config", cfg, "--format", fmt], text=True, capture_output=True, timeout=60).stdout
+
+disk.write_text(attrs(0))
+cfg = config("smart.toml", str(fake))
+snap = json.loads(once(cfg))
+row = next(r for r in snap["storage"] if r["kind"] == "smart")
+assert (row["name"], row["state"], row["smart"]["power_on_hours"]) == ("sdz", "healthy", 31337), row
+doctor = subprocess.run([binary, "--doctor", "--config", cfg], text=True, capture_output=True)
+assert doctor.returncode == 0 and "SMART read for 1 disk;" in doctor.stdout, doctor.stdout
+
+disk.write_text(attrs(8))
+snap = json.loads(once(cfg))
+assert [r["state"] for r in snap["storage"] if r["kind"] == "smart"] == ["degraded"], snap["storage"]
+assert "storage  sdz degraded 8 reallocated" in once(cfg, "text"), "the text report hides a failing disk"
+watch = subprocess.run([binary, "--watch-rule", "storage>=1", "--watch-timeout", "30", "--config", cfg],
+                       text=True, capture_output=True, timeout=60)
+assert watch.returncode == 1, "storage rule never matched a degraded disk: " + watch.stderr
+
+# Headless alerts: the hook names the disk, and stderr says it once, not per frame.
+hooks = root / "smart-hooks"
+alert = config("smart-alert.toml", str(fake), '[[alert]]\nname="disks"\nkind="storage"\nthreshold=1\ncommand='
+               + json.dumps('echo "$CRABMON_MESSAGE" >> ' + str(hooks)) + "\n")
+with (root / "smart-stream.err").open("w") as err:
+    stream = subprocess.Popen([binary, "--stream", "--alerts", "--config", alert], stdout=subprocess.DEVNULL, stderr=err)
+    try:
+        end = time.monotonic() + 30
+        while time.monotonic() < end and not hooks.exists():
+            time.sleep(.2)
+        time.sleep(3)
+    finally:
+        stream.terminate(); stream.wait(timeout=5)
+assert "(sdz degraded 8 reallocated)" in hooks.read_text(), hooks.read_text()
+said = [l for l in (root / "smart-stream.err").read_text().splitlines() if "disks " in l]
+assert len(said) == 1, "a firing rule was printed per frame: " + repr(said)
+
+# A disk crabmon may not open is unreadable, never healthy.
+denied = root / "denied-smartctl"
+denied.write_text("#!/bin/sh\ncase \" $* \" in *\" --scan \"*) echo '{\"devices\":[{\"name\":\"/dev/sdz\"}]}'; exit 0;; esac\n"
+                  "echo '{\"smartctl\":{\"exit_status\":2,\"messages\":[{\"string\":\"Smartctl open device: /dev/sdz failed: Permission denied\",\"severity\":\"error\"}]}}'\n")
+denied.chmod(0o700)
+cfg = config("denied.toml", str(denied))
+snap = json.loads(once(cfg))
+assert snap["storage"] == [] and "Permission denied" in snap["smart_unreadable"], snap.get("smart_unreadable")
+doctor = subprocess.run([binary, "--doctor", "--config", cfg], text=True, capture_output=True)
+assert doctor.returncode == 1 and "needs root" in doctor.stdout, doctor.stdout
+
+checks = ["healthy", "degraded", "text-report", "watch-rule", "alert-names-disk", "said-once", "unreadable", "doctor"]
+real = shutil.which("smartctl")
+if real:
+    snap = json.loads(once(config("real.toml", real)))
+    for r in snap["storage"]:
+        if r["kind"] == "smart":
+            assert r.get("smart", {}).get("temp_c") != 0, "a placeholder 0 C was drawn as a reading: " + repr(r)
+    assert snap["storage"] or snap.get("smart_unreadable"), "real smartctl: neither disks nor a reason"
+    checks.append("real-smartctl")
+print(json.dumps({"smart": "passed", "checks": checks}))
+'''
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", required=True)
@@ -174,6 +257,8 @@ def main():
         remote("chmod 700 " + shlex.quote(root + "/crabmon"))
         remote("cat > " + shlex.quote(root + "/test.py"), REMOTE_TEST.encode())
         print(remote("python3 " + shlex.quote(root + "/test.py") + " " + shlex.quote(root)).decode().strip())
+        remote("cat > " + shlex.quote(root + "/smart.py"), SMART_TEST.encode())
+        print(remote("python3 " + shlex.quote(root + "/smart.py") + " " + shlex.quote(root)).decode().strip())
         if args.units:
             remote("cat > " + shlex.quote(root + "/units.py"), UNITS_TEST.encode())
             tag = root.rsplit(".", 1)[-1].lower()
@@ -243,6 +328,25 @@ def main():
             finally:
                 never.terminate(); never.wait(timeout=10)
             print(json.dumps({"never_sampled": "passed", "checks": ["up-only"]}))
+
+            # An explicit --remote-command that streams is read as a stream.
+            # Run as a one-shot it waited 15 s for an exit that never comes,
+            # on every sample, and the host never came up.
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                port = sock.getsockname()[1]
+            addr = "127.0.0.1:" + str(port)
+            streaming = subprocess.Popen([str(args.binary.resolve()), "--serve", addr, "--remote", args.target,
+                "--remote-command", shlex.quote(root + "/crabmon") + " --stream --refresh 500",
+                "--config", str(cfg)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                end = time.monotonic() + 12
+                while time.monotonic() < end and value(scrape(), "up") != 1:
+                    time.sleep(.5)
+                assert value(scrape(), "up") == 1, "a streaming --remote-command never came up"
+            finally:
+                streaming.terminate(); streaming.wait(timeout=10)
+            print(json.dumps({"stream_command": "passed", "checks": ["explicit-stream"]}))
     finally:
         if exporter is not None:
             exporter.terminate()

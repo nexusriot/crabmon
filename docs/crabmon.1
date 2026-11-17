@@ -70,7 +70,7 @@ Always samples the host it runs on; combining it with \fB\-\-remote\fR or
 \fB\-\-replay\fR is refused rather than quietly reporting the wrong machine.
 .TP
 .B \-\-format " " \fIFMT\fR
-Output format for \fB\-\-once\fR and \fB\-\-watch\fR: \fBjson\fR (default),
+Output format for \fB\-\-once\fR and \fB\-\-watch\fR: \fBjson\fR (the default, via \fB[export] format\fR),
 \fBcsv\fR or \fBtext\fR. \fBtext\fR is an aligned table laid out by the same
 column planner the interface uses, i.e. the \fBtop \-b \-n1\fR shape.
 \fB\-\-diff\fR writes its report as \fBjson\fR, as \fBcsv\fR \(em one row per
@@ -88,11 +88,11 @@ Aggregate the process table: \fBnone\fR, \fBservice\fR, \fBcontainer\fR or
 \fBuser\fR.
 .TP
 .B \-\-columns " " \fILIST\fR
-Process-table columns, comma separated, overriding \fB[procs] columns\fR —
+Process-table columns, comma separated, overriding \fB[procs] columns\fR \(em
 e.g. \fBpid,user,cpu,mem,name\fR. Known columns: \fBmark\fR, \fBpid\fR,
 \fBuser\fR, \fBstate\fR, \fBcpu\fR, \fBtrend\fR, \fBmem\fR, \fBvirt\fR,
-\fBthr\fR, \fBni\fR, \fBfd\fR, \fBdisk\fR, \fBtime\fR, \fBports\fR,
-\fBname\fR. An unknown name is an error rather than a column quietly missing
+\fBpss\fR, \fBgrowth\fR, \fBmajflt\fR, \fBthr\fR, \fBni\fR, \fBfd\fR,
+\fBdisk\fR, \fBtime\fR, \fBports\fR, \fBname\fR. An unknown name is an error rather than a column quietly missing
 from the table. \fBname\fR is always drawn last.
 .TP
 .B \-\-record " " \fIPATH\fR
@@ -100,11 +100,12 @@ Record every sample to a JSON Lines file, replacing any file already at that
 path. See \fBRECORDINGS\fR. Works in every mode that samples on a loop: the
 interface, \fB\-\-stream\fR, \fB\-\-serve\fR and \fB\-\-watch\fR.
 \fB\-\-once\fR and \fB\-\-diff\fR refuse it, because a recording is a
-sequence and they take one sample; so does \fB\-\-serve \-\-remote\fR,
-where a fleet has a timeline per host and one file to put them in.
+sequence and they take one sample. Under \fB\-\-serve \-\-remote\fR each
+host gets a file of its own, recorded when a new live frame is seen.
 .TP
 .B \-\-record\-rotate " " \fIDIR\fR
-Keep a rotating recording in \fIDIR\fR: segments of \fB[record]\fR
+Keep a rotating recording in \fIDIR\fR, made if it does not exist; a path
+that is not a directory stops crabmon at start. Segments of \fB[record]\fR
 \fIrotate_frames\fR frames each, the oldest deleted once there are more than
 \fIrotate_keep\fR of them. Unlike \fB\-\-record\fR this is meant to be left
 on, so a replay of the last hour is always available without having predicted
@@ -144,7 +145,13 @@ the most rules firing.
 .TP
 .B \-\-remote\-command " " \fICMD\fR
 Command to run on the remote host. Defaults to
-.BR "crabmon \-\-once \-\-refresh 200" .
+\fBcrabmon \-\-stream \-\-refresh\fR \fIMS\fR, or, when \fB[remote] stream\fR
+is false or the far end predates \fB\-\-stream\fR,
+\fBcrabmon \-\-once \-\-refresh 200 \-\-format json \-\-top 0 \-\-filter=''\fR.
+An explicit command is never second-guessed: one containing \fB\-\-stream\fR
+as a word of its own is read as a stream, and anything else must print one
+frame and exit \(em e.g. \fB/opt/crabmon/bin/crabmon \-\-stream\fR for a
+crabmon that is not on the far end's \fBPATH\fR.
 .TP
 .B \-\-ssh\-option " " \fIOPT\fR
 Pass \fB\-o\fR \fIOPT\fR to \fBssh\fR for every \fB\-\-remote\fR connection,
@@ -185,13 +192,15 @@ usable on its own as a collector. Samples this host only.
 .TP
 .B \-\-alerts
 With \fB\-\-serve\fR or \fB\-\-stream\fR, evaluate the \fB[[alert]]\fR rules
-on every sample: run the hook commands, write flight recordings, and — under
-\fB\-\-serve\fR — export each rule as \fBcrabmon_alert_active\fR,
+on every sample: run the hook commands, write flight recordings, and \(em under
+\fB\-\-serve\fR \(em export each rule as \fBcrabmon_alert_active\fR,
 \fBcrabmon_alert_value\fR, \fBcrabmon_alert_silenced\fR and
 \fBcrabmon_alert_threshold\fR. \fB[[silence]]\fR windows apply. Without it those
 rules run only in the full-screen interface, which means the flight recorder
 depends on someone watching at the moment the incident happens. Notices go to
-standard error, so \fB\-\-stream\fR's output stays one frame per line.
+standard error, so \fB\-\-stream\fR's output stays one frame per line: a rule
+is said when it starts firing, when its silence begins or ends, and when it
+recovers, not on every sample in between.
 .TP
 .B \-\-diff " " \fIA\fR " " [\fIB\fR]
 Compare two snapshots and print what changed: CPU, load, memory, swap,
@@ -219,7 +228,8 @@ something other than a person.
 .TP
 .B \-\-watch " " \fIQUERY\fR
 Sample headlessly until processes match \fIQUERY\fR (see \fBFILTER LANGUAGE\fR),
-then print them and exit \fB1\fR. Exits \fB0\fR if \fB\-\-watch\-timeout\fR
+then print them and exit \fB1\fR. crabmon itself, whose command line carries
+the query, and the programs it runs are not counted. Exits \fB0\fR if \fB\-\-watch\-timeout\fR
 elapses first. A match is the non-zero exit, so \fB||\fR runs on a match and
 \fB&&\fR on a clean run.
 .TP
@@ -276,7 +286,7 @@ Quit.
 Move the selection.
 .TP
 .B Enter
-Open the process detail pane, or — in the grouped view — open the selected
+Open the process detail pane, or \(em in the grouped view \(em open the selected
 group, filtering the process table down to the processes inside it.
 .TP
 .B W
@@ -421,6 +431,14 @@ unit that did not bring one), and offers \fBr\fR to restart it and \fBx\fR to
 \fBsystemctl \-\-no\-ask\-password\fR; \fBl\fR reloads the journal. Read-only
 for a unit on another machine.
 .TP
+.B E
+The events timeline, newest first: rules firing and clearing, kernel events,
+units failing, restarting and recovering, storage arrays and SMART disks
+changing state, fleet hosts that stop or start answering, and actions taken
+from the interface. Times are UTC; a unit or disk already in trouble at start
+is marked \fB(at start)\fR. Worked out from the samples, so a replay rebuilds
+it; the last 500 are kept.
+.TP
 .B !
 Show the alert rules and their state, every transition, and the last fifty
 notes from running hooks and notifications \(em a post that failed, a hook
@@ -433,10 +451,12 @@ Terms are separated by whitespace and combined with AND. A leading \fB!\fR
 negates a term. A standalone \fB|\fR is OR, and binds looser than the implicit
 AND, so \fBa b | c\fR means \fB(a AND b) OR c\fR. Only a \fB|\fR surrounded
 by whitespace is an operator, so a regular expression containing one is left
-alone.
+alone. A \fIword\fB:\fIvalue\fR term whose word is not a field below is an
+error naming the fields; a name containing a colon, such as
+\fBkworker/u8:2\fR, is still a name.
 .PP
 .nf
-firefox            name contains "firefox"
+firefox            name contains "firefox" (also name:firefox)
 !kworker           name does not contain "kworker"
 nginx | apache     either one
 user:vlad          user name contains "vlad"
@@ -469,13 +489,17 @@ Settings live in
 .I $XDG_CONFIG_HOME/crabmon/config.toml
 (usually
 .IR ~/.config/crabmon/config.toml ).
-The file is written when the refresh interval changes and on exit. The active
+The file is written when the refresh interval changes and on exit. A fleet
+session keeps the layout the file had, and \fBfleet\fR itself is never
+saved, since it means nothing without \fB\-\-remote\fR hosts. The active
 filter is session state and is not written back, so a query typed at
 .B /
 does not silently narrow later runs. Missing or malformed files fall back to
 defaults; out-of-range values are clamped rather than rejected \(em except
 \fB[[notify]]\fR and \fB[[silence]]\fR entries that cannot work, which stop
-crabmon at start.
+crabmon at start, and an \fB[[alert]]\fR whose \fBhysteresis\fR is negative or
+not finite, which makes the whole file invalid so the defaults are used, with
+a warning.
 .SS Top-level keys
 .TP
 .B refresh_ms
@@ -504,8 +528,8 @@ Aggregate the process table: \fBnone\fR, \fBservice\fR, \fBcontainer\fR or
 \fBuser\fR. Default \fBnone\fR.
 .TP
 .B layout
-\fBdashboard\fR, \fBprocesses\fR, \fBcpu\fR or \fBio\fR. Default
-\fBdashboard\fR.
+\fBdashboard\fR, \fBprocesses\fR, \fBcpu\fR, \fBio\fR or \fBfleet\fR.
+Default \fBdashboard\fR.
 .TP
 .B theme
 \fBdefault\fR, \fBmono\fR, \fBnord\fR, \fBsolarized\fR or \fBgruvbox\fR.
@@ -527,7 +551,7 @@ Samples kept per chart, clamped to 16\-4096. Default 240.
 .TP
 .B panel_order
 Draw order of the right-hand column. Default
-.BR net ", " sensors ", " disks ", " gpu ", " cgroup .
+.BR net ", " psi ", " kernel ", " sensors ", " disks ", " power ", " gpu ", " cgroup .
 .SS [thresholds]
 .B warn
 and
@@ -540,7 +564,7 @@ are the same, as a fraction of each sensor's critical temperature (0.75 and
 0.9).
 .SS [panels]
 .BR header ", " cpu ", " mem ", " procs ", " net ", " sensors ", " disks ", "
-.BR gpu ", " cgroup ", " psi " and " power
+.BR gpu ", " cgroup ", " psi ", " kernel " and " power
 each switch a panel off when set to false. All default to true. The
 .BR psi ", " power ", " gpu " and " cgroup
 panels are additionally hidden when the machine has nothing to report.
@@ -595,8 +619,11 @@ without crabmon in front of it.
 and
 .B rotate_keep
 bound a rotating recording (\fB\-\-record\-rotate\fR): frames per segment
-file, and segments kept including the one being written. 0 frames switches
-rotation off, which is the default. At the default 800 ms refresh,
+file, and segments kept including the one being written. 0 (the default)
+leaves rotation off unless \fB\-\-record\-rotate\fR is given, which then uses
+1800; a non-zero value turns rotation on by itself. Segments go to
+\fBrotate_dir\fR, falling back to \fBflight_dir\fR and then the working
+directory. At the default 800 ms refresh,
 \fBrotate_frames = 1800\fR with \fBrotate_keep = 4\fR is about ninety
 minutes on disk. Under \fB\-\-serve\fR a frame is recorded per scrape
 rather than per \fIrefresh_ms\fR, because a scrape is when a sample is
@@ -622,7 +649,7 @@ since every thread of a process shares its address space and would report the
 process's own figures.
 .TP
 .B ports
-looks up listening ports for the rows on screen — one fd table per visible row,
+looks up listening ports for the rows on screen \(em one fd table per visible row,
 so it is off by default.
 .B pin_marker
 draws the leading marker column (\fB\(bu\fR tagged, pinned).
@@ -646,6 +673,31 @@ after a credential-looking \fIkey\fB=\fR, \fIkey\fB:\fR or quoted JSON
 key, the credential after an \fBAuthorization:\fR scheme, bearer tokens,
 and URL user and password. The words around them are kept, since a journal
 line is the reason a unit is down.
+.SS [smart]
+.B enabled
+(default false) reads disk health from SMART through \fBsmartctl\fR
+(smartmontools 7.0 or later), every
+.B interval_secs
+seconds (default 600, at least 60) on a thread of its own, with
+\fB\-n standby\fR so a disk that has spun down is not woken and keeps its last
+reading.
+.B command
+is how to run it, split on whitespace (default \fBsmartctl\fR); reading SMART
+needs root, so \fBsudo \-n smartctl\fR with a sudoers rule for that binary is
+the unprivileged way.
+.B devices
+lists device paths; empty (the default) reads whatever \fBsmartctl \-\-scan\fR
+finds. Each disk becomes a storage row of kind \fBsmart\fR: failed when its
+self-assessment fails or a pre-fail attribute is below threshold now, degraded
+with remapped, pending or uncorrectable sectors, NVMe media errors, a critical
+warning, spare capacity below its threshold or endurance used up. So it fires
+\fBstorage\fR rules and is exported as \fBcrabmon_storage_degraded\fR, with
+per-disk \fBcrabmon_smart_temperature_celsius\fR, \fBcrabmon_smart_power_on_hours\fR,
+\fBcrabmon_smart_wear_percent\fR, \fBcrabmon_smart_reallocated_sectors\fR,
+\fBcrabmon_smart_pending_sectors\fR, \fBcrabmon_smart_uncorrectable_sectors\fR,
+\fBcrabmon_smart_media_errors\fR and \fBcrabmon_smart_passed\fR. When no
+disk can be read the reason is reported by \fB\-\-doctor\fR, which fails while
+\fB[smart]\fR is on, and as \fBsmart_unreadable\fR in JSON.
 .SS [remote]
 .B stream
 holds one SSH session open and reads a stream of frames instead of starting a
@@ -715,7 +767,7 @@ and
 .B start
 and
 .BR end ,
-like \fB2026\-11\-20T02:00Z\fR \(em all in UTC. A window that cannot open
+like \fB2026\-11\-20T02:00Z\fR \(em all in UTC. A malformed window
 stops crabmon at start; a reload keeps the old windows instead.
 .SS [[notify]]
 Each table posts every alert transition \(em of every rule, with or without a
@@ -753,11 +805,11 @@ restarts of any unit within \fB[units] window_secs\fR), and \fIquery\fR names
 a unit, \fBapi\fR or \fBapi.service\fR; empty means all of them. It measures
 nothing where systemd cannot be read.
 .I storage
-counts md arrays, ZFS pools and btrfs filesystems that are degraded,
-rebuilding or failed;
+counts md arrays, ZFS pools, btrfs filesystems and \fB[smart]\fR disks that are
+degraded, rebuilding or failed;
 .I target
-names one (\fBmd0\fR, a pool, a btrfs label) and an empty target counts all
-of them.
+names one (\fBmd0\fR, a pool, a btrfs label, a disk such as \fBsdb\fR) and an
+empty target counts all of them. The message names them and their reasons.
 .I throttle
 is the share of CPU-quota periods a container or unit spent throttled, in
 percent;
@@ -881,7 +933,7 @@ writes one JSON object per sample, so a recording is greppable with
 .BR jq (1)
 and replayable with
 .BR "crabmon \-\-replay" .
-Frames are trimmed by \fB[record]\fR — by default the busiest 100 processes
+Frames are trimmed by \fB[record]\fR \(em by default the busiest 100 processes
 with command lines truncated to 200 characters, roughly 55 KiB per frame, or
 about 240 MiB for an hour at the default interval.
 .PP
@@ -932,10 +984,11 @@ requires permission to read \fI/proc/<pid>/io\fR, so figures for other users'
 processes read as zero unless crabmon runs as root; their fd tables are
 unreadable for the same reason, and report as unknown rather than zero.
 .PP
-Alerts \(em and so the flight recorder \(em are evaluated only by the
-interactive interface.
-.BR \-\-once ", " \-\-serve ", " \-\-stream " and " \-\-watch
-do not evaluate rules and never write a dump.
+Alert rules \(em and so the flight recorder \(em are evaluated in the
+interface and, with \fB\-\-alerts\fR, under \fB\-\-serve\fR and
+\fB\-\-stream\fR; \fB\-\-watch\fR is a rule by construction.
+.BR \-\-once " and " \-\-diff
+take a single sample and never fire one.
 .SH SAMPLE FRESHNESS, HYSTERESIS AND REDACTION
 Remote exporters emit crabmon_sample_age_seconds (seconds since receipt of a
 new frame) and crabmon_sample_stale (1 when connecting, failed or stale).
@@ -972,7 +1025,10 @@ Success. For \fB\-\-watch\fR, this means the condition was never met before
 \fB\-\-watch\-timeout\fR elapsed.
 .TP
 .B 1
-A \fB\-\-watch\fR condition matched, or the run failed.
+A \fB\-\-watch\fR condition matched; \fB\-\-doctor\fR found something the
+config asks for that cannot work here (including a \fB[[notify]]\fR or
+\fB[[silence]]\fR entry, which \fB\-\-doctor\fR reports rather than refusing);
+or the run failed.
 .TP
 .B 2
 Invalid command line; a \fB[[notify]]\fR target that cannot deliver; a

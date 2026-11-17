@@ -14,7 +14,7 @@ use super::procgroup::CgroupPaths;
 use super::{
     CpuSample, DiskRow, GpuInfo, HostInfo, MemSample, MetricSource, NetIface, ProcRow, Sensor,
     Snapshot, cgroup, containers, fds, gpu, identity, kmsg, kstat, meminfo, netclass, netns,
-    netstat, power, procgroup, psi, rate, smaps, storage, units,
+    netstat, power, procgroup, psi, rate, smaps, smart, storage, units,
 };
 
 /// Device lists (mounted filesystems, interfaces, sensors) are rescanned on this
@@ -81,6 +81,7 @@ pub struct SysinfoSource {
     nvidia_smi: Option<gpu::NvidiaSmi>,
     /// `systemctl show`, on its own thread, when `[units]` is on.
     units: Option<units::UnitWatcher>,
+    smart: Option<smart::SmartWatcher>,
     /// Count each process's open descriptors. Off by default: it is a
     /// `getdents` sweep per process per sample.
     count_fds: bool,
@@ -244,6 +245,7 @@ impl SysinfoSource {
             virtual_prefixes,
             nvidia_smi: use_nvidia_smi.then(gpu::NvidiaSmi::spawn),
             units: None,
+            smart: None,
             count_fds: false,
             read_pss: false,
             host,
@@ -260,6 +262,12 @@ impl SysinfoSource {
         if cfg!(target_os = "linux") {
             self.units = settings.map(units::UnitWatcher::spawn);
         }
+        self
+    }
+
+    /// Read SMART on a thread of its own; see `[smart]`.
+    pub fn with_smart(mut self, settings: Option<smart::SmartSettings>) -> SysinfoSource {
+        self.smart = settings.map(smart::SmartWatcher::spawn);
         self
     }
 
@@ -718,6 +726,18 @@ impl MetricSource for SysinfoSource {
             }
             None => (Vec::new(), Some("systemd is Linux-only".into())),
         };
+        let mut storage = storage::read();
+        let smart_unreadable = match &self.smart {
+            Some(w) => {
+                let (disks, why) = w.latest();
+                storage.extend(disks);
+                // Worst first across both, so a failing disk outranks a
+                // healthy array in a short panel.
+                storage.sort_by_key(|a| std::cmp::Reverse(a.state as u8));
+                why
+            }
+            None => None,
+        };
         Snapshot {
             host,
             cpu,
@@ -737,7 +757,8 @@ impl MetricSource for SysinfoSource {
             cpu_time,
             vm,
             tcp,
-            storage: storage::read(),
+            storage,
+            smart_unreadable,
             units: units_now.0,
             units_unreadable: units_now.1,
             taken_at_unix: now_unix(),
