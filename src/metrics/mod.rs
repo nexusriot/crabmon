@@ -99,6 +99,28 @@ impl MemSample {
     }
 }
 
+/// Whether these rows let a thread be told from a process at all.
+///
+/// On Linux the sampler reports a task count for real processes and `None` for
+/// their threads. Platforms that never report a task count would otherwise have
+/// every row taken for a thread, so the distinction only applies where it
+/// exists.
+pub fn threads_are_distinguishable(procs: &[ProcRow]) -> bool {
+    procs.iter().any(|p| p.threads.is_some())
+}
+
+/// Drop the thread rows, keeping every process.
+///
+/// Linux reports each thread as a task of its own, carrying its process's
+/// memory, run time and IO. Anything that counts or ranks *processes* — a
+/// `proc:` rule, a `--top` limit, the text report — would otherwise count a
+/// 40-thread daemon forty times. A no-op where threads cannot be told apart.
+pub fn retain_processes(procs: &mut Vec<ProcRow>) {
+    if threads_are_distinguishable(procs) {
+        procs.retain(|p| p.threads.is_some());
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProcRow {

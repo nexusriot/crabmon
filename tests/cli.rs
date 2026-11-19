@@ -530,3 +530,44 @@ fn a_malformed_watch_query_is_rejected_rather_than_matching_nothing_forever() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("regex"));
 }
+
+/// Linux lists every thread as a task. A `--top` budget and the text report
+/// are about processes: a busy daemon's threads used to take the slots with
+/// copies of their process's row. Every row kept must carry a thread count,
+/// which only processes have.
+#[cfg(target_os = "linux")]
+#[test]
+fn once_top_and_text_leave_threads_out() {
+    let out = crabmon(&["--once", "--top", "50", "--refresh", "200"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let procs = v["procs"].as_array().unwrap();
+    assert!(!procs.is_empty());
+    assert!(
+        procs.iter().all(|p| p["threads"].is_u64()),
+        "a thread took a --top slot: {:?}",
+        procs.iter().filter(|p| !p["threads"].is_u64()).map(|p| &p["pid"]).collect::<Vec<_>>()
+    );
+}
+
+/// `crabmon --once | head` is an ordinary pipeline. Rust ignores SIGPIPE, so
+/// the closed pipe arrived as a write error and the run ended in
+/// `Error: Broken pipe` and exit 1.
+#[cfg(unix)]
+#[test]
+fn a_reader_that_stops_early_is_not_an_error() {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_crabmon"))
+        .args(["--once", "--refresh", "200", "--format", "csv"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let status = child.wait().unwrap();
+    let mut err = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+    assert!(status.success(), "exit {status}: {err}");
+    assert!(!err.contains("Broken pipe"), "{err}");
+}

@@ -66,6 +66,36 @@ for one on purpose. The fixes came from another round against a real host.
 
 ### Fixed
 
+- **Fleet exports kept fresh between scrapes.** `--serve --remote` sampled
+  each host only when scraped, so every scrape was handed the frame the
+  previous one asked for: on a 15-second Prometheus interval each host was
+  exported 15 seconds old, `crabmon_sample_stale` read 1 for hosts streaming
+  a frame a second, and every alert's hold time was reset on every scrape,
+  so no `for_secs` rule could fire. Hosts are now sampled on their own
+  refresh interval, and an outage is judged by the gaps between frames.
+- **Threads are not processes.** A `proc:` rule or `--watch` counted every
+  thread as a match (`proc:dockerd>=2` fired on one dockerd), and `--once
+  --top` and `--format text` filled their rows with copies of a busy
+  process. Threads are now left out of all of these, as the interface does;
+  a whole JSON or CSV dump still carries every task. The Prometheus
+  per-process series skip threads too.
+- **`--watch` no longer matches whatever started it.** The `bash -c`,
+  `sudo` or `timeout` above a watch carries its query in its own command
+  line, so `ssh host 'cd /srv; crabmon --watch cmd:backup'` reported a backup
+  running on its first sample.
+- **An unreachable fleet host says so.** Opening one from the fleet table
+  showed a dashboard of zeros labelled only with its name; the status line
+  now reads UNREACHABLE with the reason, as a single `--remote` does.
+- **Container root filesystems are not disks.** Docker's per-container
+  `overlay` mounts each repeated `/`'s size in the Disks panel, `--diff` and
+  the exporter; they are skipped (an overlay mounted as `/` is kept).
+- **TIME fits its column.** Run times past a day print as `17d 03:24`
+  rather than being cut to `17d 03:3…`.
+- **A closed pipe is not an error.** `crabmon --once | head` ended with
+  `Error: Broken pipe` and exit 1; it now exits quietly.
+- **The README snapshot is masked.** `make snapshot` replaces the hostname,
+  MAC and IP addresses and container ids, at their own width.
+
 Found by a full run against the real test host (Ubuntu 26.04, systemd 259,
 a QEMU disk), each with a test:
 

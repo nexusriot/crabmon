@@ -56,9 +56,28 @@ impl Outcome {
 /// carries `backup` in its own command line, so it matched itself on the
 /// first sample and exited 1 — "it is running" — with no backup in sight.
 /// Found on a real host.
+///
+/// Its ancestors are left out too, for the same reason one level up: whatever
+/// started the watch usually carries the query in its own argv. `ssh host 'cd
+/// /srv; crabmon --watch cmd:backup'` runs it under `bash -c '...cmd:backup'`,
+/// and `sudo`, `timeout`, `nohup` and a cron line do the same, so the watch
+/// matched its own parent and reported a backup that was not running — also
+/// found on a real host. PID 1 is kept: it starts everything, and is never
+/// the thing that started a watch on purpose.
 pub fn without_self(snap: &Snapshot, me: u32) -> Snapshot {
+    let parent_of: std::collections::HashMap<u32, u32> =
+        snap.procs.iter().filter_map(|p| Some((p.pid, p.ppid?))).collect();
+    let mut ancestors = std::collections::HashSet::new();
+    let mut at = me;
+    // Bounded, so a recycled PID that closes a loop cannot hang the watch.
+    while let Some(&parent) = parent_of.get(&at) {
+        if parent <= 1 || !ancestors.insert(parent) || ancestors.len() > 512 {
+            break;
+        }
+        at = parent;
+    }
     let mut judged = snap.clone();
-    judged.procs.retain(|p| p.pid != me && p.ppid != Some(me));
+    judged.procs.retain(|p| p.pid != me && p.ppid != Some(me) && !ancestors.contains(&p.pid));
     judged
 }
 
@@ -423,6 +442,31 @@ mod tests {
         let mut only_me = snap.clone();
         only_me.procs.truncate(2);
         assert!(e.evaluate(&without_self(&only_me, 10), 0).is_empty(), "matched itself");
+    }
+
+    #[test]
+    fn a_watch_does_not_count_the_shell_or_sudo_that_started_it() {
+        use crate::metrics::ProcRow;
+        let row = |pid, ppid, cmd: &str| ProcRow {
+            pid,
+            ppid: Some(ppid),
+            name: cmd.split(' ').next().unwrap().into(),
+            cmd: cmd.into(),
+            ..Default::default()
+        };
+        let snap = Snapshot {
+            procs: vec![
+                row(1, 0, "/sbin/init cmd:backup.sh"),
+                row(5, 1, "bash -c cd /srv; sudo crabmon --watch cmd:backup.sh"),
+                row(6, 5, "sudo crabmon --watch cmd:backup.sh"),
+                row(7, 6, "crabmon --watch cmd:backup.sh"),
+                row(8, 5, "sh backup.sh"),
+            ],
+            ..Default::default()
+        };
+        let judged = without_self(&snap, 7);
+        // The sibling started by the same shell is a real match; init is kept.
+        assert_eq!(judged.procs.iter().map(|p| p.pid).collect::<Vec<_>>(), [1, 8]);
     }
 
     #[test]

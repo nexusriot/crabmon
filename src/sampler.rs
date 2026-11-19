@@ -53,12 +53,32 @@ pub struct ThreadedSource {
     /// The worker died; nothing more will ever arrive.
     finished: bool,
     received: Instant,
+    /// The worker samples on its own cadence rather than when asked.
+    free_running: bool,
+    /// The longest wait between two new frames since `take_longest_gap`.
+    longest_gap: Duration,
 }
 
 impl ThreadedSource {
     /// Takes the first sample synchronously, so the interface opens with real
     /// numbers rather than a blank dashboard for one refresh interval.
-    pub fn new(mut inner: Box<dyn MetricSource + Send>) -> ThreadedSource {
+    pub fn new(inner: Box<dyn MetricSource + Send>) -> ThreadedSource {
+        ThreadedSource::start(inner, None)
+    }
+
+    /// A worker that samples every `interval` whether or not anyone asks.
+    ///
+    /// For `--serve`, where the only thing asking is a scraper. Driven by
+    /// requests, each scrape was handed the frame the *previous* scrape asked
+    /// for: on a 15-second Prometheus interval every remote host was exported
+    /// fifteen seconds old, `crabmon_sample_stale` read 1 on a host
+    /// streaming a frame a second, and every alert's hold time was
+    /// interrupted on every scrape, so a `for_secs` rule could never fire.
+    pub fn free_running(inner: Box<dyn MetricSource + Send>, interval: Duration) -> ThreadedSource {
+        ThreadedSource::start(inner, Some(interval))
+    }
+
+    fn start(mut inner: Box<dyn MetricSource + Send>, cadence: Option<Duration>) -> ThreadedSource {
         let first = inner.snapshot(Duration::ZERO);
         let label = inner.label();
         let error = inner.error();
@@ -72,9 +92,15 @@ impl ThreadedSource {
             let mut last = Instant::now();
             let mut last_id = inner_id;
             let mut received = received;
-            // Ends when the source is dropped and `requests` closes.
-            while req_rx.recv().is_ok() {
-                let dt = last.elapsed();
+            let mut pacer = cadence.map(Pacer::new);
+            // Ends when the source is dropped: `requests` closes, or a
+            // free-running worker's `send` fails.
+            loop {
+                let dt = match pacer.as_mut() {
+                    Some(pacer) => pacer.wait(),
+                    None if req_rx.recv().is_ok() => last.elapsed(),
+                    None => return,
+                };
                 last = Instant::now();
                 let snap = inner.snapshot(dt);
                 let label = inner.label();
@@ -102,7 +128,18 @@ impl ThreadedSource {
             local,
             finished: false,
             received,
+            free_running: cadence.is_some(),
+            longest_gap: Duration::ZERO,
         }
+    }
+
+    /// The longest the worker went between two new frames since this was last
+    /// asked, and reset it. A free-running worker delivers frames nobody
+    /// looked at, so the spacing of scrapes says nothing about whether the
+    /// host was continuously answering in between; this does.
+    pub fn take_longest_gap(&mut self) -> Duration {
+        self.drain();
+        std::mem::take(&mut self.longest_gap)
     }
 
     /// Take everything the worker has finished, keeping only the newest. A
@@ -111,6 +148,10 @@ impl ThreadedSource {
         loop {
             match self.updates.try_recv() {
                 Ok(update) => {
+                    if update.received > self.received {
+                        let gap = update.received.duration_since(self.received);
+                        self.longest_gap = self.longest_gap.max(gap);
+                    }
                     self.latest = update.snap;
                     self.label = update.label;
                     self.error = update.error;
@@ -144,7 +185,7 @@ impl MetricSource for ThreadedSource {
         self.drain();
         // One outstanding request at a time: asking again while the worker is
         // still busy would queue work it can never catch up on.
-        if !self.pending && !self.finished && self.requests.send(()).is_ok() {
+        if !self.free_running && !self.pending && !self.finished && self.requests.send(()).is_ok() {
             self.pending = true;
         }
         self.latest.clone()
@@ -263,6 +304,32 @@ mod wrapper_tests {
     fn a_wrapped_sources_error_reaches_the_caller() {
         let src = ThreadedSource::new(Box::new(Broken));
         assert_eq!(src.error().as_deref(), Some("host-a: UNREACHABLE"));
+    }
+
+    /// A scraper that calls once a minute must still be handed a frame
+    /// sampled on the source's own cadence, not the one its previous call
+    /// asked for a minute ago.
+    #[test]
+    fn a_free_running_worker_samples_without_being_asked() {
+        struct Counting(u64);
+        impl MetricSource for Counting {
+            fn snapshot(&mut self, _dt: Duration) -> Snapshot {
+                self.0 += 1;
+                Snapshot { taken_at_unix: self.0, ..Default::default() }
+            }
+            fn frame_id(&self) -> Option<u64> {
+                Some(self.0)
+            }
+        }
+        let mut src =
+            ThreadedSource::free_running(Box::new(Counting(0)), Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(300));
+        let snap = src.snapshot(Duration::ZERO);
+        assert!(snap.taken_at_unix >= 5, "only {} frames in 300ms", snap.taken_at_unix);
+        assert!(src.received_at().elapsed() < Duration::from_millis(150));
+        let gap = src.take_longest_gap();
+        assert!(gap < Duration::from_millis(200), "{gap:?}");
+        assert_eq!(src.take_longest_gap(), Duration::ZERO, "taking it resets it");
     }
 
     #[test]

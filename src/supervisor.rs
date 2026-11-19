@@ -71,6 +71,41 @@ impl RemoteFreshness {
         // reconnect cannot silently complete a pre-outage hold timer.
         let expired =
             self.received.is_some_and(|at| now.saturating_duration_since(at) >= self.timeout);
+        self.judge(snap, id, reachable, now, received, expired, engine)
+    }
+
+    /// As `update_received`, for a source sampled on its own cadence
+    /// (`ThreadedSource::free_running`). `longest_gap` is the longest the
+    /// source went between two new frames since the last call: frames arrived
+    /// that no scrape saw, so the time since the previous *scrape* is no
+    /// measure of an outage — on a 15-second scrape interval it called every
+    /// healthy host interrupted, every time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_sampled(
+        &mut self,
+        snap: &Snapshot,
+        id: Option<u64>,
+        reachable: bool,
+        now: Instant,
+        received: Instant,
+        longest_gap: Duration,
+        engine: Option<&mut AlertEngine>,
+    ) -> (bool, bool) {
+        let expired = self.received.is_some() && longest_gap >= self.timeout;
+        self.judge(snap, id, reachable, now, received, expired, engine)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn judge(
+        &mut self,
+        snap: &Snapshot,
+        id: Option<u64>,
+        reachable: bool,
+        now: Instant,
+        received: Instant,
+        expired: bool,
+        engine: Option<&mut AlertEngine>,
+    ) -> (bool, bool) {
         let valid = reachable && snap.taken_at_unix != 0;
         let fresh = valid && (self.received.is_none() || id.is_none() || id != self.last_id);
         let delayed = now.saturating_duration_since(received) >= self.timeout;
@@ -1021,5 +1056,53 @@ mod age_tests {
         assert_eq!(gate.sample_age(later), Some(0.0));
         gate.update(&snap, Some(2), false, later + Duration::from_secs(1), None);
         assert_eq!(gate.sample_age(later + Duration::from_secs(1)), Some(1.0));
+    }
+
+    /// Found on a real fleet export: Prometheus scrapes every 15 seconds,
+    /// the host streams a frame a second, and judging continuity by the time
+    /// between *scrapes* called every scrape an outage, so no `for_secs`
+    /// rule could ever complete its hold.
+    #[test]
+    fn a_slow_scraper_does_not_interrupt_a_host_that_kept_answering() {
+        let start = Instant::now();
+        let mut gate = RemoteFreshness::new(Duration::from_secs(1));
+        let mut rule = crate::watch::parse_rule("cpu>=50", 20).unwrap();
+        rule.command = "page".into();
+        let mut engine = AlertEngine::new(vec![rule]);
+        let snap = Snapshot {
+            taken_at_unix: 1,
+            cpu: crate::metrics::CpuSample { per_core: vec![90.0], ..Default::default() },
+            ..Default::default()
+        };
+        let second = Duration::from_secs(1);
+        for (scrape, t) in [0u64, 15, 30].into_iter().enumerate() {
+            let now = start + Duration::from_secs(t);
+            let (fresh, up) = gate.update_sampled(
+                &snap,
+                Some(scrape as u64 + 1),
+                true,
+                now,
+                now,
+                second,
+                Some(&mut engine),
+            );
+            assert!(fresh && up, "scrape at {t}s");
+            engine.evaluate(&snap, t);
+        }
+        assert_eq!(engine.take_commands().len(), 1, "held 30s against a 20s hold");
+
+        // A real gap between frames is still an interruption: it restarts the
+        // hold, so 25s of over-threshold with a 10s hole in it does not page.
+        let mut gate = RemoteFreshness::new(Duration::from_secs(1));
+        let mut rule = crate::watch::parse_rule("cpu>=50", 20).unwrap();
+        rule.command = "page".into();
+        let mut engine = AlertEngine::new(vec![rule]);
+        for (id, t, gap) in [(1, 0, 1), (2, 15, 10), (3, 25, 1)] {
+            let now = start + Duration::from_secs(t);
+            let gap = Duration::from_secs(gap);
+            gate.update_sampled(&snap, Some(id), true, now, now, gap, Some(&mut engine));
+            engine.evaluate(&snap, t);
+        }
+        assert!(engine.take_commands().is_empty(), "the hole must restart the hold");
     }
 }

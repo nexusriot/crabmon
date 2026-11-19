@@ -785,7 +785,7 @@ ExecMainStatus=2\n";
     fn journal_lines_lose_the_hostname_and_nothing_else() {
         assert_eq!(
             without_hostname(
-                "2026-11-15T08:05:04+00:00 vps3639009.example.net api[7]: bind: in use"
+                "2026-11-15T08:05:04+00:00 vps0000000.example.net api[7]: bind: in use"
             ),
             "2026-11-15T08:05:04+00:00 api[7]: bind: in use"
         );

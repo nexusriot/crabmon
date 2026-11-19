@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Row, Table, TableState};
 
 use crate::app::{App, Mode};
-use crate::format::{compact_bytes, human_duration, truncate_fit};
+use crate::format::{compact_bytes, compact_duration, truncate_fit};
 use crate::metrics::ProcRow;
 use crate::sort::SortBy;
 use crate::ui::block;
@@ -320,7 +320,7 @@ fn field_text(key: SortBy, p: &ProcRow, name: &str, name_width: usize) -> String
                 format!("{:>8}", compact_bytes(p.io_bps() as u64))
             }
         }
-        SortBy::Time => human_duration(p.run_time),
+        SortBy::Time => compact_duration(p.run_time),
         SortBy::Nice => p.nice.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
         SortBy::Fds => fd_text(p),
         SortBy::Pss => pss_text(p),

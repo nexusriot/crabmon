@@ -1265,7 +1265,7 @@ fn unit_trouble_survives_a_narrow_terminal() {
     use crabmon::metrics::NetNamespace;
     use crabmon::metrics::units::{UnitHealth, UnitState};
     let mut snap = common::snapshot();
-    snap.host.hostname = "vps3639009.trouble-free.net".into();
+    snap.host.hostname = "vps0000000.example-host.net".into();
     snap.units = vec![UnitHealth {
         name: "cm3-oom.service".into(),
         active: "failed".into(),
@@ -1297,7 +1297,7 @@ fn unit_trouble_survives_a_narrow_terminal() {
 fn a_very_narrow_header_keeps_a_gap_after_the_unit_warning() {
     use crabmon::metrics::units::{UnitHealth, UnitState};
     let mut snap = common::snapshot();
-    snap.host.hostname = "vps3639009.trouble-free.net".into();
+    snap.host.hostname = "vps0000000.example-host.net".into();
     let unit = |name: &str, state| UnitHealth { name: name.into(), state, ..Default::default() };
     snap.units =
         vec![unit("a.service", UnitState::Failed), unit("b.service", UnitState::CrashLoop)];
@@ -1315,7 +1315,7 @@ fn a_very_narrow_header_keeps_a_gap_after_the_unit_warning() {
     // Found regenerating the README snapshot: at 100 columns the OS name was
     // cut to `Debian 1…` for a gap the right half did not need.
     let mut quiet = common::snapshot();
-    quiet.host.hostname = "vps3639009.trouble-free.net".into();
+    quiet.host.hostname = "vps0000000.example-host.net".into();
     quiet.host.os = "Linux (Ubuntu 26.04)".into();
     quiet.host.kernel = "7.0.0-42-generic".into();
     let mut a = crabmon::App::new(common::config(), Box::new(common::FakeSource::single(quiet)));

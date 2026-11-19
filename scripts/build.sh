@@ -241,7 +241,9 @@ cmd_uninstall() {
 # The capture is of whatever machine runs it, so re-running this replaces the
 # committed one with yours. That is the point — it is a demonstration of the
 # interface, not a fixture — and it is why the README's copy is replaced in
-# place between its markers rather than added to.
+# place between its markers rather than added to. What would identify the
+# machine (hostname, MAC and IP addresses, container ids) is masked by
+# scripts/embed-snapshot.py before it is written.
 SNAPSHOT_COLS=${SNAPSHOT_COLS:-100}
 SNAPSHOT_ROWS=${SNAPSHOT_ROWS:-30}
 SNAPSHOT_WAIT=${SNAPSHOT_WAIT:-6}

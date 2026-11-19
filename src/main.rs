@@ -23,6 +23,23 @@ use crabmon::sampler::{Pacer, ThreadedSource};
 use crabmon::supervisor;
 
 fn main() -> Result<()> {
+    match run() {
+        // A reader that stopped reading — `crabmon --once | head`, a
+        // `--stream` consumer that went away — is the ordinary end of a
+        // pipeline, not a failure: Rust ignores SIGPIPE, so without this the
+        // write surfaced as `Error: Broken pipe (os error 32)` and exit 1.
+        Err(e) if is_broken_pipe(&e) => Ok(()),
+        other => other,
+    }
+}
+
+fn is_broken_pipe(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause.downcast_ref::<io::Error>().is_some_and(|io| io.kind() == io::ErrorKind::BrokenPipe)
+    })
+}
+
+fn run() -> Result<()> {
     let args = match cli::parse(std::env::args().skip(1)) {
         Ok(Parsed::Help) => {
             print!("{}", cli::help_text());
@@ -502,7 +519,10 @@ fn serve_fleet(addr: &str, cfg: &Config, args: &Args, spec: &str) -> Result<()> 
         }
         hosts.push(Host {
             name: target.clone(),
-            source: ThreadedSource::new(Box::new(remote)),
+            source: ThreadedSource::free_running(
+                Box::new(remote),
+                Duration::from_millis(cfg.refresh_ms),
+            ),
             sup: alerts.then(|| supervisor::Supervisor::new(cfg).for_host(target)),
             freshness: supervisor::RemoteFreshness::new(Duration::from_millis(cfg.refresh_ms)),
             recordings,
@@ -515,12 +535,14 @@ fn serve_fleet(addr: &str, cfg: &Config, args: &Args, spec: &str) -> Result<()> 
             .iter_mut()
             .map(|host| {
                 let snap = host.source.snapshot(elapsed);
-                let (fresh, reachable) = host.freshness.update_received(
+                let longest_gap = host.source.take_longest_gap();
+                let (fresh, reachable) = host.freshness.update_sampled(
                     &snap,
                     host.source.frame_id(),
                     host.source.error().is_none(),
                     Instant::now(),
                     host.source.received_at(),
+                    longest_gap,
                     host.sup.as_mut().map(|s| &mut s.alerts),
                 );
                 // Only a frame that actually arrived: re-recording the last
@@ -652,14 +674,24 @@ fn print_once(cfg: &Config, args: &Args, source: &mut SysinfoSource) -> Result<(
     let filter =
         crabmon::filter::parse(&cfg.filter).map_err(|e| anyhow::anyhow!("bad filter: {e}"))?;
     snap.procs.retain(|p| filter.matches(p));
-    crabmon::sort::sort_rows(&mut snap.procs, cfg.sort_by, cfg.sort_desc);
-    let snap = export::trim_procs(&snap, cfg.export.top_n);
-    let snap = export::redact_commands(&snap, cfg.export.redact_commands);
-
     let format = args
         .format
         .or_else(|| export::ExportFormat::parse(&cfg.export.format))
         .unwrap_or(export::ExportFormat::Json);
+    // Linux reports every thread as a task, carrying its process's memory,
+    // run time and IO. The text report is the TUI's table on paper, and the
+    // TUI hides threads by default; a `--top` limit is a budget for
+    // processes, and a busy daemon's threads used to fill it with copies of
+    // one row. A whole JSON or CSV dump keeps every task, each thread marked
+    // by an absent thread count — it is also what `--remote` reads, and what
+    // lets `H` show a remote host's threads.
+    if !cfg.show_threads && (format == export::ExportFormat::Text || cfg.export.top_n > 0) {
+        crabmon::metrics::retain_processes(&mut snap.procs);
+    }
+    crabmon::sort::sort_rows(&mut snap.procs, cfg.sort_by, cfg.sort_desc);
+    let snap = export::trim_procs(&snap, cfg.export.top_n);
+    let snap = export::redact_commands(&snap, cfg.export.redact_commands);
+
     let mut out = io::stdout().lock();
     // The text table is laid out for whoever is reading it: the terminal's
     // width when there is a terminal, and a fixed width when the output is

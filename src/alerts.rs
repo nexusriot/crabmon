@@ -1506,7 +1506,17 @@ fn measure(
             // A query that did not parse leaves the rule inert. Counting zero
             // instead would make every `below` rule fire for ever on a typo.
             let q = query?;
-            return Some((snap.procs.iter().filter(|p| q.matches(p)).count() as f64, ""));
+            // Processes, not tasks: Linux lists every thread as a task, so
+            // `proc:dockerd>=2` fired on one dockerd with a dozen threads, and
+            // `proc:worker<4` stayed quiet with a single multi-threaded worker.
+            let distinguishable = crate::metrics::threads_are_distinguishable(&snap.procs);
+            let count = snap
+                .procs
+                .iter()
+                .filter(|p| !distinguishable || p.threads.is_some())
+                .filter(|p| q.matches(p))
+                .count();
+            return Some((count as f64, ""));
         }
     };
     if v.is_nan() { None } else { Some((v, "%")) }
@@ -2404,6 +2414,30 @@ mod tests {
         busier.procs.push(worker(5, 5.0, "app"));
         busier.procs.push(worker(6, 5.0, "app"));
         assert_eq!(e.evaluate(&busier, 1).len(), 1);
+    }
+
+    #[test]
+    fn a_proc_rule_counts_processes_not_their_threads() {
+        // Found on a real host: one dockerd with a dozen threads satisfied
+        // `proc:dockerd>=2`, because Linux lists every thread as a task.
+        let mut r = rule("two-dockerds", AlertKind::Proc, 2.0, 0);
+        r.query = "dockerd".into();
+        let mut e = crate::alerts::AlertEngine::new(vec![r]);
+        let task = |pid: u32, threads: Option<usize>| ProcRow {
+            pid,
+            name: "dockerd".into(),
+            threads,
+            ..Default::default()
+        };
+        let snap = Snapshot {
+            procs: vec![task(10, Some(3)), task(11, None), task(12, None)],
+            ..Default::default()
+        };
+        assert!(e.evaluate(&snap, 0).is_empty(), "one process and two of its threads");
+
+        let mut two = snap.clone();
+        two.procs.push(task(20, Some(1)));
+        assert_eq!(e.evaluate(&two, 1).len(), 1);
     }
 
     #[test]

@@ -184,8 +184,16 @@ impl MetricSource for FleetSource {
     fn label(&self) -> Option<String> {
         let host = self.hosts.get(self.selected)?;
         let reachable = self.hosts.iter().filter(|h| h.source.error().is_none()).count();
+        // A host opened from the fleet table that is not answering said only
+        // "fleet 2/3 — db-1" over a dashboard of zeros — `0 cpu`, `up 00:00`
+        // — which reads as a machine, not as no machine. The single-host
+        // source names this UNREACHABLE, and the status line turns red on it.
+        let broken = match host.source.error() {
+            Some(e) => format!(" UNREACHABLE — {e}"),
+            None => String::new(),
+        };
         Some(format!(
-            "fleet {}/{} — {} ({} reachable)",
+            "fleet {}/{} — {}{broken} ({} reachable)",
             self.selected + 1,
             self.hosts.len(),
             host.target,
@@ -587,10 +595,13 @@ mod tests {
         assert!(label.contains("1/3"), "{label}");
         assert!(label.contains("2 reachable"), "{label}");
 
+        assert!(!label.contains("UNREACHABLE"), "{label}");
+
         f.select_host(2);
         let label = f.label().unwrap();
         assert!(label.contains("db-1"), "{label}");
         assert!(label.contains("3/3"), "{label}");
+        assert!(label.contains("UNREACHABLE"), "a dashboard of zeros must explain itself: {label}");
     }
 
     #[test]

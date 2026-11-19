@@ -35,6 +35,24 @@ pub fn compact_bytes(x: u64) -> String {
     if u == 0 || v >= 100.0 { format!("{v:.0}{}", SUF[u]) } else { format!("{v:.1}{}", SUF[u]) }
 }
 
+/// A run time for the process table's nine-character TIME column.
+///
+/// `human_duration` spends eleven characters on two-digit days, so on any
+/// box up for more than a day the column read `17d 03:3…` for every
+/// long-lived process: the truncation ate the minutes and left a dangling
+/// ellipsis. Past a day the seconds are noise anyway; past 99 days, so are
+/// the minutes.
+pub fn compact_duration(secs: u64) -> String {
+    let d = secs / 86_400;
+    let h = (secs % 86_400) / 3_600;
+    let m = (secs % 3_600) / 60;
+    match d {
+        0 => human_duration(secs),
+        1..=99 => format!("{d}d {h:02}:{m:02}"),
+        _ => format!("{d}d {h:02}h"),
+    }
+}
+
 /// `3d 04:12:33`, `04:12:33`, `12:33`.
 pub fn human_duration(secs: u64) -> String {
     let d = secs / 86_400;
@@ -164,6 +182,13 @@ mod tests {
         assert_eq!(human_duration(3_661), "01:01:01");
         assert_eq!(human_duration(16_020), "04:27:00");
         assert_eq!(human_duration(90_061), "1d 01:01:01");
+        // The TIME column is nine wide: every form must fit it.
+        assert_eq!(compact_duration(3_661), "01:01:01");
+        assert_eq!(compact_duration(1_481_051), "17d 03:24");
+        assert_eq!(compact_duration(150 * 86_400 + 7_200), "150d 02h");
+        for secs in [59, 3_661, 90_061, 1_481_051, 99 * 86_400 + 86_399, 9_999 * 86_400] {
+            assert!(compact_duration(secs).chars().count() <= 9, "{secs}");
+        }
     }
 
     #[test]

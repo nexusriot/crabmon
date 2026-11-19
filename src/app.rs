@@ -552,7 +552,8 @@ impl App {
     /// Recompute the filtered, sorted (or tree-ordered) process view and keep
     /// the highlight on the same process rather than the same row number.
     pub fn rebuild_view(&mut self) {
-        let hide_threads = !self.cfg.show_threads && threads_are_distinguishable(&self.snap.procs);
+        let hide_threads =
+            !self.cfg.show_threads && crate::metrics::threads_are_distinguishable(&self.snap.procs);
         let mut rows: Vec<ProcRow> = self
             .snap
             .procs
@@ -2434,15 +2435,6 @@ impl App {
         }
         crate::config::save_to(path, &cfg);
     }
-}
-
-/// Whether this platform lets us tell a thread from a process at all.
-///
-/// On Linux the sampler reports a task count for real processes and `None` for
-/// their threads. Platforms that never report a task count would otherwise have
-/// every row hidden, so the distinction is only applied when it exists.
-fn threads_are_distinguishable(procs: &[ProcRow]) -> bool {
-    procs.iter().any(|p| p.threads.is_some())
 }
 
 /// One row of the grouped process view.

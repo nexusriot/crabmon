@@ -95,6 +95,19 @@ pub struct SysinfoSource {
     prev_majflt: HashMap<u32, (u64, u64)>,
 }
 
+/// A container's root filesystem, mounted on the host.
+///
+/// Docker and containerd mount an `overlay` for every running container under
+/// their state directory, and each one reports the size and usage of whatever
+/// filesystem holds its upper layer — `/`, again, on most hosts. Listed as a
+/// disk each, they pushed real mounts out of the panel and repeated `/`'s
+/// figures once per container, in the panel, the diff and the exporter.
+/// An overlay mounted *as* `/` is kept: that is crabmon running inside a
+/// container, or a live system, and it is the only root there is.
+fn is_container_overlay(mount: &str, fs: &str) -> bool {
+    fs == "overlay" && mount != "/"
+}
+
 fn process_refresh_kind() -> ProcessRefreshKind {
     // `OnlyIfNotSet` keeps the per-tick cost near the old cpu+memory-only refresh
     // while still populating the columns the detail pane needs for new processes.
@@ -576,7 +589,7 @@ impl SysinfoSource {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for (mount, device, fs, kind, removable, total, avail) in listed {
-            if !seen.insert(mount.clone()) {
+            if is_container_overlay(&mount, &fs) || !seen.insert(mount.clone()) {
                 continue;
             }
             let kernel_name = self.device_key(&device, &stats).unwrap_or_default();
@@ -906,6 +919,14 @@ pub fn parse_cpu_list(s: &str, max_cpu: usize) -> Result<Vec<usize>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_rootfs_overlays_are_not_disks_but_an_overlay_root_is() {
+        let layer = "/var/lib/docker/rootfs/overlayfs/6d537c7115ab7d2b1148bf6afb2445fc";
+        assert!(is_container_overlay(layer, "overlay"));
+        assert!(!is_container_overlay("/", "overlay"), "inside a container, / is the overlay");
+        assert!(!is_container_overlay("/home", "ext4"));
+    }
 
     /// The thread count has to be the number of threads the process has.
     ///

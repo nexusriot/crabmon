@@ -13,40 +13,42 @@ and it can print all of it as JSON or CSV for scripts.
 
 This is what it looks like, captured from a one-core VPS with
 `make snapshot` — which drives a real pty through tmux, so this is the
-interface as drawn rather than a description of it:
+interface as drawn rather than a description of it. The hostname, and any
+MAC or IP address or container id, is masked at its own width before the
+capture is written here:
 
 <!-- snapshot:begin -->
 ```text
 ┌ crabmon ─────────────────────────────────────────────────────────────────────────────────────────┐
-│vps3639009.trouble-free.net  Linux (Ubuntu 26.04)      1 cpu  load 0.29 0.27 0.28  up 12d 19:53:22│
+│demo-host.example.net        Linux (Ubuntu 26.04)      1 cpu  load 0.25 0.32 0.24  up 17d 03:45:24│
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ CPU  61.5%  2.10 GHz  usr 48.7 sys 12.8 io 20.5 ─────────┐┌ Network [phys]  ↓ 16.3 KiB/s  ↑ 9.7 K┐
-│100│⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠢⢄                                         ││Iface     ↓ rate    ↑ rate   total    │
-│   │             ⠑⠢⡀               ⢀⣀                    ⣀││eth0      16.3 KiB/ 9.7 KiB/ 20.3 GiB │
-│   │               ⠈⠑⢄         ⢀⡠⠔⠊⠁ ⠉⠉⠒⠒⠤⢄⣀⡀     ⣀⡠⠤⠔⠒⠉⠉ ││                                      │
-│   │                  ⠉⠢⣀  ⢀⡠⠔⠊⠁            ⠈⠉⠑⠒⠉⠉        ││tcp 7 est 0 tw                        │
-│0  │                     ⠑⠊⠁                              │└──────────────────────────────────────┘
-│▅                                                         │┌ Pressure ────────────────────────────┐
-└──────────────────────────────────────────────────────────┘│     some    full    10s              │
-┌ Memory ──────────────────────────────────────────────────┐│cpu    8.4%    0.0%  █░░░░░░░░░░░░░░░ │
-│ 38.0%  623.8 MiB / 1.6 GiB  (1019.0 MiB avail, 1.1 GiB ca││mem    0.0%    0.0%  ░░░░░░░░░░░░░░░░ │
+┌ CPU  28.8%  2.10 GHz  usr 20.0 sys 8.8 ──────────────────┐┌ Network [phys]  ↓ 4.4 KiB/s  ↑ 470 B/┐
+│100│⠑⡄                                                    ││Iface     ↓ rate    ↑ rate   total    │
+│   │ ⠈⠢⡀                                                  ││eth0      4.4 KiB/s 470 B/s  27.8 GiB │
+│   │   ⠘⢄                                                 ││                                      │
+│   │     ⠑⡄                                           ⣀⣀⡠⠤││                                      │
+│0  │      ⠈⠢⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠔⠒⠒⠒⠒⠊⠉⠉    ││tcp 5 est 0 tw                        │
+│▂                                                         │└──────────────────────────────────────┘
+└──────────────────────────────────────────────────────────┘┌ Pressure ────────────────────────────┐
+┌ Memory ──────────────────────────────────────────────────┐│     some    full    10s              │
+│ 34.9%  572.9 MiB / 1.6 GiB  (1.0 GiB avail, 1.1 GiB cache││cpu    2.8%    0.0%  ░░░░░░░░░░░░░░░░ │
+└──────────────────────────────────────────────────────────┘│mem    0.0%    0.0%  ░░░░░░░░░░░░░░░░ │
+┌ Swap ────────────────────────────────────────────────────┐│io     0.1%    0.1%  ░░░░░░░░░░░░░░░░ │
+│████ 47.8%  489.5 MiB / 1024.0 MiB  in 0 B/s out 0 B/s    │└──────────────────────────────────────┘
+└──────────────────────────────────────────────────────────┘┌ Kernel ──────────────────────────────┐
+┌─ Processes ──────────────────────────────────────────────┐│OOM  python3 (683060)       02:19 ago │
+│  PID     USER      S CPU%↓  MEM     DISK      COMMAND    ││OOM  python3 (679354)       22:57 ago │
+│  1       root      S  10.0   10.2M          - systemd    │└──────────────────────────────────────┘
+│  684428  root      S   5.0    8.8M          - crabmon    │┌ Sensors (°C) ────────────────────────┐
+│  680585  root      I   1.2      0B          - kworker/0:…││no temperature sensors                │
+│  2       root      S   0.0      0B          - kthreadd   ││                                      │
+│  3       root      S   0.0      0B          - pool_workq…││                                      │
+│  4       root      I   0.0      0B          - kworker/R-…│└──────────────────────────────────────┘
+│  5       root      I   0.0      0B          - kworker/R-…│┌ Disks  R 0 B/s  W 119.9 KiB/s ───────┐
+│  6       root      I   0.0      0B          - kworker/R-…││/  16.9 GiB / 37.3 GiB  R 0 B/s  W 119│
+│  7       root      I   0.0      0B          - kworker/R-…││█████/boot  245.5 MiB / 973.4 MiB     │
 └──────────────────────────────────────────────────────────┘└──────────────────────────────────────┘
-┌ Swap ────────────────────────────────────────────────────┐┌ Kernel ──────────────────────────────┐
-│ 49.3%  504.7 MiB / 1024.0 MiB  in 10.0 KiB/s out 0 B/s  1││OOM  python3 (482060)       28:27 ago │
-└──────────────────────────────────────────────────────────┘│OOM  python3 (480464)       33:07 ago │
-┌─ Processes ──────────────────────────────────────────────┐│OOM  python3 (478455)       38:58 ago │
-│  PID     USER      S CPU%↓  MEM     DISK      COMMAND    ││OOM  python3 (477047)       47:21 ago │
-│  443796  root      S  28.2   70.2M          - retroshare…│└──────────────────────────────────────┘
-│  1619    usbmux    S  23.1    197M      935K  minio      │┌ Sensors (°C) ────────────────────────┐
-│  484507  root      S   3.8    8.5M          - crabmon    ││no temperature sensors                │
-│  316     root      S   2.6      0B      1.2M  jbd2/sda4-8││                                      │
-│  443783  retrosha… S   1.3   12.0M          - retroshare…││                                      │
-│  1       root      S   0.0   11.0M          - systemd    │└──────────────────────────────────────┘
-│  2       root      S   0.0      0B          - kthreadd   │┌ Disks  R 0 B/s  W 15.7 MiB/s ────────┐
-│  3       root      S   0.0      0B          - pool_workq…││/  16.3 GiB / 37.3 GiB  R 0 B/s  W 15.│
-│  4       root      I   0.0      0B          - kworker/R-…││█████/boot  245.5 MiB / 973.4 MiB     │
-└──────────────────────────────────────────────────────────┘└──────────────────────────────────────┘
- 125 shown of 284 tasks · sort CPU%↓ · 800 ms · [?] help
+ 134 shown of 284 tasks · sort CPU%↓ · 800 ms · [?] help
 ```
 <!-- snapshot:end -->
 
@@ -267,6 +269,9 @@ interface as drawn rather than a description of it:
   TUI, or run `crabmon --once` headless. `--format text` is the `top -b -n1`
   shape, laid out by the same column planner the interface uses, for when the
   question is "what is this box doing" over SSH and `jq` is not the answer.
+  Like the interface, the text table and a `--top` limit leave threads out
+  (`show_threads = true` keeps them); a whole JSON or CSV dump keeps every
+  task, threads marked by an empty thread count.
   A `units` line names any service that has failed or is crash-looping, and
   a `storage` line any array or disk that is degraded, rebuilding or failed.
 - **Record & replay** — `--record` writes every sample to a JSONL file (trimmed
@@ -709,9 +714,10 @@ four gigabytes.
 crabmon --watch 'state:D' --watch-for 30 --watch-timeout 600 || notify-send 'stuck IO'
 ```
 
-`--watch` samples headlessly until the query matches, leaving itself and
-whatever it runs out of the count — its own command line carries the query.
-It exits **1** when it
+`--watch` samples headlessly until the query matches, leaving itself,
+whatever it runs and whatever started it (the `sudo`, `timeout` or `bash -c`
+above it) out of the count — their command lines carry the query too.
+Matches are counted in processes, never threads. It exits **1** when it
 does, printing the matching processes, **0** if `--watch-timeout` elapses
 first, and **2** if the watch cannot run at all — a malformed query or rule, a
 mount crabmon does not measure, a `unit` or `kernel` source it cannot read —

@@ -1048,7 +1048,11 @@ pub fn render_host(
         // N exported an arbitrary handful — on a 2400-process box, every series
         // was an idle kernel thread and not one of the busiest tasks appeared.
         // `--once` and the recorder both sort before truncating; so must this.
-        let mut ranked: Vec<&crate::metrics::ProcRow> = snap.procs.iter().collect();
+        // Threads are left out: each carries its process's memory and IO, so
+        // a busy daemon's threads filled the budget with copies of one series.
+        let distinguishable = crate::metrics::threads_are_distinguishable(&snap.procs);
+        let mut ranked: Vec<&crate::metrics::ProcRow> =
+            snap.procs.iter().filter(|p| !distinguishable || p.threads.is_some()).collect();
         ranked.sort_by(|a, b| {
             b.cpu
                 .partial_cmp(&a.cpu)
