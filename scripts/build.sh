@@ -71,6 +71,45 @@ cmd_bin() {
   say "$BIN_DIR/$NAME  ($(version))"
 }
 
+# Cross-compile for 64-bit ARM (the uConsole's CM4, Raspberry Pi, ...). Static
+# musl by default, so the binary does not care which glibc the device ships.
+# Needs `rustup target add aarch64-unknown-linux-musl` and an aarch64 gcc to
+# link with (Debian/Ubuntu: gcc-aarch64-linux-gnu). Override with ARM64_TARGET
+# or ARM64_LINKER.
+ARM64_TARGET=${ARM64_TARGET:-aarch64-unknown-linux-musl}
+ARM64_LINKER=${ARM64_LINKER:-aarch64-linux-gnu-gcc}
+
+# 32-bit ARM with hard float (Raspberry Pi OS 32-bit, armhf Debian). Dynamic
+# glibc: needs gcc-arm-linux-gnueabihf and the armv7 rustup target. Override
+# with ARMHF_TARGET or ARMHF_LINKER.
+ARMHF_TARGET=${ARMHF_TARGET:-armv7-unknown-linux-gnueabihf}
+ARMHF_LINKER=${ARMHF_LINKER:-arm-linux-gnueabihf-gcc}
+
+build_cross() { # target linker [cargo args...]
+  local target=$1 linker=$2
+  shift 2
+  say "building (release, $target)"
+  local var=CARGO_TARGET_$(echo "$target" | tr 'a-z-' 'A-Z_')_LINKER
+  env "$var=${!var:-$linker}" $CARGO build --release --target "$target" "$@"
+}
+
+build_arm64() { build_cross "$ARM64_TARGET" "$ARM64_LINKER" "$@"; }
+build_armhf() { build_cross "$ARMHF_TARGET" "$ARMHF_LINKER" "$@"; }
+
+cmd_bin_armhf() {
+  build_armhf "$@"
+  mkdir -p "$BIN_DIR"
+  cp -f "target/$ARMHF_TARGET/release/$NAME" "$BIN_DIR/$NAME-armhf"
+  say "$BIN_DIR/$NAME-armhf  ($(version), $ARMHF_TARGET)"
+}
+
+cmd_bin_arm64() {
+  build_arm64 "$@"
+  mkdir -p "$BIN_DIR"
+  cp -f "target/$ARM64_TARGET/release/$NAME" "$BIN_DIR/$NAME-arm64"
+  say "$BIN_DIR/$NAME-arm64  ($(version), $ARM64_TARGET)"
+}
+
 cmd_run() {
   $CARGO run -- "$@"
 }
@@ -180,6 +219,30 @@ cmd_deb() {
   say "packaging"
   $CARGO deb
   ls -1 target/debian/*.deb
+}
+
+# The same package for arm64. cargo-deb maps the target/release assets onto
+# target/<triple>/release and takes the architecture from the target.
+cmd_deb_arm64() {
+  if ! command -v cargo-deb >/dev/null 2>&1; then
+    say "installing cargo-deb"
+    $CARGO install cargo-deb
+  fi
+  build_arm64
+  say "packaging (arm64)"
+  $CARGO deb --no-build --target "$ARM64_TARGET"
+  ls -1 "target/$ARM64_TARGET"/debian/*.deb
+}
+
+cmd_deb_armhf() {
+  if ! command -v cargo-deb >/dev/null 2>&1; then
+    say "installing cargo-deb"
+    $CARGO install cargo-deb
+  fi
+  build_armhf
+  say "packaging (armhf)"
+  $CARGO deb --no-build --target "$ARMHF_TARGET"
+  ls -1 "target/$ARMHF_TARGET"/debian/*.deb
 }
 
 # A tarball of exactly what `install` would put on a machine, for the platforms
@@ -298,6 +361,7 @@ Usage: ./scripts/build.sh <command>       (or: make <command>)
   build        debug build
   release      optimised build
   bin          release build, binary copied to $BIN_DIR/$NAME
+  bin-arm64    cross-compile for aarch64 (uConsole), into $BIN_DIR/$NAME-arm64
   run          run the debug build (extra arguments are passed through)
 
   test         the whole suite: unit tests and every integration suite
@@ -312,6 +376,9 @@ Usage: ./scripts/build.sh <command>       (or: make <command>)
   ci           fmt-check, lint and test — what CI runs
 
   deb          Debian package into target/debian
+  deb-arm64    the same for arm64 (uConsole), cross-compiled
+  bin-armhf    cross-compile for 32-bit ARM, into $BIN_DIR/$NAME-armhf
+  deb-armhf    Debian package for 32-bit ARM (armhf)
   dist         release tarball into $DIST_DIR
   install      install under PREFIX=$PREFIX (honours DESTDIR)
   uninstall    remove what install put there
