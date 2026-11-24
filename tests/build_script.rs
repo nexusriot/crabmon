@@ -115,3 +115,16 @@ fn an_unknown_command_fails_instead_of_quietly_doing_nothing() {
     assert_eq!(status, Some(2), "an unknown command should exit 2");
     assert!(stdout.is_empty(), "the error belongs on stderr: {stdout}");
 }
+
+/// A static binary links nothing, so cargo-deb's `$auto` finds nothing and
+/// leaves `Depends:` empty, which lintian flags. cargo-deb cannot omit the
+/// field, so the script rewrites the package; losing that call silently would
+/// put the warning back.
+#[test]
+fn cross_debs_are_repacked_without_an_empty_depends_field() {
+    let script = read("scripts/build.sh");
+    assert!(script.contains("strip_empty_depends()"), "the repacking helper is gone");
+    let deb_cross = script.split("deb_cross()").nth(1).expect("deb_cross should exist");
+    let body = deb_cross.split("\n}\n").next().unwrap();
+    assert!(body.contains("strip_empty_depends"), "deb_cross no longer calls it:\n{body}");
+}

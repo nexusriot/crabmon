@@ -874,8 +874,60 @@ pub fn render_host(
             })
             .collect::<Vec<_>>(),
     );
+    metric(
+        &mut out,
+        "battery_cycles",
+        "Full charge cycles the battery has been through.",
+        "gauge",
+        &snap
+            .power
+            .batteries
+            .iter()
+            .filter_map(|b| {
+                b.cycle_count.map(|c| (format!("battery=\"{}\"", escape_label(&b.name)), c as f64))
+            })
+            .collect::<Vec<_>>(),
+    );
+    metric(
+        &mut out,
+        "backlight_percent",
+        "Screen backlight level, as a share of its maximum.",
+        "gauge",
+        &snap
+            .power
+            .backlights
+            .iter()
+            .map(|b| (format!("device=\"{}\"", escape_label(&b.name)), b.percent()))
+            .collect::<Vec<_>>(),
+    );
     if let Some(w) = snap.power.rapl_watts {
         metric(&mut out, "package_watts", "CPU package power draw.", "gauge", &plain(w));
+    }
+    // The Pi firmware's throttle word, as the conditions in effect now and
+    // those seen since boot. Absent on a machine with no firmware to ask,
+    // not zero: a PC has not been found healthy by it.
+    if let Some(t) = snap.power.soc.throttle {
+        metric(
+            &mut out,
+            "soc_throttled",
+            "Throttling conditions in effect now: undervoltage, frequency cap, throttling, soft temperature limit.",
+            "gauge",
+            &plain(t.count_now() as f64),
+        );
+        metric(
+            &mut out,
+            "soc_undervoltage",
+            "1 while the supply voltage is below the firmware's threshold.",
+            "gauge",
+            &plain(t.undervoltage_now() as u8 as f64),
+        );
+        metric(
+            &mut out,
+            "soc_throttled_since_boot",
+            "Throttling conditions seen at any point since boot.",
+            "gauge",
+            &plain(t.count_since_boot() as f64),
+        );
     }
 
     let gpu_label = |g: &crate::metrics::GpuInfo| format!("gpu=\"{}\"", escape_label(&g.name));
@@ -1974,7 +2026,44 @@ mod tests {
         assert!(!text.contains("battery_percent"), "no battery must mean no series");
         assert!(!text.contains("gpu_busy_percent"));
         assert!(!text.contains("package_watts"));
+        assert!(!text.contains("soc_throttled"), "no firmware must mean no series");
+        assert!(!text.contains("battery_cycles"));
+        assert!(!text.contains("backlight_percent"));
         assert!(text.contains("crabmon_up 1"), "but the exporter is still up");
+    }
+
+    #[test]
+    fn the_backlight_is_exported_per_device() {
+        let mut s = snap();
+        s.power.backlights.push(crate::metrics::backlight::Backlight {
+            name: "intel_backlight".into(),
+            brightness: 24,
+            max: 96,
+            kind: "raw".into(),
+        });
+        let text = render(&s, 0);
+        assert!(
+            text.contains("crabmon_backlight_percent{device=\"intel_backlight\"} 25"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_boards_throttle_word_and_battery_wear_are_exported() {
+        use crate::metrics::soc::ThrottleFlags;
+        let mut s = snap();
+        s.power.soc.throttle = Some(ThrottleFlags(0x50005));
+        s.power.batteries.push(crate::metrics::power::Battery {
+            name: "BAT0".into(),
+            percent: 80.0,
+            cycle_count: Some(212),
+            ..Default::default()
+        });
+        let text = render(&s, 0);
+        assert!(text.contains("crabmon_soc_throttled 2"), "{text}");
+        assert!(text.contains("crabmon_soc_undervoltage 1"), "{text}");
+        assert!(text.contains("crabmon_soc_throttled_since_boot 2"), "{text}");
+        assert!(text.contains("crabmon_battery_cycles{battery=\"BAT0\"} 212"), "{text}");
     }
 
     #[test]

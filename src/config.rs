@@ -220,6 +220,16 @@ pub struct ProcsConfig {
     /// memory" on a machine that forks — a browser, a database with workers
     /// — where RSS counts every shared page once per process holding it.
     pub pss: bool,
+    /// Measure each process's TCP traffic, which adds the NET column and
+    /// makes `net` a sort key. Off by default: it runs `ss` on every sample,
+    /// a dump of every TCP socket on the machine.
+    ///
+    /// The kernel counts bytes per interface, not per process; the only
+    /// per-process figure it exposes without eBPF is the counter on each TCP
+    /// socket. So this is TCP only (UDP and QUIC read as quiet), and a
+    /// connection that opens and closes between two samples is not counted.
+    /// Other users' processes need root.
+    pub net: bool,
     /// Rows to keep pinned across restarts is meaningless — PIDs are recycled —
     /// but the marker column can be switched off.
     pub pin_marker: bool,
@@ -227,7 +237,14 @@ pub struct ProcsConfig {
 
 impl Default for ProcsConfig {
     fn default() -> Self {
-        Self { columns: Vec::new(), ports: false, fds: false, pss: false, pin_marker: true }
+        Self {
+            columns: Vec::new(),
+            ports: false,
+            fds: false,
+            pss: false,
+            net: false,
+            pin_marker: true,
+        }
     }
 }
 
@@ -368,6 +385,9 @@ pub struct Config {
     /// Aggregate the process table by systemd unit, container or user.
     pub group_by: GroupBy,
     pub layout: Layout,
+    /// The small-screen dashboard: a few lines of vitals over a full-width
+    /// process table, in place of the multi-panel one.
+    pub compact: crate::ui::Compact,
     pub theme: String,
     pub group_sensors: bool,
     pub show_virtual_ifaces: bool,
@@ -417,6 +437,7 @@ impl Default for Config {
             layout: Layout::Dashboard,
             theme: "default".into(),
             group_sensors: true,
+            compact: crate::ui::Compact::Auto,
             show_virtual_ifaces: false,
             virtual_iface_prefixes: netclass::default_prefixes(),
             history_len: 240,

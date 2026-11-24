@@ -3,6 +3,96 @@
 Notable changes to crabmon. Versions follow [semantic versioning](https://semver.org),
 with the usual 0.x caveat that minor releases may change behaviour.
 
+## 0.19.0 — unreleased
+
+For the machines crabmon is carried around on: a dashboard that fits a
+handheld's screen, what a Raspberry Pi's firmware knows about its own power,
+the screen backlight, GPUs on ARM boards, and the first per-process answers
+to "who is using the swap" and "who is using the network". Packaging grows to every architecture it will be asked to
+run on.
+
+### Added
+
+- **Small screens.** Below 100×30 the dashboard collapses to a box of vitals
+  — CPU, memory, swap, load, network, disk, the hottest sensor, each battery
+  with its time left and draw — over a full-width process table, instead of
+  leaving the table a sliver beside a column of panels. `compact = "auto"`
+  (the default), `"on"` or `"off"`, and `C` cycles it; the other layouts are
+  unchanged.
+- **Board and battery detail.** The power panel shows each battery's health
+  and charge cycles, and on a Raspberry Pi or another board with the Pi
+  firmware, the clock against its ceiling, the governor and the firmware's
+  throttle word, telling an undervoltage *now* from one that happened since
+  boot. New `battery` and `soc` alert kinds (`battery:remaining<600`,
+  `soc:undervoltage>=1`), Prometheus `crabmon_soc_*` and `crabmon_battery_cycles`,
+  and `--doctor` checks for the board and for `ss`.
+- **Per-process swap and network.** `[procs] pss` also reads swapped memory:
+  a SWAP column and `-s swap`. `[procs] net` adds NET/s and `-s net`, each
+  process's TCP bytes per second from the per-socket counters `ss` reports —
+  TCP only, live sockets only, root for other users' processes. Both appear
+  in the detail pane.
+- **Anomaly alerts.** `kind = "anomaly"` fires on a series (`cpu`, `mem`,
+  `swap`, `load`, `io`, `net`, `temp`) straying from its own recent normal, in
+  standard deviations over the rule's window — `anomaly:cpu>3/30m` — so a
+  machine with a nightly job needs no per-host threshold. Silent until the
+  window is half full.
+- **Backlight.** The screen backlight level, from `/sys/class/backlight`, on
+  the power panel, in the compact dashboard beside the battery, and as
+  `crabmon_backlight_percent`. `b` and `B` brighten and dim it by a tenth of
+  its range, never to black, on the machine crabmon is running on only;
+  `--doctor` says whether it may write to it.
+- **ARM GPUs.** Mali (Panfrost, Lima, the vendor driver) and other SoC GPUs
+  are read from devfreq — clock, ceiling, load where the driver has one, the
+  GPU's own thermal zone — and a Raspberry Pi's VideoCore from `vcgencmd`
+  (its clock and the memory reserved for it). The DRM scan used to find these
+  cards and drop them as empty. A VideoCore has no load figure available
+  without debugfs, so its row shows the clock; `--doctor` says when
+  `vcgencmd` is missing.
+- **Packaging.** `make rpm`; `bin-`, `deb-` and `rpm-` targets for `arm64`,
+  `armhf`, `riscv64` and `static` (musl x86-64), each naming the rustup target
+  or linker it is missing before compiling anything.
+
+### Fixed
+
+Found by running the build against a real VPS (Ubuntu 26.04, one CPU, 21 days
+up) rather than a test fixture.
+
+- **A first network rate of hundreds of GiB/s.** The sampler thread measured
+  the gap before the second sample from when it started, not from when the
+  first sample was read, so the second sample of every TUI run divided a
+  second's traffic by a few microseconds. On a 20 GiB interface that was a
+  305 GiB/s point in the chart's history, which set its scale and flattened
+  everything after it until it scrolled out four minutes later. The source now
+  checks the interval it is given against the time that really passed.
+- **SWAP and NET/s were silently missing on a narrow terminal** with both
+  `pss` and `net` switched on: the automatic layout had spent the width on
+  free columns. A measured column now displaces the free ones, least valuable
+  first.
+- **The PSS and FD columns followed the local config** while SWAP and NET/s
+  followed the data, so `--remote` and `--replay` drew half of one read. All
+  four follow the data.
+- **The detail pane said `off ([procs] pss)` about a kernel thread** on a
+  machine where PSS was on: a kernel thread has no `smaps_rollup`. It now says
+  "not readable" when anything in the sample was measured, and "off" only when
+  nothing was.
+- **Control chords were typed as their letter.** Terminals deliver Ctrl-U as
+  `u` plus a modifier and every handler matched the letter, so Ctrl-U in the
+  filter prompt inserted a `u` (`sleep` became `usleep`, an empty table), and
+  in the table it opened the unit pane. Ctrl and Alt chords are now line
+  editing where there is a line — `Ctrl-U` clears it, `Ctrl-W` deletes a word —
+  and nothing where there is not. AltGr, which some layouts type `@` with,
+  still types.
+- **An incident summary's "busiest processes" listed threads** — a daemon's
+  `SSU2` and `tokio-rt-worker`, three of the eight rows, each carrying the
+  daemon's memory.
+- **`make deb-static`, `deb-arm64` and `deb-riscv64` produced a package with
+  an empty `Depends:` field**, which lintian flags; the script now removes it.
+  The deb also `Suggests` the tools crabmon uses when they are there
+  (`iproute2`, `smartmontools`, `libraspberrypi-bin`), installs the changelog
+  under its real name, and no longer opens its description with an article.
+- **`--watch-rule` text output printed seventeen digits** of a measured
+  value (`41.20071049646773 against a threshold of 0`).
+
 ## 0.18.0 — unreleased
 
 The other half of a crash loop: what the unit itself said before it died, and

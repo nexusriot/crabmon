@@ -86,7 +86,11 @@ src/
     units.rs         systemd failures and restart loops via `systemctl show`,
                      journal tails via `journalctl`, restart and reset
     power.rs         batteries, mains and RAPL
-    smaps.rs         proportional and unique memory per process
+    smaps.rs         proportional, unique and swapped memory per process
+    procnet.rs       per-process TCP bytes from `ss`, as rates
+    soc.rs           Raspberry Pi throttle word, clock ceiling, governor
+    backlight.rs     screen backlight level, and stepping it
+    socgpu.rs        Mali (devfreq) and Raspberry Pi VideoCore (vcgencmd) GPUs
     kmsg.rs          OOM kills, crashes and IO errors from /dev/kmsg
     ioprio.rs        IO scheduling class and level
     procdetail.rs    OOM score, cgroup path and environment, per process

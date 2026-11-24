@@ -3,7 +3,7 @@ complete -c crabmon -f
 
 complete -c crabmon -s r -l refresh -r -d 'Refresh interval in ms (200-10000)'
 complete -c crabmon -s s -l sort -r -d 'Sort column' \
-    -a 'pid name cpu mem virt disk time user state threads nice fds pss growth majflt'
+    -a 'pid name cpu mem virt disk time user state threads nice fds pss growth majflt swap net'
 complete -c crabmon -s a -l ascending -d 'Sort ascending'
 complete -c crabmon -s d -l descending -d 'Sort descending (the default)'
 complete -c crabmon -s f -l filter -r -d 'Initial process filter'
@@ -30,7 +30,7 @@ complete -c crabmon -l serve -r -d 'Serve Prometheus metrics on ADDR'
 complete -c crabmon -l stream -d 'Print one JSON snapshot per line forever'
 complete -c crabmon -l alerts -d 'With --serve/--stream: evaluate alert rules headlessly'
 complete -c crabmon -l columns -r -d 'Process-table columns, comma separated' \
-    -a 'mark pid user state cpu trend mem pss growth majflt virt thr ni fd disk time ports name'
+    -a 'mark pid user state cpu trend mem pss swap growth majflt net virt thr ni fd disk time ports name'
 complete -c crabmon -l diff -r -F -d 'Compare two snapshots, or one recording end to end'
 complete -c crabmon -l doctor -d 'Report what this host lets crabmon measure, and exit'
 complete -c crabmon -l watch -r -d 'Block until processes match QUERY, then exit 1'

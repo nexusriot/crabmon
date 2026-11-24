@@ -1,13 +1,13 @@
 [package]
 name = "crabmon"
-version = "0.18.0"
+version = "0.19.0"
 edition = "2024"
 # The floor is the highest any dependency asks for, not the edition's own
 # 1.85: sysinfo 0.40 wants 1.95. Declared so cargo refuses an older toolchain
 # with a sentence naming the package, which is how the e2e image's pinned
 # rust 1.90 announced itself rather than failing somewhere in a build log.
 rust-version = "1.95"
-description = "A fast, keyboard-driven terminal system monitor"
+description = "Fast, keyboard-driven terminal system monitor"
 repository = "https://github.com/nexusriot/crabmon"
 license = "MIT"
 
@@ -76,8 +76,27 @@ assets = [
   ["completions/crabmon.zsh", "/usr/share/zsh/vendor-completions/_crabmon", "644"],
   ["completions/crabmon.fish", "/usr/share/fish/vendor_completions.d/crabmon.fish", "644"],
   ["README.md", "/usr/share/doc/crabmon/README.md", "644"],
-  ["docs/CHANGELOG.md", "/usr/share/doc/crabmon/changelog", "644"],
+  ["docs/CHANGELOG.md", "/usr/share/doc/crabmon/CHANGELOG.md", "644"],
   ["docs/DESIGN.md", "/usr/share/doc/crabmon/DESIGN.md", "644"]
 ]
 section = "utils"
 priority = "optional"
+# What crabmon can use when it is there, and does without when it is not: `ss`
+# for per-process network, smartctl for disk health, vcgencmd on a Raspberry Pi.
+suggests = "iproute2, smartmontools, libraspberrypi-bin"
+
+# The same files as the deb, for `make rpm` (cargo-generate-rpm, which needs no
+# rpmbuild). Completions go where Fedora and openSUSE look for them, which is
+# not where Debian does for zsh.
+[package.metadata.generate-rpm]
+assets = [
+  { source = "target/release/crabmon", dest = "/usr/bin/crabmon", mode = "755" },
+  { source = "docs/crabmon.1", dest = "/usr/share/man/man1/crabmon.1", mode = "644", doc = true },
+  { source = "completions/crabmon.bash", dest = "/usr/share/bash-completion/completions/crabmon", mode = "644" },
+  { source = "completions/crabmon.zsh", dest = "/usr/share/zsh/site-functions/_crabmon", mode = "644" },
+  { source = "completions/crabmon.fish", dest = "/usr/share/fish/vendor_completions.d/crabmon.fish", mode = "644" },
+  { source = "README.md", dest = "/usr/share/doc/crabmon/README.md", mode = "644", doc = true },
+  { source = "docs/CHANGELOG.md", dest = "/usr/share/doc/crabmon/CHANGELOG.md", mode = "644", doc = true },
+  { source = "docs/DESIGN.md", dest = "/usr/share/doc/crabmon/DESIGN.md", mode = "644", doc = true },
+  { source = "LICENSE", dest = "/usr/share/licenses/crabmon/LICENSE", mode = "644", license = true },
+]

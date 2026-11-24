@@ -6,6 +6,15 @@
 /bin/
 /dist/
 
+# Packages from `make deb`, `make rpm` and their cross variants normally stay
+# under target/; a copy fetched or moved into the checkout should not be
+# committed.
+*.deb
+*.rpm
+
+# Claude Code's per-checkout permissions and scratch state.
+/.claude/settings.local.json
+
 # Editor and OS cruft
 /.vscode/
 /.idea/

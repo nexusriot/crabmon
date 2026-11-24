@@ -30,9 +30,14 @@ pub enum SortBy {
     Growth,
     /// Major page faults per second.
     MajFlt,
+    /// Memory pushed to swap. Always `-` unless `[procs] pss` is on.
+    Swap,
+    /// TCP bytes per second, both directions. Always `-` unless `[procs] net`
+    /// is on.
+    Net,
 }
 
-pub const ALL_SORTS: [SortBy; 15] = [
+pub const ALL_SORTS: [SortBy; 17] = [
     SortBy::Pid,
     SortBy::Name,
     SortBy::Cpu,
@@ -48,6 +53,8 @@ pub const ALL_SORTS: [SortBy; 15] = [
     SortBy::Pss,
     SortBy::Growth,
     SortBy::MajFlt,
+    SortBy::Swap,
+    SortBy::Net,
 ];
 
 impl SortBy {
@@ -68,6 +75,8 @@ impl SortBy {
             SortBy::Pss => "PSS",
             SortBy::Growth => "GROWTH",
             SortBy::MajFlt => "MAJFLT",
+            SortBy::Swap => "SWAP",
+            SortBy::Net => "NET",
         }
     }
 
@@ -96,6 +105,8 @@ impl SortBy {
             SortBy::Pss => "pss",
             SortBy::Growth => "growth",
             SortBy::MajFlt => "majflt",
+            SortBy::Swap => "swap",
+            SortBy::Net => "net",
         }
     }
 
@@ -138,6 +149,13 @@ pub fn compare(a: &ProcRow, b: &ProcRow, key: SortBy, desc: bool) -> Ordering {
             .major_faults_ps
             .unwrap_or(-1.0)
             .partial_cmp(&b.major_faults_ps.unwrap_or(-1.0))
+            .unwrap_or(Ordering::Equal),
+        SortBy::Swap => a.swap.cmp(&b.swap),
+        // Unmeasured sorts below measured-and-idle, as it does for MAJFLT.
+        SortBy::Net => a
+            .net_bps()
+            .unwrap_or(-1.0)
+            .partial_cmp(&b.net_bps().unwrap_or(-1.0))
             .unwrap_or(Ordering::Equal),
     };
     let primary = if desc { primary.reverse() } else { primary };
@@ -194,6 +212,28 @@ mod tests {
         let mut rows = vec![row(1, "zsh", 0.0, 0), row(2, "Apache", 0.0, 0)];
         sort_rows(&mut rows, SortBy::Name, false);
         assert_eq!(rows[0].name, "Apache");
+    }
+
+    #[test]
+    fn swap_and_network_sort_with_unmeasured_below_measured_and_idle() {
+        let swapped = ProcRow { pid: 1, swap: Some(5 << 20), ..ProcRow::default() };
+        let clean = ProcRow { pid: 2, swap: Some(0), ..ProcRow::default() };
+        let unmeasured = ProcRow { pid: 3, ..ProcRow::default() };
+        let mut rows = vec![unmeasured.clone(), clean.clone(), swapped.clone()];
+        sort_rows(&mut rows, SortBy::Swap, true);
+        assert_eq!(rows.iter().map(|r| r.pid).collect::<Vec<_>>(), vec![1, 2, 3]);
+
+        let busy = ProcRow {
+            pid: 1,
+            net_rx_bps: Some(900.0),
+            net_tx_bps: Some(100.0),
+            ..ProcRow::default()
+        };
+        let idle =
+            ProcRow { pid: 2, net_rx_bps: Some(0.0), net_tx_bps: Some(0.0), ..ProcRow::default() };
+        let mut rows = vec![unmeasured, idle, busy];
+        sort_rows(&mut rows, SortBy::Net, true);
+        assert_eq!(rows.iter().map(|r| r.pid).collect::<Vec<_>>(), vec![1, 2, 3]);
     }
 
     #[test]

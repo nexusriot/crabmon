@@ -2,6 +2,8 @@
 //!
 //! * amdgpu exposes `gpu_busy_percent` and VRAM counters.
 //! * i915/xe expose current and max clocks but no busy percentage.
+//! * Mali and other SoC GPUs sit behind devfreq, and a Raspberry Pi's
+//!   VideoCore is read through `vcgencmd`; see `socgpu.rs`.
 //! * NVIDIA exposes nothing useful in sysfs, so it is read via `nvidia-smi`
 //!   only when the user opts in (`[gpu] nvidia_smi = true`).
 
@@ -181,6 +183,13 @@ fn query_nvidia_smi() -> Vec<GpuInfo> {
 /// is a poller.
 pub fn read_all(nvidia: Option<&NvidiaSmi>) -> Vec<GpuInfo> {
     let mut gpus = scan_drm(Path::new("/sys/class/drm"));
+    // SoC GPUs, which the DRM scan finds and drops as empty: Mali behind
+    // devfreq, and a Raspberry Pi's VideoCore through the firmware.
+    gpus.extend(super::socgpu::read(
+        Path::new("/sys/class/drm"),
+        Path::new("/sys/class/devfreq"),
+        Path::new("/sys/class/thermal"),
+    ));
     if let Some(nvidia) = nvidia {
         gpus.extend(nvidia.latest());
     }

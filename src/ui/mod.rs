@@ -40,6 +40,62 @@ pub enum Layout {
     Fleet,
 }
 
+/// Whether the dashboard collapses to its small-screen form.
+///
+/// A handheld such as the uConsole shows about 100 columns by 30 rows at a
+/// readable size, and the full dashboard — CPU history, two bars, a side
+/// column of eight panels — leaves the process table a sliver of that.
+/// Compact keeps the vitals to a few lines and gives the rest to processes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Compact {
+    /// Compact when the terminal is smaller than `COMPACT_BELOW`.
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+/// Narrower or shorter than this, `auto` picks the compact dashboard.
+pub const COMPACT_BELOW: (u16, u16) = (100, 30);
+
+impl Compact {
+    pub fn name(self) -> &'static str {
+        match self {
+            Compact::Auto => "auto",
+            Compact::On => "on",
+            Compact::Off => "off",
+        }
+    }
+
+    /// `auto` → `on` → `off` → `auto`, which is what the `C` key walks.
+    pub fn next(self) -> Compact {
+        match self {
+            Compact::Auto => Compact::On,
+            Compact::On => Compact::Off,
+            Compact::Off => Compact::Auto,
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Compact> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Compact::Auto),
+            "on" | "true" | "yes" => Some(Compact::On),
+            "off" | "false" | "no" => Some(Compact::Off),
+            _ => None,
+        }
+    }
+
+    /// Whether a terminal of this size gets the compact dashboard.
+    pub fn applies(self, width: u16, height: u16) -> bool {
+        match self {
+            Compact::On => true,
+            Compact::Off => false,
+            Compact::Auto => width < COMPACT_BELOW.0 || height < COMPACT_BELOW.1,
+        }
+    }
+}
+
 /// Every layout, in the order `Tab` cycles them.
 ///
 /// A list rather than a hand-maintained one in the docs tests, for the reason
@@ -115,6 +171,9 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
         header::draw(f, chunks[0], app);
     }
     match app.cfg.layout {
+        Layout::Dashboard if app.cfg.compact.applies(size.width, size.height) => {
+            draw_compact(f, chunks[1], app)
+        }
         Layout::Dashboard => draw_dashboard(f, chunks[1], app),
         Layout::Processes => procs::draw(f, chunks[1], app),
         Layout::Cpu => cpu::draw_detail(f, chunks[1], app),
@@ -138,6 +197,108 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
         Mode::Unit => popups::unit(f, size, app),
         Mode::Silence => popups::silence(f, size, app),
         Mode::Normal | Mode::Filter => {}
+    }
+}
+
+/// The vitals the compact dashboard shows, one string per line.
+///
+/// Pure so it can be asserted on without a terminal. Each line is built from
+/// segments that drop out when the machine has nothing to say — no battery,
+/// no sensors — instead of reading `n/a`, and is cut to `width` rather than
+/// left to wrap into the table below it.
+pub fn compact_lines(app: &App, width: usize) -> Vec<String> {
+    use crate::format::{compact_bytes, human_duration, truncate_fit};
+    let snap = &app.snap;
+
+    let mut vitals = vec![
+        format!("CPU {:>3.0}%", snap.cpu.avg()),
+        format!(
+            "MEM {:>3.0}% {}/{}",
+            snap.mem.ratio() * 100.0,
+            compact_bytes(snap.mem.used),
+            compact_bytes(snap.mem.total)
+        ),
+    ];
+    if snap.mem.swap_total > 0 {
+        vitals.push(format!("SWP {:>3.0}%", snap.mem.swap_ratio() * 100.0));
+    }
+    vitals.push(format!("LOAD {:.2}", snap.host.load[0]));
+
+    let (rx, tx) = snap.net_totals(app.cfg.show_virtual_ifaces);
+    let mut io = vec![format!("NET ↓{} ↑{}", compact_bytes(rx as u64), compact_bytes(tx as u64))];
+    if let Some(util) = snap.disk_util_max() {
+        io.push(format!("DISK {util:.0}%"));
+    }
+    if let Some(hot) = snap
+        .sensors
+        .iter()
+        .map(|s| s.temp)
+        .fold(None, |a: Option<f32>, t| Some(a.map_or(t, |x| x.max(t))))
+    {
+        io.push(format!("TEMP {hot:.0}°C"));
+    }
+    for b in &snap.power.batteries {
+        let arrow = if b.is_charging() {
+            "↑"
+        } else if b.is_discharging() {
+            "↓"
+        } else {
+            ""
+        };
+        let mut text = format!("BAT {:.0}%{arrow}", b.percent);
+        if let Some(secs) = b.time_remaining_secs {
+            text.push(' ');
+            text.push_str(&human_duration(secs));
+        }
+        if let Some(w) = b.power_w {
+            text.push_str(&format!(" {}", power::watts_text(Some(w)).trim()));
+        }
+        io.push(text);
+    }
+
+    // The backlight is the biggest draw a handheld has, and the one a person
+    // can change; it earns a place beside the battery it is draining.
+    for b in &snap.power.backlights {
+        io.push(format!("BRT {:.0}%", b.percent()));
+    }
+
+    let mut lines = vec![vitals.join("  "), io.join("  ")];
+
+    // Trouble last and loud: the board's own warning, then alerts. These are
+    // the lines worth a row of a screen this small.
+    if let Some((text, Some(true))) = power::throttle_text(&snap.power.soc) {
+        lines.push(format!("! {text}"));
+    }
+    lines.iter().map(|l| truncate_fit(l, width)).collect()
+}
+
+/// The small-screen dashboard: a few lines of vitals, then the process table
+/// over the full width.
+fn draw_compact(f: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let width = area.width.saturating_sub(2) as usize;
+    let lines = compact_lines(app, width);
+    let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(3));
+    let slots = rows(area, vec![Constraint::Length(h), Constraint::Min(3)]);
+
+    let b = block(app, " crabmon ");
+    let inner = b.inner(slots[0]);
+    f.render_widget(b, slots[0]);
+    let text: Vec<ratatui::text::Line> = lines
+        .into_iter()
+        .map(|l| {
+            // The warning line is the only one starting with `!`.
+            let style = if l.starts_with('!') {
+                Style::default().fg(app.theme.crit)
+            } else {
+                Style::default().fg(app.theme.text)
+            };
+            ratatui::text::Line::from(ratatui::text::Span::styled(l, style))
+        })
+        .collect();
+    f.render_widget(ratatui::widgets::Paragraph::new(text), inner);
+
+    if app.cfg.panels.procs {
+        procs::draw(f, slots[1], app);
     }
 }
 
@@ -199,7 +360,7 @@ fn draw_side_column(f: &mut Frame<'_>, area: Rect, app: &mut App) {
                 ("kernel", Constraint::Length(kernel::height(app)))
             }
             "power" if app.cfg.panels.power && app.snap.power.is_available() => {
-                ("power", Constraint::Length(app.snap.power.batteries.len().max(1) as u16 + 3))
+                ("power", Constraint::Length(power::height(app)))
             }
             _ => continue,
         };

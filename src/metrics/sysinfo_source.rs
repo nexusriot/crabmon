@@ -14,7 +14,7 @@ use super::procgroup::CgroupPaths;
 use super::{
     CpuSample, DiskRow, GpuInfo, HostInfo, MemSample, MetricSource, NetIface, ProcRow, Sensor,
     Snapshot, cgroup, containers, fds, gpu, identity, kmsg, kstat, meminfo, netclass, netns,
-    netstat, power, procgroup, psi, rate, smaps, smart, storage, units,
+    netstat, power, procgroup, procnet, psi, rate, smaps, smart, storage, units,
 };
 
 /// Device lists (mounted filesystems, interfaces, sensors) are rescanned on this
@@ -88,6 +88,13 @@ pub struct SysinfoSource {
     /// Read `/proc/<pid>/smaps_rollup` per process. Opt-in for the same
     /// reason the descriptor walk is: one more read per process per sample.
     read_pss: bool,
+    /// Read per-process TCP byte rates from `ss`. Opt-in: one `ss` run per
+    /// sample.
+    read_net: bool,
+    net: procnet::NetTracker,
+    /// When the counters were last read, so the interval a rate is divided
+    /// by can be the real one; see `effective_interval`.
+    last_sampled: Option<Instant>,
     host: HostInfo,
     sample_ticks: HashMap<u32, u64>,
     /// Each process's major-fault counter at the last sample, with the start
@@ -261,6 +268,9 @@ impl SysinfoSource {
             smart: None,
             count_fds: false,
             read_pss: false,
+            read_net: false,
+            net: procnet::NetTracker::default(),
+            last_sampled: None,
             host,
             sample_ticks: HashMap::new(),
             prev_majflt: HashMap::new(),
@@ -286,6 +296,12 @@ impl SysinfoSource {
 
     pub fn with_pss(mut self, read_pss: bool) -> SysinfoSource {
         self.read_pss = read_pss;
+        self
+    }
+
+    /// Measure each process's TCP traffic; see `[procs] net`.
+    pub fn with_net(mut self, read_net: bool) -> SysinfoSource {
+        self.read_net = read_net;
         self
     }
 
@@ -325,6 +341,15 @@ impl SysinfoSource {
     fn collect_procs(&mut self, secs: f64) -> Vec<ProcRow> {
         let mut seen: HashSet<u32> = HashSet::with_capacity(self.sys.processes().len());
         let mut rows = Vec::with_capacity(self.sys.processes().len());
+
+        // One `ss` run for the whole table, before the loop. `None` where it
+        // cannot be run, which leaves every row's figure unmeasured rather
+        // than claiming the machine is idle.
+        let net_rates = if self.read_net {
+            procnet::read().map(|socks| self.net.update(&socks, secs))
+        } else {
+            None
+        };
 
         for (pid, p) in self.sys.processes() {
             let pid_u = pid.as_u32();
@@ -413,6 +438,17 @@ impl SysinfoSource {
                 mem: p.memory(),
                 pss: rollup.map(|r| r.pss),
                 uss: rollup.map(|r| r.uss),
+                swap: rollup.map(|r| r.swap),
+                // A process with no sockets is a process moving nothing, which
+                // is a measurement; only a failed `ss` leaves it blank.
+                net_rx_bps: net_rates
+                    .as_ref()
+                    .filter(|_| is_process)
+                    .map(|m| m.get(&pid_u).map_or(0.0, |r| r.rx_bps)),
+                net_tx_bps: net_rates
+                    .as_ref()
+                    .filter(|_| is_process)
+                    .map(|m| m.get(&pid_u).map_or(0.0, |r| r.tx_bps)),
                 virt: p.virtual_memory(),
                 state: status_char(p.status()),
                 uid: uid_of(p),
@@ -684,9 +720,32 @@ impl SysinfoSource {
     }
 }
 
+/// The interval to divide a counter's growth by: the time that really passed
+/// between the two reads, never less than the caller's own figure.
+///
+/// The caller's `dt` is a promise about the gap between samples, and the
+/// sampler thread kept it from the wrong clock — measured from when it
+/// started, not from when the first sample was read — so the second sample of
+/// every TUI run arrived with a gap of a few microseconds for a second's worth
+/// of traffic. The result was a first network rate of 305 GiB/s on a 20 GiB
+/// interface, which stayed in the chart's history and set its scale until it
+/// scrolled out four minutes later. The source knows when it last read the
+/// counters, so it checks the figure against that. Larger `dt` is kept — a
+/// caller that measured a longer gap is not contradicted — and the first
+/// sample, which has nothing to compare, keeps `dt`, which is zero and means
+/// "learn the baseline, report no rates".
+pub fn effective_interval(last: Option<Instant>, now: Instant, dt: Duration) -> Duration {
+    match last {
+        Some(prev) if !dt.is_zero() => dt.max(now.saturating_duration_since(prev)),
+        _ => dt,
+    }
+}
+
 impl MetricSource for SysinfoSource {
     fn snapshot(&mut self, dt: Duration) -> Snapshot {
-        let secs = dt.as_secs_f64();
+        let started = Instant::now();
+        let secs = effective_interval(self.last_sampled, started, dt).as_secs_f64();
+        self.last_sampled = Some(started);
         self.relist_if_due();
         self.kmsg.drain();
 
@@ -1000,5 +1059,67 @@ mod tests {
     #[test]
     fn the_refresh_floor_matches_what_sysinfo_requires() {
         assert!(MIN_REFRESH >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+    }
+
+    #[test]
+    fn a_tiny_gap_from_the_caller_is_raised_to_the_time_that_really_passed() {
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_millis(900);
+        // The sampler thread's second request: microseconds by its clock,
+        // nearly a second by the counters'.
+        assert_eq!(
+            effective_interval(Some(t0), later, Duration::from_micros(5)),
+            Duration::from_millis(900)
+        );
+        // A caller that measured a longer gap is not contradicted.
+        assert_eq!(
+            effective_interval(Some(t0), later, Duration::from_secs(2)),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn the_first_sample_and_a_zero_gap_still_mean_no_rates() {
+        let now = Instant::now();
+        // Nothing to compare against: the caller's figure stands, and zero
+        // makes every rate zero rather than the growth since boot.
+        assert_eq!(effective_interval(None, now, Duration::ZERO), Duration::ZERO);
+        assert_eq!(
+            effective_interval(None, now, Duration::from_millis(5)),
+            Duration::from_millis(5)
+        );
+        // Zero asked for explicitly stays zero even with a history.
+        let t0 = now - Duration::from_secs(3);
+        assert_eq!(effective_interval(Some(t0), now, Duration::ZERO), Duration::ZERO);
+        // A clock that appears to run backwards does not underflow.
+        assert_eq!(
+            effective_interval(Some(now + Duration::from_secs(1)), now, Duration::from_millis(7)),
+            Duration::from_millis(7)
+        );
+    }
+
+    /// The whole path, against the real counters: a second sample taken after
+    /// a real pause but announced as microseconds must report the traffic over
+    /// the pause, not over the microseconds.
+    #[test]
+    fn a_second_sample_announced_as_instant_is_divided_by_the_real_gap() {
+        let Ok(mut source) = SysinfoSource::new(vec![], false) else { return };
+        let first = source.snapshot(Duration::ZERO);
+        std::thread::sleep(Duration::from_millis(400));
+        let second = source.snapshot(Duration::from_micros(2));
+        for n in &second.nets {
+            let Some(before) = first.nets.iter().find(|b| b.name == n.name) else { continue };
+            let grew = n.rx_total.saturating_sub(before.rx_total) as f64;
+            // The rate can be no more than the growth over the pause (a
+            // little under 400 ms of it, allowing for the clock). Divided by
+            // two microseconds it was two hundred thousand times that.
+            assert!(
+                n.rx_bps <= grew / 0.3 + 1.0,
+                "{}: {} B/s from {} bytes over a 400 ms pause",
+                n.name,
+                n.rx_bps,
+                grew
+            );
+        }
     }
 }

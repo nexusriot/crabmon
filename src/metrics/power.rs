@@ -25,6 +25,13 @@ pub struct Battery {
     pub time_remaining_secs: Option<u64>,
     /// Design capacity remaining, 0..100 — how worn the cell is.
     pub health_percent: Option<f64>,
+    /// Full charge cycles the cell has been through. A pack is worn out by
+    /// these rather than by age, which is what `health_percent` is the
+    /// consequence of. Not every fuel gauge counts them.
+    pub cycle_count: Option<u32>,
+    pub voltage_v: Option<f64>,
+    /// Cell temperature in °C, where the gauge has a sensor.
+    pub temp_c: Option<f64>,
 }
 
 impl Battery {
@@ -44,11 +51,21 @@ pub struct PowerSample {
     pub ac_online: Option<bool>,
     /// Package power draw from RAPL, when the counters are readable.
     pub rapl_watts: Option<f64>,
+    /// The board's own state, on a Raspberry Pi and its relatives: throttle
+    /// word, clock ceiling, governor. Empty everywhere else.
+    pub soc: super::soc::SocSample,
+    /// Screen backlights, which on a laptop or handheld are the biggest
+    /// single draw there is.
+    pub backlights: Vec<super::backlight::Backlight>,
 }
 
 impl PowerSample {
     pub fn is_available(&self) -> bool {
-        !self.batteries.is_empty() || self.ac_online.is_some() || self.rapl_watts.is_some()
+        !self.batteries.is_empty()
+            || self.ac_online.is_some()
+            || self.rapl_watts.is_some()
+            || self.soc.is_available()
+            || !self.backlights.is_empty()
     }
 }
 
@@ -124,6 +141,15 @@ fn read_battery(dir: &Path) -> Option<Battery> {
         energy_full_wh,
         time_remaining_secs: None,
         health_percent,
+        // `cycle_count` is 0 on gauges that do not count, which is not the
+        // same as a new battery: a zero on a pack that reports a health
+        // below 100 would be a lie.
+        cycle_count: read_num(dir.join("cycle_count"))
+            .filter(|c| *c > 0.0 || health_percent.is_none_or(|h| h >= 99.0))
+            .map(|c| c as u32),
+        voltage_v: read_num(dir.join("voltage_now")).map(|v| v / 1_000_000.0).filter(|v| *v > 0.0),
+        // sysfs quotes tenths of a degree.
+        temp_c: read_num(dir.join("temp")).map(|t| t / 10.0),
     };
 
     battery.time_remaining_secs = match (battery.is_discharging(), energy_wh, energy_full_wh) {
@@ -220,6 +246,14 @@ pub fn watts_from_energy(prev_uj: u64, cur_uj: u64, secs: f64) -> Option<f64> {
     Some(joules / secs)
 }
 
+/// The batteries this machine has, for `--doctor`.
+pub fn read_batteries() -> Vec<Battery> {
+    if !cfg!(target_os = "linux") {
+        return Vec::new();
+    }
+    scan_supplies(Path::new("/sys/class/power_supply")).0
+}
+
 pub fn read(prev_rapl_uj: &mut Option<u64>, secs: f64) -> PowerSample {
     if !cfg!(target_os = "linux") {
         return PowerSample::default();
@@ -231,7 +265,13 @@ pub fn read(prev_rapl_uj: &mut Option<u64>, secs: f64) -> PowerSample {
         _ => None,
     };
     *prev_rapl_uj = cur;
-    PowerSample { batteries, ac_online, rapl_watts }
+    PowerSample {
+        batteries,
+        ac_online,
+        rapl_watts,
+        soc: super::soc::read(),
+        backlights: super::backlight::read(),
+    }
 }
 
 #[cfg(test)]

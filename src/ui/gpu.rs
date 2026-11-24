@@ -28,6 +28,9 @@ pub fn load_text(g: &GpuInfo) -> String {
 pub fn vram_text(g: &GpuInfo) -> String {
     match (g.vram_used, g.vram_total) {
         (Some(u), Some(t)) => format!("{} / {}", human_bytes(u), human_bytes(t)),
+        // A Pi reports what the firmware set aside for the GPU, not how much
+        // of it is in use: say so, or it reads as an empty tank.
+        (None, Some(t)) => format!("{} reserved", human_bytes(t)),
         _ => "-".into(),
     }
 }
@@ -88,6 +91,20 @@ mod tests {
         let g = GpuInfo::default();
         assert_eq!(load_text(&g), "-");
         assert_eq!(vram_text(&g), "-");
+    }
+
+    #[test]
+    fn a_reservation_without_a_usage_figure_says_reserved() {
+        let g = GpuInfo { vram_total: Some(76 << 20), ..Default::default() };
+        assert_eq!(vram_text(&g), "76.0 MiB reserved");
+    }
+
+    #[test]
+    fn a_videocore_with_only_a_clock_shows_the_clock_not_a_percentage() {
+        let g = GpuInfo { freq_mhz: Some(500), ..Default::default() };
+        let t = load_text(&g);
+        assert!(!t.contains('%'), "a clock with no ceiling is not a load: {t}");
+        assert!(t.contains("500"), "{t}");
     }
 
     #[test]

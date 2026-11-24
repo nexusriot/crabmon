@@ -1,6 +1,7 @@
 //! The metric layer: plain data types plus a `MetricSource` trait so the whole
 //! app can be driven from a fixture in tests instead of the live host.
 
+pub mod backlight;
 pub mod cgroup;
 pub mod containers;
 pub mod control;
@@ -18,9 +19,12 @@ pub mod netstat;
 pub mod power;
 pub mod procdetail;
 pub mod procgroup;
+pub mod procnet;
 pub mod psi;
 pub mod smaps;
 pub mod smart;
+pub mod soc;
+pub mod socgpu;
 pub mod sockets;
 pub mod storage;
 pub mod sysinfo_source;
@@ -165,6 +169,22 @@ pub struct ProcRow {
     /// Unique set size: what killing this process would actually free.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uss: Option<u64>,
+    /// Anonymous memory this process has pushed to swap. `None` unless
+    /// `[procs] pss` is on, since it comes from the same `smaps_rollup`
+    /// read. The answer to "who is the swap *for*": the machine's swap gauge
+    /// says how much is used, never by what, and RSS excludes it entirely, so
+    /// a process can be enormous and nearly invisible in the memory column.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swap: Option<u64>,
+    /// TCP bytes received per second, from `ss`. `None` unless `[procs] net`
+    /// is on, and `None` for a process `ss` could not see the sockets of.
+    /// TCP only, and only sockets that were open for the whole interval or
+    /// opened within it; see `metrics::procnet`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub net_rx_bps: Option<f64>,
+    /// TCP bytes sent per second; see `net_rx_bps`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub net_tx_bps: Option<f64>,
     /// The process's own `RLIMIT_NOFILE` soft limit, which is what `fds` runs
     /// out against — the system-wide total is nowhere near it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -202,6 +222,14 @@ pub struct ProcRow {
 impl ProcRow {
     pub fn io_bps(&self) -> f64 {
         self.read_bps + self.write_bps
+    }
+
+    /// TCP bytes per second in both directions, where measured.
+    pub fn net_bps(&self) -> Option<f64> {
+        match (self.net_rx_bps, self.net_tx_bps) {
+            (None, None) => None,
+            (rx, tx) => Some(rx.unwrap_or(0.0) + tx.unwrap_or(0.0)),
+        }
     }
 
     /// How close the process is to its own descriptor limit, 0..=1.

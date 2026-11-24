@@ -158,6 +158,9 @@ pub fn run(cfg: &crate::config::Config, path: &Path) -> Report {
         gpu(cfg),
         descriptors(cfg).with_required(cfg.procs.fds),
         proportional_memory(cfg),
+        process_network(cfg).with_required(cfg.procs.net),
+        board(),
+        backlight(),
         process_io(),
         config_file(cfg, path).with_required(true),
         alert_rules(cfg).with_required(true),
@@ -413,6 +416,12 @@ fn gpu(cfg: &crate::config::Config) -> Check {
     if !cfg.gpu.enabled {
         return Check::new("gpu", Status::Limited, "switched off in [gpu] enabled");
     }
+    // A Pi's GPU has a clock and nothing else, and only through the
+    // firmware's tool: say so rather than reporting a healthy empty panel.
+    if crate::metrics::socgpu::has_videocore(Path::new("/sys/class/drm")) && !which("vcgencmd") {
+        return Check::new("gpu", Status::Limited, "a VideoCore GPU, but vcgencmd is not on PATH")
+            .with_remedy("install libraspberrypi-bin to read its clock and reserved memory");
+    }
     let drm = Path::new("/sys/class/drm").exists();
     let nvidia = which("nvidia-smi");
     match (drm, nvidia, cfg.gpu.nvidia_smi) {
@@ -508,6 +517,83 @@ fn proportional_memory(cfg: &crate::config::Config) -> Check {
     }
 }
 
+fn process_network(cfg: &crate::config::Config) -> Check {
+    if !cfg!(target_os = "linux") {
+        return Check::new("process-net", Status::Unavailable, "per-process traffic needs Linux");
+    }
+    if !crate::metrics::procnet::is_available() {
+        return Check::new(
+            "process-net",
+            Status::Unavailable,
+            "ss is not installed; the NET column cannot be filled",
+        )
+        .with_remedy("install iproute2");
+    }
+    // SAFETY: `geteuid` reads a property of this process and touches nothing.
+    #[cfg(unix)]
+    let root = unsafe { libc::geteuid() } == 0;
+    #[cfg(not(unix))]
+    let root = false;
+    match (root, cfg.procs.net) {
+        (true, _) => Check::new("process-net", Status::Ok, "ss is available and sees every socket"),
+        (false, true) => Check::new(
+            "process-net",
+            Status::Limited,
+            "[procs] net is on, but only our own processes' sockets are visible",
+        ),
+        (false, false) => Check::new(
+            "process-net",
+            Status::Limited,
+            "ss is available; other users' processes need root",
+        ),
+    }
+}
+
+/// The board's own state, where there is a board: a Raspberry Pi's throttle
+/// word and the clock ceiling. Nothing on a PC, so it is not an error there.
+fn board() -> Check {
+    let soc = crate::metrics::soc::read();
+    match (soc.throttle, soc.is_available()) {
+        (Some(t), _) if t.count_now() > 0 => {
+            Check::new("board", Status::Limited, format!("{} right now", t.now().join(", ")))
+        }
+        (Some(_), _) => Check::new("board", Status::Ok, "the firmware reports no throttling"),
+        (None, true) => {
+            Check::new("board", Status::Limited, "a board, but no throttle word to read")
+        }
+        (None, false) => {
+            Check::new("board", Status::Unavailable, "no Raspberry Pi firmware to ask")
+        }
+    }
+}
+
+/// The screen backlight: whether there is one to read, and whether `b`/`B`
+/// may move it. Not an error on a machine without a panel.
+fn backlight() -> Check {
+    if !cfg!(target_os = "linux") {
+        return Check::new("backlight", Status::Unavailable, "backlights need Linux");
+    }
+    let lights = crate::metrics::backlight::read();
+    let Some(first) = lights.first() else {
+        return Check::new("backlight", Status::Unavailable, "no /sys/class/backlight device");
+    };
+    let path = Path::new("/sys/class/backlight").join(&first.name).join("brightness");
+    let writable = std::fs::OpenOptions::new().write(true).open(&path).is_ok();
+    match writable {
+        true => Check::new(
+            "backlight",
+            Status::Ok,
+            format!("{} is readable and adjustable", first.name),
+        ),
+        false => Check::new(
+            "backlight",
+            Status::Limited,
+            format!("{} is readable; b and B cannot adjust it", first.name),
+        )
+        .with_remedy("add yourself to the video group or install a udev rule for the backlight"),
+    }
+}
+
 fn process_io() -> Check {
     if !cfg!(target_os = "linux") {
         return Check::new("process-io", Status::Limited, "per-process IO is read differently");
@@ -590,6 +676,15 @@ fn alert_rules(cfg: &crate::config::Config) -> Check {
             }
             AlertKind::Unit if !cfg.units.enabled => Some("[units] enabled is off"),
             AlertKind::Unit if !cfg!(target_os = "linux") => Some("systemd needs Linux"),
+            AlertKind::Battery if crate::metrics::power::read_batteries().is_empty() => {
+                Some("no battery in /sys/class/power_supply")
+            }
+            AlertKind::Soc if !crate::metrics::soc::read().is_available() => {
+                Some("no board firmware to ask (a Raspberry Pi's throttle word)")
+            }
+            AlertKind::Anomaly if !crate::alerts::anomaly_series_is_known(rule.target.trim()) => {
+                Some("no such series to compare against")
+            }
             AlertKind::OomKill if rule.target.is_empty() && !readable("/proc/vmstat") => {
                 Some("/proc/vmstat is unreadable")
             }

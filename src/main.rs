@@ -134,6 +134,7 @@ fn live_source(cfg: &Config) -> Result<SysinfoSource> {
     )?
     .with_fds(cfg.procs.fds)
     .with_pss(cfg.procs.pss)
+    .with_net(cfg.procs.net)
     .with_units(cfg.units.settings())
     .with_smart(cfg.smart.settings()))
 }
@@ -397,7 +398,10 @@ fn watch_for(rule: crabmon::alerts::AlertRule, cfg: &Config, args: &Args) -> Res
                 export::ExportFormat::Text => {
                     format!(
                         "{}\n{} against a threshold of {}\n",
-                        alert.message, alert.value, alert.threshold
+                        alert.message,
+                        // Not `{}`: that printed `41.20071049646773`.
+                        crabmon::alerts::hook_number(alert.value),
+                        crabmon::alerts::hook_number(alert.threshold)
                     )
                 }
             },

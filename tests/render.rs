@@ -1086,7 +1086,7 @@ fn the_detail_pane_charts_what_the_process_has_been_doing() {
         crossterm::event::KeyModifiers::NONE,
     ));
     assert_eq!(a.mode, Mode::Detail);
-    let s = screen(&mut a, 120, 44);
+    let s = screen(&mut a, 120, 48);
     for needle in ["CPU trend", "RSS trend", "IO trend", "peak"] {
         assert!(s.contains(needle), "{needle} missing from the detail pane:\n{s}");
     }
@@ -1413,4 +1413,265 @@ fn silenced_alerts_leave_the_red_banner_but_are_still_shown() {
     ));
     let s = screen(&mut a, 160, 30);
     assert!(s.contains("S to silence") && s.contains("MUTED"), "{s}");
+}
+
+// ---- the small-screen dashboard ---------------------------------------
+
+#[test]
+fn a_small_terminal_gets_the_compact_dashboard_with_the_battery_in_it() {
+    let mut a = app();
+    a.cfg.compact = crabmon::ui::Compact::Auto;
+    a.tick();
+    // 80x24 is what a handheld's terminal gives: below both thresholds.
+    let s = screen(&mut a, 80, 24);
+    for needle in ["CPU", "MEM", "NET", "BAT 98%", "Processes"] {
+        assert!(s.contains(needle), "{needle} missing from the compact dashboard:\n{s}");
+    }
+    // The side column's panels are what compact gives up.
+    for gone in ["Sensors", "Disks", "Swap"] {
+        assert!(!s.contains(gone), "{gone} drawn in the compact dashboard:\n{s}");
+    }
+}
+
+#[test]
+fn a_large_terminal_keeps_the_full_dashboard() {
+    let mut a = app();
+    a.cfg.compact = crabmon::ui::Compact::Auto;
+    a.tick();
+    let s = screen(&mut a, 160, 48);
+    assert!(s.contains("Sensors") && s.contains("Disks"), "{s}");
+    assert!(!s.contains("BAT 98%"), "the compact line leaked into the full dashboard:\n{s}");
+}
+
+#[test]
+fn compact_can_be_forced_either_way_and_the_key_cycles_it() {
+    use crabmon::ui::Compact;
+    let mut a = app();
+    a.tick();
+    a.cfg.compact = Compact::On;
+    let forced = screen(&mut a, 160, 48);
+    assert!(forced.contains("BAT 98%"), "compact = on ignored on a large terminal:\n{forced}");
+    a.cfg.compact = Compact::Off;
+    let off = screen(&mut a, 80, 24);
+    assert!(!off.contains("BAT 98%"), "compact = off ignored on a small terminal:\n{off}");
+
+    a.cfg.compact = Compact::Auto;
+    a.on_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('C'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_eq!(a.cfg.compact, Compact::On, "C should step auto -> on");
+}
+
+#[test]
+fn every_compact_line_fits_the_width_it_was_given() {
+    let mut a = app();
+    a.tick();
+    for width in [20usize, 40, 80] {
+        for line in crabmon::ui::compact_lines(&a, width) {
+            assert!(line.chars().count() <= width, "{width}: {line:?}");
+        }
+    }
+}
+
+#[test]
+fn an_undervolted_board_says_so_in_the_compact_view() {
+    use crabmon::metrics::soc::ThrottleFlags;
+    let mut snap = snapshot();
+    snap.power.soc.throttle = Some(ThrottleFlags(0x1));
+    let mut a = crabmon::App::new(common::config(), Box::new(FakeSource::single(snap)));
+    a.cfg.compact = crabmon::ui::Compact::On;
+    a.tick();
+    let s = screen(&mut a, 100, 24);
+    assert!(s.contains("! undervoltage now"), "{s}");
+}
+
+#[test]
+fn the_power_panel_shows_the_boards_state_and_the_batterys_wear() {
+    use crabmon::metrics::soc::{SocSample, ThrottleFlags};
+    let mut snap = snapshot();
+    snap.power.soc = SocSample {
+        model: Some("Raspberry Pi 4 Model B Rev 1.5".into()),
+        throttle: Some(ThrottleFlags(0x10000)),
+        cur_khz: Some(1_500_000),
+        max_khz: Some(1_500_000),
+        governor: Some("ondemand".into()),
+    };
+    let mut a = crabmon::App::new(common::config(), Box::new(FakeSource::single(snap)));
+    a.tick();
+    let s = screen(&mut a, 200, 60);
+    assert!(s.contains("Raspberry Pi 4 Model B"), "{s}");
+    assert!(s.contains("ondemand"), "{s}");
+    assert!(s.contains("undervoltage since boot"), "{s}");
+    assert!(s.contains("212"), "no cycle count:\n{s}");
+}
+
+#[test]
+fn measured_swap_and_network_columns_join_the_process_table() {
+    let mut snap = snapshot();
+    for p in &mut snap.procs {
+        p.pss = Some(p.mem / 2);
+        p.swap = Some(3 << 20);
+        p.net_rx_bps = Some(2048.0);
+        p.net_tx_bps = Some(1024.0);
+    }
+    let mut a = crabmon::App::new(common::config(), Box::new(FakeSource::single(snap)));
+    a.tick();
+    a.cfg.layout = Layout::Processes;
+    let s = screen(&mut a, 160, 40);
+    assert!(s.contains("SWAP"), "no SWAP column:\n{s}");
+    assert!(s.contains("NET/s"), "no NET column:\n{s}");
+    assert!(s.contains("3.0M"), "no swap figure:\n{s}");
+    assert!(s.contains("3.0K"), "no network figure (2K rx + 1K tx):\n{s}");
+}
+
+// ---- backlight and SoC GPUs ---------------------------------------------
+
+#[test]
+fn the_power_panel_shows_the_screen_backlight() {
+    let mut a = app();
+    a.tick();
+    let s = screen(&mut a, 200, 60);
+    assert!(s.contains("Screen  50%  intel_backlight"), "no backlight line:\n{s}");
+}
+
+#[test]
+fn the_compact_view_shows_the_backlight_beside_the_battery() {
+    let mut a = app();
+    a.cfg.compact = crabmon::ui::Compact::On;
+    a.tick();
+    let s = screen(&mut a, 100, 24);
+    assert!(s.contains("BRT 50%"), "{s}");
+}
+
+#[test]
+fn a_machine_without_a_backlight_draws_no_screen_line() {
+    let mut snap = snapshot();
+    snap.power.backlights.clear();
+    let mut a = crabmon::App::new(common::config(), Box::new(FakeSource::single(snap)));
+    a.tick();
+    let s = screen(&mut a, 200, 60);
+    assert!(!s.contains("Screen "), "{s}");
+}
+
+/// A source that is somebody else's machine, as `--remote` and `--replay` are.
+struct Elsewhere(FakeSource);
+
+impl crabmon::metrics::MetricSource for Elsewhere {
+    fn snapshot(&mut self, dt: std::time::Duration) -> crabmon::metrics::Snapshot {
+        self.0.snapshot(dt)
+    }
+    fn is_local(&self) -> bool {
+        false
+    }
+}
+
+fn press(a: &mut crabmon::App, key: char) {
+    a.on_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char(key),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+}
+
+/// A backlight directory in a temporary place, so no test here ever writes to
+/// the real `/sys/class/backlight` — which, run as root, would move the screen.
+fn fake_backlight(tag: &str, level: u64) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!("crabmon-render-bl-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dir = root.join("bl");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("brightness"), level.to_string()).unwrap();
+    std::fs::write(dir.join("max_brightness"), "100").unwrap();
+    std::fs::write(dir.join("type"), "raw").unwrap();
+    root
+}
+
+#[test]
+fn the_brightness_keys_move_the_backlight_and_say_what_they_did() {
+    let root = fake_backlight("keys", 50);
+    let mut a = app();
+    a.backlight_root = root.clone();
+    a.tick();
+    press(&mut a, 'b');
+    assert_eq!(std::fs::read_to_string(root.join("bl/brightness")).unwrap(), "60");
+    assert_eq!(a.status_text(), Some("bl 60%"));
+    press(&mut a, 'B');
+    press(&mut a, 'B');
+    assert_eq!(std::fs::read_to_string(root.join("bl/brightness")).unwrap(), "40");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Under `--replay` or `--remote` the screen in front of the user is not the
+/// machine in the data, and the keys must not touch this one's sysfs.
+#[test]
+fn the_brightness_keys_refuse_when_the_data_is_not_from_this_machine() {
+    let root = fake_backlight("remote", 50);
+    let mut a =
+        crabmon::App::new(common::config(), Box::new(Elsewhere(FakeSource::single(snapshot()))));
+    a.backlight_root = root.clone();
+    a.tick();
+    for key in ['b', 'B'] {
+        press(&mut a, key);
+        let status = a.status_text().unwrap_or_default().to_string();
+        assert!(status.contains("only adjustable on this machine"), "{key}: {status}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.join("bl/brightness")).unwrap(),
+        "50",
+        "a refused key still wrote"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_mali_and_a_videocore_get_gpu_rows_with_their_clocks() {
+    use crabmon::metrics::GpuInfo;
+    let mut snap = snapshot();
+    snap.gpus = vec![
+        GpuInfo {
+            name: "Mali panfrost".into(),
+            vendor: "ARM".into(),
+            busy_percent: Some(35.0),
+            temp_c: Some(47.0),
+            freq_mhz: Some(600),
+            max_freq_mhz: Some(800),
+            ..Default::default()
+        },
+        GpuInfo {
+            name: "VideoCore VI".into(),
+            vendor: "Broadcom".into(),
+            vram_total: Some(76 << 20),
+            freq_mhz: Some(500),
+            ..Default::default()
+        },
+    ];
+    let mut a = crabmon::App::new(common::config(), Box::new(FakeSource::single(snap)));
+    a.tick();
+    let s = screen(&mut a, 200, 60);
+    assert!(s.contains("Mali panfrost") && s.contains("35%"), "{s}");
+    assert!(s.contains("VideoCore VI"), "{s}");
+    assert!(s.contains("76.0 MiB reserved"), "{s}");
+}
+
+/// A `--remote` host or a recording can carry PSS and descriptor counts this
+/// machine's config never asked for. The columns follow the data, as SWAP and
+/// NET/s do, rather than the local `[procs]` switches.
+#[test]
+fn pss_and_fd_columns_follow_the_data_not_the_local_config() {
+    let mut snap = snapshot();
+    for p in &mut snap.procs {
+        p.pss = Some(p.mem / 2);
+        p.swap = Some(1 << 20);
+        p.fds = Some(12);
+        p.fd_limit = Some(1024);
+    }
+    let cfg = common::config();
+    assert!(!cfg.procs.pss && !cfg.procs.fds, "premise: the local config has both off");
+    let mut a = crabmon::App::new(cfg, Box::new(FakeSource::single(snap)));
+    a.tick();
+    a.cfg.layout = Layout::Processes;
+    let s = screen(&mut a, 200, 40);
+    for col in ["PSS", "SWAP", "FD"] {
+        assert!(s.contains(col), "{col} missing though the rows carry it:\n{s}");
+    }
 }

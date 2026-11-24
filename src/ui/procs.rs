@@ -62,13 +62,67 @@ const GROWTH: Col = col("growth", SortBy::Growth, "GROWTH", 8);
 /// makes anyway — but off the automatic list because it is blank on most
 /// machines most of the time; name it in `[procs] columns` or sort by it.
 const MAJFLT: Col = col("majflt", SortBy::MajFlt, "MAJFLT", 6);
+/// Memory pushed to swap. Off the automatic list like PSS, whose read it
+/// shares: it joins the table when `[procs] pss` has measured it.
+const SWAP: Col = col("swap", SortBy::Swap, "SWAP", 6);
+/// TCP bytes per second, both directions. Off the automatic list until
+/// `[procs] net` has measured it.
+const NET: Col = col("net", SortBy::Net, "NET/s", 7);
 const NAME: Col = col("name", SortBy::Name, "COMMAND", 0);
 
 /// Every column `[procs] columns` can name.
-pub const ALL_COLUMNS: [Col; 18] = [
-    MARK, PID, USER, STATE, CPU, SPARK, MEM, PSS, GROWTH, MAJFLT, VIRT, THR, NI, FD, DISK, TIME,
-    PORTS, NAME,
+pub const ALL_COLUMNS: [Col; 20] = [
+    MARK, PID, USER, STATE, CPU, SPARK, MEM, PSS, SWAP, GROWTH, MAJFLT, NET, VIRT, THR, NI, FD,
+    DISK, TIME, PORTS, NAME,
 ];
+
+/// Add the columns whose data has been measured, when the layout is
+/// automatic: SWAP beside PSS, NET before COMMAND. An explicit `[procs]
+/// columns` list is honoured as written, so this leaves it alone.
+///
+/// Done after planning rather than inside it so the planner's signature —
+/// and every caller of it — stays as it was; a column that only exists
+/// where it has data is the same rule the planner applies to PSS and FD.
+pub fn with_measured(
+    mut cols: Vec<Col>,
+    automatic: bool,
+    swap: bool,
+    net: bool,
+    width: u16,
+) -> Vec<Col> {
+    if !automatic {
+        return cols;
+    }
+    let fits = |cols: &[Col]| fixed_width(cols) + MIN_NAME <= width;
+    for (wanted, col, after) in [(swap, SWAP, PSS.id), (net, NET, "")] {
+        if !wanted || cols.contains(&col) {
+            continue;
+        }
+        let mut trial = cols.clone();
+        // Beside PSS where there is one, else just before COMMAND.
+        let at = trial
+            .iter()
+            .position(|c| c.id == after)
+            .map(|i| i + 1)
+            .unwrap_or(trial.len().saturating_sub(1));
+        trial.insert(at, col);
+        // A column somebody switched a measurement on for outranks the ones
+        // that cost nothing and nobody asked for: on an 88-column handheld the
+        // planner had already spent the width on THR and NI, and NET/s was
+        // silently missing from a table whose config said `net = true`. Drop
+        // the free optionals, least valuable first, until it fits.
+        for dropped in OPTIONAL.iter().rev() {
+            if fits(&trial) {
+                break;
+            }
+            trial.retain(|c| c != dropped);
+        }
+        if fits(&trial) {
+            cols = trial;
+        }
+    }
+    cols
+}
 
 pub fn column_by_name(name: &str) -> Option<Col> {
     let name = name.trim().to_ascii_lowercase();
@@ -202,10 +256,18 @@ pub fn text_table_with(procs: &[ProcRow], configured: &[String], width: u16) -> 
     let drawable = |c: &Col| !matches!(c.id, "mark" | "trend" | "ports" | "growth");
     let with_pss = procs.iter().any(|p| p.pss.is_some());
     let with_fds = procs.iter().any(|p| p.fds.is_some());
-    let cols: Vec<Col> = columns_for(width, configured, false, with_fds, with_pss)
-        .into_iter()
-        .filter(drawable)
-        .collect();
+    let with_swap = procs.iter().any(|p| p.swap.is_some());
+    let with_net = procs.iter().any(|p| p.net_bps().is_some());
+    let cols: Vec<Col> = with_measured(
+        columns_for(width, configured, false, with_fds, with_pss),
+        configured.is_empty(),
+        with_swap,
+        with_net,
+        width,
+    )
+    .into_iter()
+    .filter(drawable)
+    .collect();
     let name_width = width.saturating_sub(fixed_width(&cols)).max(MIN_NAME) as usize;
 
     let mut out = String::new();
@@ -324,6 +386,18 @@ fn field_text(key: SortBy, p: &ProcRow, name: &str, name_width: usize) -> String
         SortBy::Nice => p.nice.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
         SortBy::Fds => fd_text(p),
         SortBy::Pss => pss_text(p),
+        SortBy::Swap => match p.swap {
+            None => "     -".into(),
+            // Nothing swapped is the common case; a column of `0B` would
+            // bury the rows that matter.
+            Some(0) => "     ·".into(),
+            Some(b) => format!("{:>6}", compact_bytes(b)),
+        },
+        SortBy::Net => match p.net_bps() {
+            None => "      -".into(),
+            Some(v) if v < 1.0 => "      ·".into(),
+            Some(v) => format!("{:>7}", compact_bytes(v as u64)),
+        },
         // Drawn from the app's own history, which this does not have; the
         // draw loop fills it in, as it does for TREND and PORTS.
         SortBy::Growth => String::new(),
@@ -443,12 +517,24 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
 
-    let cols = columns_for(
+    let cols = with_measured(
+        columns_for(
+            inner.width,
+            &app.cfg.procs.columns,
+            app.cfg.procs.ports,
+            // The config *or* the data: a remote host or a recording carries
+            // figures this machine was never asked to measure, and showing
+            // SWAP and NET from the data while PSS waited on the local config
+            // drew half of one read.
+            app.cfg.procs.fds || app.snap.procs.iter().any(|p| p.fds.is_some()),
+            app.cfg.procs.pss || app.snap.procs.iter().any(|p| p.pss.is_some()),
+        ),
+        app.cfg.procs.columns.is_empty(),
+        // From the data rather than the config: a remote host or a recording
+        // may carry figures this machine was never asked to measure.
+        app.snap.procs.iter().any(|p| p.swap.is_some()),
+        app.snap.procs.iter().any(|p| p.net_bps().is_some()),
         inner.width,
-        &app.cfg.procs.columns,
-        app.cfg.procs.ports,
-        app.cfg.procs.fds,
-        app.cfg.procs.pss,
     );
     app.proc_area = area;
     app.header_cols = column_ranges(inner, &cols);
@@ -1130,6 +1216,60 @@ mod tests {
             assert!(cols.iter().any(|c| c.id == PORTS.id), "width {width} dropped ports");
             let fixed: u16 = cols.iter().map(|c| c.width + 1).sum();
             assert!(fixed <= width, "width {width}: columns do not fit");
+        }
+    }
+
+    #[test]
+    fn measured_columns_join_an_automatic_layout_and_not_an_explicit_one() {
+        let base = plan(200, false, false, true);
+        let cols = with_measured(base.clone(), true, true, true, 200);
+        let ids: Vec<&str> = cols.iter().map(|c| c.id).collect();
+        // SWAP sits beside PSS, NET before COMMAND, which stays last.
+        let pss = ids.iter().position(|i| *i == "pss").unwrap();
+        assert_eq!(ids[pss + 1], "swap", "{ids:?}");
+        assert_eq!(ids[ids.len() - 2], "net", "{ids:?}");
+        assert_eq!(ids[ids.len() - 1], "name");
+
+        // Nothing measured, nothing added.
+        assert_eq!(with_measured(base.clone(), true, false, false, 200), base);
+        // A configured list is honoured as written.
+        assert_eq!(with_measured(base.clone(), false, true, true, 200), base);
+        // And never at the cost of COMMAND's room.
+        let narrow = plan(60, false, false, true);
+        let widened = with_measured(narrow.clone(), true, true, true, 60);
+        assert!(fixed_width(&widened) + MIN_NAME <= 60, "{widened:?}");
+    }
+
+    /// 88 columns is a handheld's terminal. The automatic plan had spent that
+    /// on free columns, and a measured one asked for in the config was left
+    /// out without a word.
+    #[test]
+    fn a_measured_column_displaces_free_ones_rather_than_vanishing() {
+        let base = plan(88, false, false, true);
+        let ids = |cols: &[Col]| cols.iter().map(|c| c.id).collect::<Vec<_>>();
+        assert!(!ids(&base).contains(&"net"), "premise: {:?}", ids(&base));
+
+        let cols = with_measured(base.clone(), true, true, true, 88);
+        let got = ids(&cols);
+        assert!(got.contains(&"swap") && got.contains(&"net"), "{got:?}");
+        // What was asked for is kept, COMMAND still has its room, and what
+        // went was a free column.
+        assert!(got.contains(&"pss") && got.contains(&"cpu") && got.contains(&"mem"), "{got:?}");
+        assert!(fixed_width(&cols) + MIN_NAME <= 88, "{got:?}");
+        assert_eq!(got.last(), Some(&"name"));
+    }
+
+    /// ...but never below the columns every layout keeps.
+    #[test]
+    fn displacing_stops_at_the_columns_every_layout_keeps() {
+        // Too narrow for anything beyond the essentials: nothing is added and
+        // nothing essential is taken away.
+        let base = plan(30, false, false, false);
+        let cols = with_measured(base.clone(), true, true, true, 30);
+        assert_eq!(cols, base);
+        let got: Vec<&str> = cols.iter().map(|c| c.id).collect();
+        for kept in ["pid", "cpu", "mem", "name"] {
+            assert!(got.contains(&kept), "{kept} dropped: {got:?}");
         }
     }
 }

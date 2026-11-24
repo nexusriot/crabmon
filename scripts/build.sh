@@ -71,44 +71,148 @@ cmd_bin() {
   say "$BIN_DIR/$NAME  ($(version))"
 }
 
-# Cross-compile for 64-bit ARM (the uConsole's CM4, Raspberry Pi, ...). Static
-# musl by default, so the binary does not care which glibc the device ships.
-# Needs `rustup target add aarch64-unknown-linux-musl` and an aarch64 gcc to
-# link with (Debian/Ubuntu: gcc-aarch64-linux-gnu). Override with ARM64_TARGET
-# or ARM64_LINKER.
+# Cross builds. Each platform is a rustc target and a linker:
+#
+#   arm64    aarch64-unknown-linux-musl     aarch64-linux-gnu-gcc   static; the uConsole, Raspberry Pi
+#   armhf    armv7-unknown-linux-gnueabihf  arm-linux-gnueabihf-gcc dynamic glibc, 32-bit ARM
+#   riscv64  riscv64gc-unknown-linux-musl   riscv64-linux-gnu-gcc   static
+#   static   x86_64-unknown-linux-musl      (the default cc)        static, runs on any x86-64 Linux
+#
+# The musl ones are fully static, so the binary does not care which glibc the
+# machine ships. Each needs `rustup target add <target>` and, except `static`,
+# the matching gcc to link with (Debian/Ubuntu: gcc-aarch64-linux-gnu,
+# gcc-arm-linux-gnueabihf, gcc-riscv64-linux-gnu). Override with <NAME>_TARGET
+# and <NAME>_LINKER, e.g. ARM64_TARGET=aarch64-unknown-linux-gnu.
 ARM64_TARGET=${ARM64_TARGET:-aarch64-unknown-linux-musl}
 ARM64_LINKER=${ARM64_LINKER:-aarch64-linux-gnu-gcc}
-
-# 32-bit ARM with hard float (Raspberry Pi OS 32-bit, armhf Debian). Dynamic
-# glibc: needs gcc-arm-linux-gnueabihf and the armv7 rustup target. Override
-# with ARMHF_TARGET or ARMHF_LINKER.
 ARMHF_TARGET=${ARMHF_TARGET:-armv7-unknown-linux-gnueabihf}
 ARMHF_LINKER=${ARMHF_LINKER:-arm-linux-gnueabihf-gcc}
+RISCV64_TARGET=${RISCV64_TARGET:-riscv64gc-unknown-linux-musl}
+RISCV64_LINKER=${RISCV64_LINKER:-riscv64-linux-gnu-gcc}
+STATIC_TARGET=${STATIC_TARGET:-x86_64-unknown-linux-musl}
+STATIC_LINKER=${STATIC_LINKER:-}
 
-build_cross() { # target linker [cargo args...]
-  local target=$1 linker=$2
-  shift 2
+# The variable names for a platform: the target triple and the linker.
+platform_target() { local v=${1^^}_TARGET; echo "${!v}"; }
+platform_linker() { local v=${1^^}_LINKER; echo "${!v}"; }
+
+# Tell the person what is missing instead of letting rustc or the linker say
+# it in their own words, which is "linker `riscv64-linux-gnu-gcc` not found"
+# after a minute of compiling dependencies.
+check_platform() { # platform
+  local target linker
+  target=$(platform_target "$1")
+  linker=$(platform_linker "$1")
+  if command -v rustup >/dev/null 2>&1 &&
+    ! rustup target list --installed 2>/dev/null | grep -qx "$target"; then
+    echo "the rustc target $target is not installed: rustup target add $target" >&2
+    exit 1
+  fi
+  if [ -n "$linker" ] && ! command -v "$linker" >/dev/null 2>&1; then
+    echo "the linker $linker is not installed (Debian/Ubuntu: apt install gcc-${linker%-gcc}), or set ${1^^}_LINKER" >&2
+    exit 1
+  fi
+}
+
+build_cross() { # platform [cargo args...]
+  local platform=$1 target linker
+  shift
+  check_platform "$platform"
+  target=$(platform_target "$platform")
+  linker=$(platform_linker "$platform")
   say "building (release, $target)"
   local var=CARGO_TARGET_$(echo "$target" | tr 'a-z-' 'A-Z_')_LINKER
-  env "$var=${!var:-$linker}" $CARGO build --release --target "$target" "$@"
+  if [ -n "$linker" ]; then
+    env "$var=${!var:-$linker}" $CARGO build --release --target "$target" "$@"
+  else
+    $CARGO build --release --target "$target" "$@"
+  fi
 }
 
-build_arm64() { build_cross "$ARM64_TARGET" "$ARM64_LINKER" "$@"; }
-build_armhf() { build_cross "$ARMHF_TARGET" "$ARMHF_LINKER" "$@"; }
-
-cmd_bin_armhf() {
-  build_armhf "$@"
+bin_cross() { # platform [cargo args...]
+  local platform=$1 target
+  shift
+  build_cross "$platform" "$@"
+  target=$(platform_target "$platform")
   mkdir -p "$BIN_DIR"
-  cp -f "target/$ARMHF_TARGET/release/$NAME" "$BIN_DIR/$NAME-armhf"
-  say "$BIN_DIR/$NAME-armhf  ($(version), $ARMHF_TARGET)"
+  cp -f "target/$target/release/$NAME" "$BIN_DIR/$NAME-$platform"
+  say "$BIN_DIR/$NAME-$platform  ($(version), $target)"
 }
 
-cmd_bin_arm64() {
-  build_arm64 "$@"
-  mkdir -p "$BIN_DIR"
-  cp -f "target/$ARM64_TARGET/release/$NAME" "$BIN_DIR/$NAME-arm64"
-  say "$BIN_DIR/$NAME-arm64  ($(version), $ARM64_TARGET)"
+# A static binary links nothing, so cargo-deb's `$auto` finds nothing and the
+# package carries an empty `Depends:` field, which lintian flags and some
+# tools reject. cargo-deb has no way to omit the field, so the package is
+# unpacked, the empty line removed and the package rebuilt.
+strip_empty_depends() { # deb
+  local deb=$1 tmp
+  dpkg-deb -f "$deb" Depends 2>/dev/null | grep -q '[^[:space:]]' && return 0
+  command -v dpkg-deb >/dev/null 2>&1 || return 0
+  tmp=$(mktemp -d)
+  dpkg-deb -R "$deb" "$tmp"
+  sed -i '/^Depends:[[:space:]]*$/d' "$tmp/DEBIAN/control"
+  dpkg-deb --root-owner-group -b "$tmp" "$deb" >/dev/null
+  rm -rf "$tmp"
 }
+
+# cargo-deb maps the target/release assets onto target/<triple>/release and
+# takes the architecture from the target. It cannot inspect a foreign binary,
+# so it warns that it found no $auto dependencies; a static binary has none.
+deb_cross() { # platform
+  local platform=$1 target
+  target=$(platform_target "$platform")
+  if ! command -v cargo-deb >/dev/null 2>&1; then
+    say "installing cargo-deb"
+    $CARGO install cargo-deb
+  fi
+  build_cross "$platform"
+  say "packaging ($platform)"
+  $CARGO deb --no-build --target "$target"
+  local deb
+  for deb in "target/$target"/debian/*.deb; do strip_empty_depends "$deb"; done
+  ls -1 "target/$target"/debian/*.deb
+}
+
+# An rpm from the same assets, by cargo-generate-rpm, which is pure Rust: it
+# needs neither rpmbuild nor the rpm package. The architecture comes from the
+# target; the binary is stripped with the host's strip only where it is the
+# host's architecture, so a foreign one ships unstripped rather than corrupted.
+rpm_cross() { # platform
+  local platform=$1 target
+  target=$(platform_target "$platform")
+  if ! command -v cargo-generate-rpm >/dev/null 2>&1; then
+    say "installing cargo-generate-rpm"
+    $CARGO install cargo-generate-rpm
+  fi
+  build_cross "$platform"
+  say "packaging ($platform rpm)"
+  $CARGO generate-rpm --target "$target" --auto-req disabled
+  ls -1 "target/$target"/generate-rpm/*.rpm 2>/dev/null || ls -1 target/generate-rpm/*.rpm
+}
+
+cmd_bin_arm64() { bin_cross arm64 "$@"; }
+cmd_bin_armhf() { bin_cross armhf "$@"; }
+cmd_bin_riscv64() { bin_cross riscv64 "$@"; }
+cmd_bin_static() { bin_cross static "$@"; }
+
+cmd_deb_arm64() { deb_cross arm64; }
+cmd_deb_armhf() { deb_cross armhf; }
+cmd_deb_riscv64() { deb_cross riscv64; }
+cmd_deb_static() { deb_cross static; }
+
+cmd_rpm() {
+  if ! command -v cargo-generate-rpm >/dev/null 2>&1; then
+    say "installing cargo-generate-rpm"
+    $CARGO install cargo-generate-rpm
+  fi
+  cmd_release
+  say "packaging (rpm)"
+  $CARGO generate-rpm --auto-req disabled
+  ls -1 target/generate-rpm/*.rpm
+}
+cmd_rpm_arm64() { rpm_cross arm64; }
+cmd_rpm_armhf() { rpm_cross armhf; }
+cmd_rpm_riscv64() { rpm_cross riscv64; }
+cmd_rpm_static() { rpm_cross static; }
 
 cmd_run() {
   $CARGO run -- "$@"
@@ -219,30 +323,6 @@ cmd_deb() {
   say "packaging"
   $CARGO deb
   ls -1 target/debian/*.deb
-}
-
-# The same package for arm64. cargo-deb maps the target/release assets onto
-# target/<triple>/release and takes the architecture from the target.
-cmd_deb_arm64() {
-  if ! command -v cargo-deb >/dev/null 2>&1; then
-    say "installing cargo-deb"
-    $CARGO install cargo-deb
-  fi
-  build_arm64
-  say "packaging (arm64)"
-  $CARGO deb --no-build --target "$ARM64_TARGET"
-  ls -1 "target/$ARM64_TARGET"/debian/*.deb
-}
-
-cmd_deb_armhf() {
-  if ! command -v cargo-deb >/dev/null 2>&1; then
-    say "installing cargo-deb"
-    $CARGO install cargo-deb
-  fi
-  build_armhf
-  say "packaging (armhf)"
-  $CARGO deb --no-build --target "$ARMHF_TARGET"
-  ls -1 "target/$ARMHF_TARGET"/debian/*.deb
 }
 
 # A tarball of exactly what `install` would put on a machine, for the platforms
@@ -361,7 +441,6 @@ Usage: ./scripts/build.sh <command>       (or: make <command>)
   build        debug build
   release      optimised build
   bin          release build, binary copied to $BIN_DIR/$NAME
-  bin-arm64    cross-compile for aarch64 (uConsole), into $BIN_DIR/$NAME-arm64
   run          run the debug build (extra arguments are passed through)
 
   test         the whole suite: unit tests and every integration suite
@@ -376,9 +455,25 @@ Usage: ./scripts/build.sh <command>       (or: make <command>)
   ci           fmt-check, lint and test — what CI runs
 
   deb          Debian package into target/debian
-  deb-arm64    the same for arm64 (uConsole), cross-compiled
-  bin-armhf    cross-compile for 32-bit ARM, into $BIN_DIR/$NAME-armhf
-  deb-armhf    Debian package for 32-bit ARM (armhf)
+  rpm          RPM package into target/generate-rpm (needs no rpmbuild)
+
+  Cross builds — `bin-X` copies a binary to $BIN_DIR/$NAME-X, `deb-X` and
+  `rpm-X` build the package for it. X is arm64 (static, uConsole and
+  Raspberry Pi), armhf (32-bit ARM, glibc), riscv64 (static) or static
+  (x86-64, static; runs on any distribution):
+
+  bin-arm64    cross-compile for aarch64
+  bin-armhf    cross-compile for 32-bit ARM
+  bin-riscv64  cross-compile for riscv64
+  bin-static   static x86-64 binary (musl)
+  deb-arm64    Debian package for arm64
+  deb-armhf    Debian package for armhf
+  deb-riscv64  Debian package for riscv64
+  deb-static   Debian package of the static x86-64 binary
+  rpm-arm64    RPM package for aarch64
+  rpm-armhf    RPM package for armv7hl
+  rpm-riscv64  RPM package for riscv64
+  rpm-static   RPM package of the static x86-64 binary
   dist         release tarball into $DIST_DIR
   install      install under PREFIX=$PREFIX (honours DESTDIR)
   uninstall    remove what install put there

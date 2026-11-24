@@ -4,8 +4,36 @@
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+/// A home with no config in it, shared by every test in this file.
+///
+/// The binary reads `~/.config/crabmon/config.toml`, and the TUI *writes* it:
+/// a filter typed into a real session is saved there. A developer who had
+/// filtered to one service had `once_top_and_text_leave_threads_out` fail with
+/// no processes, on a machine where nothing was wrong — found when the suite
+/// was run on one such laptop. Tests that mean to read a config pass
+/// `--config`; the rest must not inherit whoever's they happen to run under.
+fn clean_home() -> &'static std::path::Path {
+    static HOME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("crabmon-cli-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a temporary home");
+        dir
+    })
+}
+
+/// The binary, pointed at `clean_home` however the platform finds a config.
+fn command() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_crabmon"));
+    cmd.env("HOME", clean_home())
+        .env("XDG_CONFIG_HOME", clean_home().join("config"))
+        .env("XDG_STATE_HOME", clean_home().join("state"))
+        .env("XDG_DATA_HOME", clean_home().join("data"));
+    cmd
+}
+
 fn crabmon(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_crabmon")).args(args).output().expect("failed to run crabmon")
+    command().args(args).output().expect("failed to run crabmon")
 }
 
 #[test]
@@ -173,12 +201,8 @@ fn stream_lines(args: &[&str], want: usize, deadline: Duration) -> (String, Vec<
     use std::io::{BufRead, BufReader};
     use std::process::Stdio;
 
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_crabmon"))
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn");
+    let mut child =
+        command().args(args).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().expect("spawn");
 
     let stdout = child.stdout.take().expect("piped stdout");
     let (tx, rx) = std::sync::mpsc::channel();
@@ -557,8 +581,8 @@ fn once_top_and_text_leave_threads_out() {
 #[test]
 fn a_reader_that_stops_early_is_not_an_error() {
     use std::io::Read;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new(env!("CARGO_BIN_EXE_crabmon"))
+    use std::process::Stdio;
+    let mut child = command()
         .args(["--once", "--refresh", "200", "--format", "csv"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -570,4 +594,31 @@ fn a_reader_that_stops_early_is_not_an_error() {
     child.stderr.take().unwrap().read_to_string(&mut err).unwrap();
     assert!(status.success(), "exit {status}: {err}");
     assert!(!err.contains("Broken pipe"), "{err}");
+}
+
+/// Found on a real host: `--watch-rule mem>=0 --format text` printed
+/// `41.20071049646773 against a threshold of 0`, seventeen digits of an
+/// `f64` in a line meant for people. The hooks and the status bar already
+/// round; the text report did not.
+#[test]
+fn a_watch_rules_text_report_rounds_its_numbers() {
+    let out = crabmon(&[
+        "--watch-rule",
+        "mem>=0",
+        "--watch-timeout",
+        "10",
+        "--refresh",
+        "200",
+        "--format",
+        "text",
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().find(|l| l.contains("against a threshold of")).expect("the value line");
+    for number in
+        line.split_whitespace().filter(|w| w.chars().all(|c| c.is_ascii_digit() || c == '.'))
+    {
+        let decimals = number.split_once('.').map_or(0, |(_, d)| d.len());
+        assert!(decimals <= 3, "{number} in {line:?}");
+    }
 }

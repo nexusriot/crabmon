@@ -1962,3 +1962,57 @@ fn stepping_a_replay_keeps_the_timeline_and_a_jump_restarts_it() {
     a.on_key(key('['));
     assert_eq!(texts(&a), ["db.service failed (at start)"]);
 }
+
+fn chord(c: char, mods: KeyModifiers) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(c), mods)
+}
+
+/// Found on a real host: Ctrl-U typed into the filter prompt inserted a `u`,
+/// turning `sleep` into `usleep` and an empty table. Terminals deliver a chord
+/// as its letter plus a modifier, and the handlers matched on the letter.
+#[test]
+fn a_control_chord_is_not_typed_into_the_filter() {
+    let mut a = app();
+    a.on_key(key('/'));
+    for c in "fire".chars() {
+        a.on_key(key(c));
+    }
+    a.on_key(chord('u', KeyModifiers::CONTROL));
+    assert_eq!(a.filter_text, "", "Ctrl-U clears the line, as in a shell");
+    for c in "bash zsh".chars() {
+        a.on_key(key(c));
+    }
+    a.on_key(chord('w', KeyModifiers::CONTROL));
+    assert_eq!(a.filter_text, "bash ", "Ctrl-W deletes the last word");
+    // Anything else is ignored, not inserted.
+    a.on_key(chord('x', KeyModifiers::CONTROL));
+    a.on_key(chord('b', KeyModifiers::ALT));
+    assert_eq!(a.filter_text, "bash ");
+    assert_eq!(a.mode, Mode::Filter, "a chord must not leave the prompt");
+}
+
+/// ...and in the table a chord must not fire the plain letter's command:
+/// Ctrl-T opened the signal menu, Ctrl-U the unit pane.
+#[test]
+fn a_control_chord_does_not_trigger_the_plain_letters_command() {
+    let mut a = app();
+    a.tick();
+    for c in ['t', 'u', 'r', 'k', 'o', 'f', 'q'] {
+        let action = a.on_key(chord(c, KeyModifiers::CONTROL));
+        assert_eq!(action, Action::None, "Ctrl-{c}");
+        assert_eq!(a.mode, Mode::Normal, "Ctrl-{c} opened something");
+    }
+    let before = a.cfg.sort_by;
+    a.on_key(chord('m', KeyModifiers::ALT));
+    assert_eq!(a.cfg.sort_by, before, "Alt-m sorted by memory");
+}
+
+/// AltGr is how some layouts type `@` and backslash, and reports as Ctrl+Alt:
+/// it is a character, not a chord.
+#[test]
+fn altgr_still_types_a_character() {
+    let mut a = app();
+    a.on_key(key('/'));
+    a.on_key(chord('@', KeyModifiers::CONTROL | KeyModifiers::ALT));
+    assert_eq!(a.filter_text, "@");
+}

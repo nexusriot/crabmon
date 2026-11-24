@@ -179,7 +179,7 @@ pub fn ioprio(f: &mut Frame<'_>, area: Rect, app: &App) {
 
 /// Fixed rows the detail pane draws before the socket list. `App` needs the
 /// count to know how far the pane can scroll.
-pub const DETAIL_FIELDS: usize = 25;
+pub const DETAIL_FIELDS: usize = 27;
 
 /// The "Open files" summary line: how many descriptors, and how many of them
 /// are real paths rather than pipes and anonymous inodes.
@@ -243,6 +243,46 @@ fn trend_text(samples: &[f32], width: usize, peak_label: impl Fn(f32) -> String)
 /// series itself is only `PROC_HIST_LEN` samples anyway.
 const MAX_TREND_WIDTH: usize = 96;
 
+/// Proportional, unique and swapped memory, where `[procs] pss` measured it.
+///
+/// RSS says how much is resident; this says how much of that is the
+/// process's own and how much has been pushed out, which is what separates
+/// "will killing this help" from "this is mostly shared libraries".
+///
+/// `measured` is whether *any* process in the sample carries the figure, which
+/// is what tells "the option is off" from "it is on and this process cannot be
+/// read" — a kernel thread maps nothing and has no `smaps_rollup`, and saying
+/// `off ([procs] pss)` about one on a machine where PSS is plainly on sends
+/// the reader to fix a config that is fine.
+pub fn memory_detail(p: &crate::metrics::ProcRow, measured: bool) -> String {
+    let Some(pss) = p.pss else {
+        return match measured {
+            true => "not readable (kernel thread, or another user's)".into(),
+            false => "off ([procs] pss)".into(),
+        };
+    };
+    let mut parts = vec![format!("{} pss", human_bytes(pss))];
+    if let Some(uss) = p.uss {
+        parts.push(format!("{} unique", human_bytes(uss)));
+    }
+    if let Some(shared) = p.shared_ratio() {
+        parts.push(format!("{:.0}% shared", shared * 100.0));
+    }
+    if let Some(swap) = p.swap.filter(|s| *s > 0) {
+        parts.push(format!("{} swapped", human_bytes(swap)));
+    }
+    parts.join(" / ")
+}
+
+/// TCP rates, where `[procs] net` measured them.
+pub fn network_detail(p: &crate::metrics::ProcRow, measured: bool) -> String {
+    match (p.net_rx_bps, p.net_tx_bps) {
+        (Some(rx), Some(tx)) => format!("rx {}  tx {}  (TCP)", human_bps(rx), human_bps(tx)),
+        _ if measured => "not measured for this process".into(),
+        _ => "off ([procs] net)".into(),
+    }
+}
+
 pub fn detail(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     let Some(p) = app.selected_row().cloned() else { return };
     let p = &p;
@@ -295,6 +335,8 @@ pub fn detail(f: &mut Frame<'_>, area: Rect, app: &mut App) {
         field("State", p.state.to_string()),
         field("CPU", format!("{:.1}%", p.cpu)),
         field("Memory", format!("{} rss / {} virt", human_bytes(p.mem), human_bytes(p.virt))),
+        field("Mem detail", memory_detail(p, app.snap.procs.iter().any(|r| r.pss.is_some()))),
+        field("Network", network_detail(p, app.snap.procs.iter().any(|r| r.net_rx_bps.is_some()))),
         field("Threads", p.threads.map(|t| t.to_string()).unwrap_or_else(|| "-".into())),
         field("Disk", format!("R {}  W {}", human_bps(p.read_bps), human_bps(p.write_bps))),
         field("Running", human_duration(p.run_time)),
@@ -430,7 +472,7 @@ fn fd_field(p: &crate::metrics::ProcRow) -> String {
 }
 
 /// Every binding, in one place, so the help and the README cannot drift.
-pub const KEYS: [(&str, &str); 47] = [
+pub const KEYS: [(&str, &str); 49] = [
     ("q / Ctrl-C", "quit"),
     ("↑ ↓ / k j", "move selection"),
     ("PgUp PgDn", "move a page"),
@@ -462,6 +504,8 @@ pub const KEYS: [(&str, &str); 47] = [
     ("Tab / S-Tab", "next / previous layout"),
     ("v", "count virtual interfaces in the total"),
     ("g", "group or expand sensors"),
+    ("C", "compact layout: auto, on, off"),
+    ("b / B", "screen brighter / dimmer"),
     ("+ / -", "refresh faster / slower"),
     ("t", "signal menu (Unix)"),
     ("r", "renice (Unix)"),
@@ -920,5 +964,41 @@ mod tests {
         assert_eq!(relative_time(""), "");
         // A clock that has gone backwards must not underflow into 584 billion years.
         assert_eq!(relative_time("99999999999"), "0s ago");
+    }
+
+    #[test]
+    fn the_detail_says_off_only_when_nothing_was_measured_anywhere() {
+        let unread = crate::metrics::ProcRow::default();
+        // Nothing in the sample has the figure: the option is off.
+        assert!(memory_detail(&unread, false).contains("[procs] pss"));
+        assert!(network_detail(&unread, false).contains("[procs] net"));
+        // Others have it: this one cannot be read, and the config is fine. A
+        // kernel thread has no smaps_rollup, and "off" would send the reader
+        // to fix an option that is on.
+        assert!(!memory_detail(&unread, true).contains("[procs]"));
+        assert!(!network_detail(&unread, true).contains("[procs]"));
+
+        let read = crate::metrics::ProcRow {
+            pss: Some(10 << 20),
+            uss: Some(4 << 20),
+            mem: 16 << 20,
+            swap: Some(2 << 20),
+            net_rx_bps: Some(2048.0),
+            net_tx_bps: Some(0.0),
+            ..Default::default()
+        };
+        let m = memory_detail(&read, true);
+        assert!(
+            m.contains("pss")
+                && m.contains("unique")
+                && m.contains("shared")
+                && m.contains("swapped"),
+            "{m}"
+        );
+        assert!(
+            network_detail(&read, true).contains("rx 2.0 KiB/s"),
+            "{}",
+            network_detail(&read, true)
+        );
     }
 }

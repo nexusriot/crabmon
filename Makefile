@@ -6,7 +6,8 @@
 #   make e2e        run the end-to-end suite in containers (needs only Docker)
 #   make e2e-local  the same tests, using the toolchain on this machine
 #   make bin        release binary into ./bin
-#   make bin-arm64  cross-compile for aarch64 (uConsole) into ./bin
+#   make bin-arm64  cross-compile for aarch64 (uConsole) into ./bin; also
+#                   bin-/deb-/rpm- for armhf, riscv64 and static (musl x86-64)
 #   make install    install under PREFIX (default /usr/local)
 #
 # Variables are passed through: make install PREFIX=$HOME/.local
@@ -19,8 +20,10 @@ ARGS ?=
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build release bin bin-arm64 bin-armhf deb-armhf run test test-unit e2e e2e-local check fmt fmt-check \
-        lint ci deb deb-arm64 dist install uninstall snapshot clean version
+.PHONY: help build release bin run test test-unit e2e e2e-local check fmt fmt-check \
+        lint ci deb rpm dist install uninstall snapshot clean version \
+        bin-arm64 bin-armhf bin-riscv64 bin-static deb-arm64 deb-armhf \
+        deb-riscv64 deb-static rpm-arm64 rpm-armhf rpm-riscv64 rpm-static
 
 help:
 	@$(BUILD) help
@@ -33,9 +36,6 @@ release:
 
 bin:
 	@$(BUILD) bin
-
-bin-arm64:
-	@$(BUILD) bin-arm64
 
 run:
 	@$(BUILD) run $(ARGS)
@@ -70,14 +70,44 @@ ci:
 deb:
 	@$(BUILD) deb
 
-deb-armhf:
-	@$(BUILD) deb-armhf
+rpm:
+	@$(BUILD) rpm
+
+bin-arm64:
+	@$(BUILD) bin-arm64
 
 bin-armhf:
 	@$(BUILD) bin-armhf
 
+bin-riscv64:
+	@$(BUILD) bin-riscv64
+
+bin-static:
+	@$(BUILD) bin-static
+
 deb-arm64:
 	@$(BUILD) deb-arm64
+
+deb-armhf:
+	@$(BUILD) deb-armhf
+
+deb-riscv64:
+	@$(BUILD) deb-riscv64
+
+deb-static:
+	@$(BUILD) deb-static
+
+rpm-arm64:
+	@$(BUILD) rpm-arm64
+
+rpm-armhf:
+	@$(BUILD) rpm-armhf
+
+rpm-riscv64:
+	@$(BUILD) rpm-riscv64
+
+rpm-static:
+	@$(BUILD) rpm-static
 
 dist:
 	@$(BUILD) dist

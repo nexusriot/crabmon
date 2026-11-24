@@ -111,12 +111,43 @@ pub enum AlertKind {
     /// A crash-looping service has no process most of the time, so a `proc`
     /// rule watching for it flickers instead of holding.
     Unit,
+    /// Battery state. `target` names the figure: `percent` (the lowest
+    /// charge; the default), `health` (lowest design-capacity share),
+    /// `remaining` (seconds until the first battery to empty does),
+    /// `draw` (watts being drawn), `cycles` or `temp`.
+    ///
+    /// Written with `below` for charge, health and remaining time — "under
+    /// 15%" is `threshold = 15` with `below = true` — because a flat battery
+    /// is the alarming direction. Quiet on a machine with no battery.
+    Battery,
+    /// The board's own health, for a Raspberry Pi and its relatives.
+    /// `target` names the figure: `throttled` (conditions in effect now:
+    /// undervoltage, frequency cap, throttling, temperature limit; the
+    /// default), `undervoltage` (1 while the supply is sagging), `sinceboot`
+    /// (conditions seen at any point since boot) or `clock` (current clock
+    /// as a percentage of its ceiling, for use with `below`).
+    ///
+    /// An undervolted Pi does not crash, it slows down, and nothing else
+    /// crabmon measures says why: CPU use and temperature both look fine.
+    Soc,
+    /// How far a series has strayed from its own recent behaviour, in
+    /// standard deviations. `target` names the series — `cpu`, `mem`,
+    /// `swap`, `load`, `io`, `net` or `temp` — and the window (`/30m`) is how
+    /// much history defines "normal".
+    ///
+    /// A level rule needs somebody to know the right number in advance, and
+    /// for a machine that idles at 3% and runs a nightly job at 60% there is
+    /// not one: 80% is routine at three in the morning and an incident at
+    /// noon. This asks "is this unusual *for this machine*", which needs no
+    /// threshold tuned per host. `threshold` is the z-score; a drop below
+    /// normal is `threshold = -3` with `below = true`.
+    Anomaly,
 }
 
 /// Every kind a rule can be, so the docs can be checked against the code
 /// rather than against a hand-maintained list — the same reason `ALL_SORTS`
 /// and `ALL_GROUPINGS` exist.
-pub const ALL_ALERT_KINDS: [AlertKind; 23] = [
+pub const ALL_ALERT_KINDS: [AlertKind; 26] = [
     AlertKind::Cpu,
     AlertKind::Mem,
     AlertKind::Swap,
@@ -140,6 +171,9 @@ pub const ALL_ALERT_KINDS: [AlertKind; 23] = [
     AlertKind::Tcp,
     AlertKind::Storage,
     AlertKind::Unit,
+    AlertKind::Battery,
+    AlertKind::Soc,
+    AlertKind::Anomaly,
 ];
 
 impl AlertKind {
@@ -169,6 +203,9 @@ impl AlertKind {
             AlertKind::Tcp => "tcp",
             AlertKind::Storage => "storage",
             AlertKind::Unit => "unit",
+            AlertKind::Battery => "battery",
+            AlertKind::Soc => "soc",
+            AlertKind::Anomaly => "anomaly",
         }
     }
 }
@@ -357,7 +394,7 @@ impl HookCall {
 /// `{}` on an `f64` holding an `f32` percentage prints `23.076923370361328`,
 /// seventeen digits of which about three are real — and a hook that echoes it
 /// into a chat message says so. Byte counts stay whole, because they are.
-fn hook_number(value: f64) -> String {
+pub fn hook_number(value: f64) -> String {
     match value.fract() == 0.0 {
         true => format!("{value:.0}"),
         false => format!("{value:.3}"),
@@ -736,6 +773,12 @@ impl AlertEngine {
             .filter_map(proc_trend_series)
             .fold(ProcAxes::default(), ProcAxes::with);
         self.trends.observe(snap, window, axes);
+        // Baselines are only kept for series some rule asks about: a
+        // few hundred points each, but there is no reason to hold any
+        // for a configuration that never mentions `anomaly`.
+        for rule in self.rules.iter().filter(|r| r.kind == AlertKind::Anomaly) {
+            self.trends.observe_anomaly(snap, rule.target.trim(), rule.window());
+        }
     }
 
     /// Which per-process series this engine is keeping, for tests and so the
@@ -929,6 +972,9 @@ pub struct TrendTracker {
     /// The per-process axes being kept, so a change of rules can drop the
     /// series nothing asks for any more.
     axes: ProcAxes,
+    /// What each series an `anomaly` rule names has been doing, for the
+    /// mean and spread that define "normal".
+    baselines: HashMap<String, Baseline>,
 }
 
 /// Points kept per series. Eight is enough to measure a slope across a
@@ -1174,6 +1220,103 @@ impl Series {
     }
 }
 
+/// The series an `anomaly` rule can name.
+pub const ANOMALY_SERIES: [&str; 7] = ["cpu", "mem", "swap", "load", "io", "net", "temp"];
+
+/// Samples before a baseline means anything.
+const MIN_BASELINE: usize = 20;
+
+/// Points kept per baseline: enough for a stable mean and spread across the
+/// window, few enough that a day-long window is not a day of memory.
+const BASELINE_POINTS: u64 = 240;
+
+pub fn anomaly_series_is_known(target: &str) -> bool {
+    ANOMALY_SERIES.contains(&target)
+}
+
+/// The smallest spread worth dividing by, in the series' own unit.
+///
+/// A series that has been perfectly flat has a spread of zero, and the first
+/// wobble would be infinitely many standard deviations. Each floor is a
+/// change nobody would call unusual: a point of CPU, a tenth of load, a few
+/// kilobytes a second of traffic.
+fn anomaly_floor(series: &str) -> f64 {
+    match series {
+        "load" => 0.1,
+        "net" => 64.0 * 1024.0,
+        "temp" => 1.0,
+        _ => 1.0,
+    }
+}
+
+/// The current reading of an anomaly series.
+fn anomaly_source(series: &str, snap: &Snapshot) -> Option<f64> {
+    let v = match series {
+        "cpu" => snap.cpu.avg(),
+        "mem" => snap.mem.ratio() * 100.0,
+        "swap" => snap.mem.swap_ratio() * 100.0,
+        "load" => snap.host.load[0],
+        "io" => snap.disk_util_max()?,
+        "net" => {
+            let (rx, tx) = snap.net_totals(false);
+            rx + tx
+        }
+        "temp" => snap.sensors.iter().map(|s| s.temp as f64).fold(f64::NAN, f64::max),
+        _ => return None,
+    };
+    v.is_finite().then_some(v)
+}
+
+#[derive(Debug, Default, Clone)]
+struct Baseline {
+    /// Thinned history, oldest first: `(taken_at_unix, value)`.
+    points: VecDeque<(u64, f64)>,
+    /// The current sample, kept apart so it is never part of the baseline it
+    /// is being compared with.
+    latest: Option<(u64, f64)>,
+}
+
+impl Baseline {
+    fn push(&mut self, at: u64, value: f64, window: u64) {
+        // The previous sample joins the baseline now that it is history.
+        if let Some(prev) = self.latest.take() {
+            let gap = (window / BASELINE_POINTS).max(1);
+            if self.points.back().is_none_or(|(t, _)| prev.0 >= t + gap) {
+                self.points.push_back(prev);
+            }
+        }
+        self.latest = Some((at, value));
+        while self.points.front().is_some_and(|(t, _)| at.saturating_sub(*t) > window) {
+            self.points.pop_front();
+        }
+    }
+
+    /// `(latest - mean) / spread` over the window, once there is a baseline.
+    fn z(&self, window: u64, floor: f64) -> Option<f64> {
+        let (at, current) = self.latest?;
+        let hist: Vec<f64> = self
+            .points
+            .iter()
+            .filter(|(t, _)| at.saturating_sub(*t) <= window)
+            .map(|(_, v)| *v)
+            .collect();
+        if hist.len() < MIN_BASELINE {
+            return None;
+        }
+        // Half the window at least: twenty samples a second apart say what
+        // the last twenty seconds were like, not what is normal.
+        let first = self.points.front()?.0;
+        if at.saturating_sub(first) < window / 2 {
+            return None;
+        }
+        let n = hist.len() as f64;
+        let mean = hist.iter().sum::<f64>() / n;
+        let var = hist.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
+        let spread = var.sqrt().max(floor).max(mean.abs() * 0.05);
+        Some((current - mean) / spread)
+    }
+}
+
 impl TrendTracker {
     /// Record one sample. `window` is the longest any rule is looking back,
     /// and `track_procs` says whether any rule needs per-process series at
@@ -1233,6 +1376,21 @@ impl TrendTracker {
         }
         // A process that has exited keeps nothing: its leak is over.
         self.procs.retain(|_, entry| entry.last_seen == at);
+    }
+
+    /// Record one reading for an `anomaly` rule's series.
+    pub fn observe_anomaly(&mut self, snap: &Snapshot, series: &str, window: u64) {
+        let at = snap.taken_at_unix;
+        if at == 0 {
+            return;
+        }
+        let Some(v) = anomaly_source(series, snap) else { return };
+        self.baselines.entry(series.to_string()).or_default().push(at, v, window);
+    }
+
+    /// How many standard deviations the series is from its recent normal.
+    pub fn anomaly_z(&self, series: &str, window: u64) -> Option<f64> {
+        self.baselines.get(series)?.z(window, anomaly_floor(series))
     }
 
     /// Growth of a machine-wide series over its window.
@@ -1375,6 +1533,15 @@ fn measure(
         AlertKind::Unit => {
             return crate::metrics::units::measure(&snap.units, &rule.target, &rule.query)
                 .map(|v| (v, ""));
+        }
+        AlertKind::Battery => return battery_value(snap, rule.target.trim()),
+        AlertKind::Soc => return soc_value(snap, rule.target.trim()),
+        // Standard deviations from the series' own recent past. `None` until
+        // there is enough history to define normal: a z-score from five
+        // samples would page on noise and call it unusual.
+        AlertKind::Anomaly => {
+            let z = trends?.anomaly_z(rule.target.trim(), rule.window())?;
+            return Some((z, "σ"));
         }
         AlertKind::Throttle => {
             return match rule.target.trim() {
@@ -1520,6 +1687,62 @@ fn measure(
         }
     };
     if v.is_nan() { None } else { Some((v, "%")) }
+}
+
+/// What a `battery` rule's target names.
+pub const BATTERY_TARGETS: [&str; 6] = ["percent", "health", "remaining", "draw", "cycles", "temp"];
+
+pub fn battery_target_is_known(target: &str) -> bool {
+    target.is_empty() || BATTERY_TARGETS.contains(&target)
+}
+
+fn battery_value(snap: &Snapshot, target: &str) -> Option<(f64, &'static str)> {
+    let b = &snap.power.batteries;
+    let min = |it: &mut dyn Iterator<Item = f64>| {
+        it.fold(None, |a: Option<f64>, v| Some(a.map_or(v, |x| x.min(v))))
+    };
+    let max = |it: &mut dyn Iterator<Item = f64>| {
+        it.fold(None, |a: Option<f64>, v| Some(a.map_or(v, |x| x.max(v))))
+    };
+    match target {
+        "" | "percent" => min(&mut b.iter().map(|x| x.percent)).map(|v| (v, "%")),
+        "health" => min(&mut b.iter().filter_map(|x| x.health_percent)).map(|v| (v, "%")),
+        // Only batteries that are running down have a time to empty; a
+        // charging one's "time remaining" is time to full, a different thing.
+        "remaining" => min(&mut b
+            .iter()
+            .filter(|x| x.is_discharging())
+            .filter_map(|x| x.time_remaining_secs.map(|s| s as f64)))
+        .map(|v| (v, "s")),
+        "draw" => max(&mut b
+            .iter()
+            .filter(|x| x.is_discharging())
+            .filter_map(|x| x.power_w.map(f64::abs)))
+        .map(|v| (v, " W")),
+        "cycles" => {
+            max(&mut b.iter().filter_map(|x| x.cycle_count.map(f64::from))).map(|v| (v, ""))
+        }
+        "temp" => max(&mut b.iter().filter_map(|x| x.temp_c)).map(|v| (v, "°C")),
+        _ => None,
+    }
+}
+
+/// What a `soc` rule's target names.
+pub const SOC_TARGETS: [&str; 4] = ["throttled", "undervoltage", "sinceboot", "clock"];
+
+pub fn soc_target_is_known(target: &str) -> bool {
+    target.is_empty() || SOC_TARGETS.contains(&target)
+}
+
+fn soc_value(snap: &Snapshot, target: &str) -> Option<(f64, &'static str)> {
+    let soc = &snap.power.soc;
+    match target {
+        "" | "throttled" => soc.throttle.map(|t| (t.count_now() as f64, "")),
+        "undervoltage" => soc.throttle.map(|t| (t.undervoltage_now() as u8 as f64, "")),
+        "sinceboot" => soc.throttle.map(|t| (t.count_since_boot() as f64, "")),
+        "clock" => soc.clock_ratio().map(|r| (r * 100.0, "%")),
+        _ => None,
+    }
 }
 
 /// The PSI figure a rule's `target` names: `cpu`, `mem`/`memory` or `io`,
@@ -3012,5 +3235,250 @@ mod hook_number_tests {
         snap.host.hostname = "db-1".into();
         e.evaluate(&snap, 0);
         assert!(pages(&mut e).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod anomaly_tests {
+    use super::*;
+
+    fn rule(name: &str, kind: AlertKind, threshold: f64, for_secs: u64) -> AlertRule {
+        AlertRule {
+            name: name.into(),
+            kind,
+            threshold,
+            hysteresis: 0.0,
+            for_secs,
+            over_secs: 0,
+            below: false,
+            target: String::new(),
+            query: String::new(),
+            command: String::new(),
+            command_clear: String::new(),
+        }
+    }
+
+    fn load_snap(at: u64, load: f64) -> Snapshot {
+        let mut snap = Snapshot { taken_at_unix: at, ..Default::default() };
+        snap.host.load = [load, 0.0, 0.0];
+        snap
+    }
+
+    fn anomaly_rule(series: &str, threshold: f64, over_secs: u64) -> AlertRule {
+        AlertRule {
+            name: "odd".into(),
+            kind: AlertKind::Anomaly,
+            threshold,
+            over_secs,
+            target: series.into(),
+            ..rule("odd", AlertKind::Anomaly, threshold, 0)
+        }
+    }
+
+    /// A wobbling-but-steady load, so the baseline has a real spread.
+    fn steady(step: u64) -> f64 {
+        1.0 + if step.is_multiple_of(2) { 0.2 } else { -0.2 }
+    }
+
+    #[test]
+    fn a_spike_against_a_steady_baseline_is_an_anomaly() {
+        let mut e = AlertEngine::new(vec![anomaly_rule("load", 3.0, 120)]);
+        let base = 1_700_000_000;
+        for step in 0..100u64 {
+            let active = e.evaluate(&load_snap(base + step, steady(step)), step);
+            assert!(active.is_empty(), "steady load fired at step {step}: {active:?}");
+        }
+        let active = e.evaluate(&load_snap(base + 100, 6.0), 100);
+        assert_eq!(active.len(), 1, "a load of 6 on a machine that idles at 1 was not unusual");
+        assert!(active[0].value > 3.0, "{:?}", active[0]);
+    }
+
+    /// 80% CPU is an incident on a machine that idles and routine on one
+    /// that has been at 80% all day: the same reading, a different verdict.
+    #[test]
+    fn the_same_reading_is_ordinary_when_it_is_normal_for_the_machine() {
+        let mut e = AlertEngine::new(vec![anomaly_rule("load", 3.0, 120)]);
+        let base = 1_700_000_000;
+        for step in 0..100u64 {
+            e.evaluate(&load_snap(base + step, 6.0 + steady(step)), step);
+        }
+        assert!(e.evaluate(&load_snap(base + 100, 6.2), 100).is_empty());
+    }
+
+    /// Five samples define nothing; a rule that fired on them would page on
+    /// noise, and on every restart.
+    #[test]
+    fn there_is_no_verdict_until_there_is_a_baseline() {
+        let mut e = AlertEngine::new(vec![anomaly_rule("load", 3.0, 120)]);
+        let base = 1_700_000_000;
+        for step in 0..5u64 {
+            e.evaluate(&load_snap(base + step, 1.0), step);
+        }
+        assert!(e.evaluate(&load_snap(base + 5, 50.0), 5).is_empty());
+        // Twenty samples a second apart cover twenty seconds of a two-minute
+        // window, which is not what "normal" means either.
+        for step in 6..30u64 {
+            e.evaluate(&load_snap(base + step, 1.0), step);
+        }
+        assert!(e.evaluate(&load_snap(base + 30, 50.0), 30).is_empty());
+    }
+
+    /// `below` with a negative threshold is how a drop is spelled.
+    #[test]
+    fn a_collapse_below_normal_is_an_anomaly_too() {
+        let mut rule = anomaly_rule("load", -3.0, 120);
+        rule.below = true;
+        let mut e = AlertEngine::new(vec![rule]);
+        let base = 1_700_000_000;
+        for step in 0..100u64 {
+            e.evaluate(&load_snap(base + step, 5.0 + steady(step)), step);
+        }
+        assert_eq!(e.evaluate(&load_snap(base + 100, 0.0), 100).len(), 1);
+    }
+
+    /// A perfectly flat series has no spread, so any change is infinite
+    /// standard deviations unless something floors it.
+    #[test]
+    fn a_flat_series_does_not_divide_by_zero() {
+        let mut e = AlertEngine::new(vec![anomaly_rule("load", 3.0, 120)]);
+        let base = 1_700_000_000;
+        for step in 0..100u64 {
+            e.evaluate(&load_snap(base + step, 1.0), step);
+        }
+        // A hundredth of a load average is not unusual, whatever the history.
+        assert!(e.evaluate(&load_snap(base + 100, 1.01), 100).is_empty());
+        assert!(e.evaluate(&load_snap(base + 101, 4.0), 101).len() == 1);
+    }
+
+    #[test]
+    fn an_anomaly_rule_keeps_history_only_for_the_series_it_names() {
+        let mut e = AlertEngine::new(vec![anomaly_rule("load", 3.0, 120)]);
+        e.evaluate(&load_snap(1_700_000_000, 1.0), 0);
+        assert_eq!(e.trends().baselines.len(), 1);
+        let mut none = AlertEngine::new(vec![rule("c", AlertKind::Cpu, 90.0, 0)]);
+        none.evaluate(&load_snap(1_700_000_000, 1.0), 0);
+        assert!(none.trends().baselines.is_empty());
+    }
+
+    #[test]
+    fn anomaly_series_names_are_the_ones_that_can_be_measured() {
+        for name in ANOMALY_SERIES {
+            assert!(anomaly_series_is_known(name));
+            // Every named series must actually produce a reading from a
+            // snapshot that has it, or the rule is inert for ever.
+            let mut snap = Snapshot { taken_at_unix: 1, ..Default::default() };
+            snap.disks = vec![crate::metrics::DiskRow { util: Some(10.0), ..Default::default() }];
+            snap.sensors = vec![crate::metrics::Sensor {
+                label: "cpu".into(),
+                temp: 50.0,
+                ..Default::default()
+            }];
+            assert!(anomaly_source(name, &snap).is_some(), "{name} reads nothing");
+        }
+        assert!(!anomaly_series_is_known("bogus"));
+        assert!(!anomaly_series_is_known(""));
+    }
+
+    fn battery(
+        name: &str,
+        percent: f64,
+        status: &str,
+        secs: Option<u64>,
+    ) -> crate::metrics::power::Battery {
+        crate::metrics::power::Battery {
+            name: name.into(),
+            percent,
+            status: status.into(),
+            time_remaining_secs: secs,
+            power_w: Some(if status == "Discharging" { -8.0 } else { 5.0 }),
+            health_percent: Some(88.0),
+            cycle_count: Some(300),
+            ..Default::default()
+        }
+    }
+
+    fn with_batteries(b: Vec<crate::metrics::power::Battery>) -> Snapshot {
+        let mut snap = Snapshot::default();
+        snap.power.batteries = b;
+        snap
+    }
+
+    #[test]
+    fn a_battery_rule_reads_the_lowest_charge_by_default() {
+        let snap = with_batteries(vec![
+            battery("BAT0", 80.0, "Discharging", Some(7200)),
+            battery("BAT1", 12.0, "Discharging", Some(900)),
+        ]);
+        assert_eq!(battery_value(&snap, ""), Some((12.0, "%")));
+        assert_eq!(battery_value(&snap, "percent"), Some((12.0, "%")));
+        assert_eq!(battery_value(&snap, "remaining"), Some((900.0, "s")));
+        assert_eq!(battery_value(&snap, "health"), Some((88.0, "%")));
+        assert_eq!(battery_value(&snap, "cycles"), Some((300.0, "")));
+        // The draw is quoted positive: the sign is for the panel.
+        assert_eq!(battery_value(&snap, "draw"), Some((8.0, " W")));
+        assert_eq!(battery_value(&snap, "nonsense"), None);
+    }
+
+    /// A charging battery's time is time to *full*; alerting "under ten
+    /// minutes remaining" on it would fire the moment a charger is plugged in.
+    #[test]
+    fn remaining_time_only_counts_batteries_that_are_running_down() {
+        let snap = with_batteries(vec![battery("BAT0", 99.0, "Charging", Some(60))]);
+        assert_eq!(battery_value(&snap, "remaining"), None);
+        assert_eq!(battery_value(&snap, "draw"), None);
+    }
+
+    #[test]
+    fn a_machine_without_a_battery_measures_nothing_and_so_never_fires() {
+        let mut low = rule("low", AlertKind::Battery, 15.0, 0);
+        low.below = true;
+        let mut e = AlertEngine::new(vec![low]);
+        assert!(e.evaluate(&Snapshot::default(), 0).is_empty());
+        assert_eq!(battery_value(&Snapshot::default(), ""), None);
+    }
+
+    #[test]
+    fn a_low_battery_pages() {
+        let mut low = rule("low", AlertKind::Battery, 15.0, 0);
+        low.below = true;
+        let mut e = AlertEngine::new(vec![low]);
+        let ok = with_batteries(vec![battery("BAT0", 50.0, "Discharging", Some(3600))]);
+        assert!(e.evaluate(&ok, 0).is_empty());
+        let flat = with_batteries(vec![battery("BAT0", 9.0, "Discharging", Some(300))]);
+        assert_eq!(e.evaluate(&flat, 1).len(), 1);
+    }
+
+    #[test]
+    fn a_soc_rule_counts_what_the_firmware_reports() {
+        use crate::metrics::soc::ThrottleFlags;
+        let mut snap = Snapshot::default();
+        // Nothing to ask: no verdict, rather than "no throttling".
+        assert_eq!(soc_value(&snap, ""), None);
+
+        snap.power.soc.throttle = Some(ThrottleFlags(0x50005));
+        assert_eq!(soc_value(&snap, ""), Some((2.0, "")));
+        assert_eq!(soc_value(&snap, "undervoltage"), Some((1.0, "")));
+        assert_eq!(soc_value(&snap, "sinceboot"), Some((2.0, "")));
+
+        snap.power.soc.throttle = Some(ThrottleFlags(0x10000));
+        assert_eq!(soc_value(&snap, ""), Some((0.0, "")), "a past brownout is not a current one");
+        assert_eq!(soc_value(&snap, "sinceboot"), Some((1.0, "")));
+
+        snap.power.soc.cur_khz = Some(600_000);
+        snap.power.soc.max_khz = Some(1_500_000);
+        assert_eq!(soc_value(&snap, "clock"), Some((40.0, "%")));
+        assert_eq!(soc_value(&snap, "bogus"), None);
+    }
+
+    #[test]
+    fn the_target_lists_match_what_the_measurements_accept() {
+        for t in BATTERY_TARGETS {
+            assert!(battery_target_is_known(t));
+        }
+        for t in SOC_TARGETS {
+            assert!(soc_target_is_known(t));
+        }
+        assert!(!battery_target_is_known("nope"));
+        assert!(!soc_target_is_known("nope"));
     }
 }

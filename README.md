@@ -234,7 +234,15 @@ capture is written here:
 - **Sensors** — temperatures grouped by driver, so a 22-core `coretemp` flood
   does not push the NVMe and chassis sensors off the panel.
 - **GPU** — utilisation, VRAM and temperature from `/sys/class/drm`, with
-  optional `nvidia-smi` support.
+  optional `nvidia-smi` support. On ARM boards, where the GPU is a platform
+  device the DRM scan finds and drops as empty: **Mali** (Panfrost, Lima, the
+  vendor driver) and other SoC GPUs are read from devfreq — clock, ceiling, a
+  load figure where the driver has one — with their own thermal zone where the
+  board has one, and a Raspberry Pi's **VideoCore** from the firmware's
+  `vcgencmd`: its clock and the memory reserved for it. A VideoCore has no
+  load figure available without debugfs, so its row shows the clock rather than
+  a zero, and the memory reads "reserved" because that is what the firmware
+  reports, not how much is in use.
 - **cgroups** — when the process is confined, an extra panel with the cgroup's
   own memory usage against its limit and its CPU quota, neither of which the
   host totals reflect.
@@ -243,6 +251,41 @@ capture is written here:
   idle.
 - **Power** — battery charge, charge/discharge watts, time remaining, cell
   health, mains state, and CPU package draw from RAPL where it is readable.
+  The panel also shows each battery's health against its design capacity and
+  its charge cycles, and on a Raspberry Pi, a uConsole or another board with
+  the Pi firmware, the board's own state: the clock against its ceiling, the
+  governor, and the firmware's throttle word — undervoltage, a frequency cap,
+  throttling, the soft temperature limit — separating a condition *now* from
+  one that happened since boot. An undervolted Pi does not crash, it slows
+  down, and CPU use and temperature both look fine while it does.
+  The screen **backlight** level is on the panel too, and in the compact
+  dashboard beside the battery: on a laptop or a handheld it is the biggest
+  single draw there is, and it explains a battery that drains faster at noon
+  than at midnight. `b` and `B` brighten and dim it by a tenth of its range,
+  never to black. Reading needs nothing; writing needs the `video` group or a
+  udev rule on most distributions, and the key says so rather than failing
+  quietly. It only acts on the machine crabmon is running on, never on a
+  `--remote` host or a recording.
+- **Small screens** — below 100×30 the dashboard collapses to a box of vitals
+  (CPU, memory, swap, load, network, disk, hottest sensor, each battery with
+  its time left and draw, and the board's throttle warning when there is one)
+  over a full-width process table, instead of leaving the table a sliver
+  beside a column of panels. `compact` is `auto`, `on` or `off`, and `C`
+  cycles it; the other layouts are unchanged.
+- **Per-process swap and network** — `[procs] pss` also reads each process's
+  swapped memory, which adds a **SWAP** column and `-s swap`: the machine's
+  swap gauge says how much is used and never by what, and RSS excludes it, so
+  a process can be enormous and nearly invisible in the memory column.
+  `[procs] net` adds **NET/s**, each process's TCP bytes per second in both
+  directions, from the counters on each socket as `ss` reports them — the
+  kernel counts bytes per interface, not per process, and this is the only
+  per-process figure available without eBPF. It is TCP only (UDP and QUIC read
+  as quiet), counts only sockets that were open during the interval, and
+  needs root for other users' processes. The detail pane shows both.
+- **Anomaly alerts** — `kind = "anomaly"` fires on a series straying from its
+  own recent normal, in standard deviations, so a machine that idles at 3% and
+  runs a job at 60% every night needs no threshold tuned for either; see
+  Alerts.
 - **Grouping** — aggregate the process table by systemd unit, container or user,
   totalling CPU, memory and disk IO per group, and `Enter` to open a group into
   the processes behind it.
@@ -370,6 +413,40 @@ binary, the man page and shell completions:
 sudo dpkg -i target/debian/crabmon_*.deb
 ```
 
+### RPM package
+
+```sh
+make rpm
+```
+
+The result is `target/generate-rpm/crabmon-<version>-1.<arch>.rpm`, with the
+same files as the deb (zsh completions go to `site-functions`, where Fedora and
+openSUSE look). It is built by `cargo-generate-rpm`, which is installed on
+first use and needs neither `rpmbuild` nor the `rpm` package.
+
+### Other architectures
+
+Every platform has the same three targets, `bin-X`, `deb-X` and `rpm-X`, which
+cross-compile and then package. `bin-X` leaves `bin/crabmon-X`.
+
+| `X` | Rust target | Linker | Notes |
+|-----|-------------|--------|-------|
+| `arm64` | `aarch64-unknown-linux-musl` | `aarch64-linux-gnu-gcc` | static; a uConsole, a Raspberry Pi on a 64-bit OS |
+| `armhf` | `armv7-unknown-linux-gnueabihf` | `arm-linux-gnueabihf-gcc` | 32-bit ARM, dynamic against glibc |
+| `riscv64` | `riscv64gc-unknown-linux-musl` | `riscv64-linux-gnu-gcc` | static |
+| `static` | `x86_64-unknown-linux-musl` | the default `cc` | static; runs on any x86-64 Linux |
+
+The musl targets are fully static, so the binary does not care which glibc the
+machine ships — and the deb and rpm declare no library dependencies. Each
+target needs `rustup target add <rust target>` and, except `static`, the gcc in
+the table (`gcc-aarch64-linux-gnu`, `gcc-arm-linux-gnueabihf` or
+`gcc-riscv64-linux-gnu` on Debian and Ubuntu); the script says which is
+missing before it starts compiling. Override with `ARM64_TARGET`,
+`ARM64_LINKER`, `ARMHF_…`, `RISCV64_…` or `STATIC_…`, for example
+`make deb-arm64 ARM64_TARGET=aarch64-unknown-linux-gnu`. The `static` deb is
+named `_amd64.deb` like the dynamic one, so it is also left under
+`target/x86_64-unknown-linux-musl/debian/` where the two cannot collide.
+
 ## Usage
 
 Run `crabmon`. It draws into the alternate screen and restores your terminal on
@@ -401,7 +478,7 @@ run of stuck workers.
 | Option | Meaning |
 | --- | --- |
 | `-r`, `--refresh <MS>` | Refresh interval, 200–10000 ms |
-| `-s`, `--sort <KEY>` | `pid`, `name`, `cpu`, `mem`, `virt`, `disk`, `time`, `user`, `state`, `threads`, `nice`, `fds`, `pss`, `growth`, `majflt` |
+| `-s`, `--sort <KEY>` | `pid`, `name`, `cpu`, `mem`, `virt`, `disk`, `time`, `user`, `state`, `threads`, `nice`, `fds`, `pss`, `growth`, `majflt`, `swap`, `net` |
 | `-a`, `--ascending` | Sort ascending |
 | `-d`, `--descending` | Sort descending (the default) |
 | `-f`, `--filter <QUERY>` | Initial process filter |
@@ -442,7 +519,7 @@ run of stuck workers.
 | `PgUp`, `PgDn` | Move a page |
 | `Home`, `End` | First / last process |
 | `Enter` | Process detail pane, or open the selected group |
-| `/` | Filter processes |
+| `/` | Filter processes (`Ctrl-U` clears the line, `Ctrl-W` deletes a word) |
 | `Esc` | Clear the filter |
 | `c` `m` `p` `n` `d` | Sort by CPU / memory / PID / name / disk IO |
 | `<`, `>` (or `,` `.`) | Previous / next sort column; in the fleet table, the hosts' |
@@ -469,6 +546,8 @@ run of stuck workers.
 | `Tab`, `Shift-Tab` | Next / previous layout |
 | `v` | Count virtual interfaces in the network total |
 | `g` | Group or expand sensors |
+| `C` | Cycle the compact layout: auto, on, off |
+| `b`, `B` | Screen brighter / dimmer (needs write access to the backlight) |
 | `+`, `-` (or `=` `_`) | Refresh faster / slower |
 | `t` | Signal menu *(Unix)* |
 | `r` | Renice *(Unix)* |
@@ -738,7 +817,7 @@ crabmon --watch-rule 'proc:nginx<1' --watch-timeout 0 && echo 'nginx came back'
 `EXPR` is `kind[:target]op value`, where `kind` is any alert kind — `cpu`,
 `mem`, `swap`, `load`, `disk`, `temp`, `gpu`, `psi`, `io`, `net`, `fd`, `proc`,
 `trend`, `fillin`, `cgroup`, `kernel`, `cputime`, `vm`, `throttle`, `oomkill`,
-`tcp`, `storage`, `unit`.
+`tcp`, `storage`, `unit`, `battery`, `soc`, `anomaly`.
 `>` and `>=` both mean at-or-over and `<` means strictly under, matching the
 way an `[[alert]]` compares; `<=` is refused rather than quietly read as `<`.
 The operator is taken from the right, so a `proc` query may contain one of its
@@ -915,13 +994,16 @@ that cannot work, which stop crabmon at start (and fail `--doctor`).
 
 ```toml
 refresh_ms = 800            # clamped to 200..=10000
-sort_by = "cpu"             # pid|name|cpu|mem|virt|disk|time|user|state|threads|nice|fds|pss|growth|majflt
+sort_by = "cpu"             # pid|name|cpu|mem|virt|disk|time|user|state|threads|nice|fds|pss|growth|majflt|swap|net
 sort_desc = true
 filter = ""                 # initial filter query
 tree = false
 show_threads = false        # Linux reports every task; threads are hidden by default
 group_by = "none"           # none|service|container|user
 layout = "dashboard"        # dashboard|processes|cpu|io|fleet
+compact = "auto"            # auto|on|off: the small-screen dashboard, a few
+                            # lines of vitals over a full-width process
+                            # table. auto means a terminal under 100x30.
 theme = "default"           # default|mono|nord|solarized|gruvbox
 group_sensors = true
 show_virtual_ifaces = false
@@ -956,13 +1038,18 @@ kernel = true               # OOM kills, segfaults, oopses and block-IO
 
 [procs]
 # Fixed column order; empty means fit as many as the terminal is wide enough
-# for. Names: mark pid user state cpu trend mem pss growth majflt virt thr ni fd disk
-# time ports name. COMMAND is always drawn last, and unknown names are ignored.
+# for. Names: mark pid user state cpu trend mem pss swap growth majflt net virt thr ni fd
+# disk time ports name. COMMAND is always drawn last, and unknown names are ignored.
 columns = []
 pss = false                 # read /proc/<pid>/smaps_rollup for proportional
                             # and unique memory: adds the PSS column and the
-                            # pss> and uss> filters. One read per process per
+                            # pss> and uss> filters, and a SWAP column. One
+                            # read per process per
                             # sample, so it is opt-in like fds.
+net = false                 # per-process TCP bytes per second, from `ss`: adds
+                            # the NET column and `-s net`. TCP only (UDP and
+                            # QUIC read as quiet), live sockets only, and other
+                            # users' processes need root. One `ss` per sample.
 ports = false               # add the PORTS column and look up ports for the
                             # rows on screen (one fd-table walk per visible row)
 fds = false                 # count every process's open descriptors and read
@@ -1070,7 +1157,7 @@ crit = "#ff5555"
 
 [[alert]]
 name = "cpu-saturated"
-kind = "cpu"                # cpu mem swap load disk temp gpu psi io net fd proc trend fillin cgroup kernel cputime vm throttle oomkill tcp storage unit
+kind = "cpu"                # cpu mem swap load disk temp gpu psi io net fd proc trend fillin cgroup kernel cputime vm throttle oomkill tcp storage unit battery soc anomaly
 threshold = 90.0            # % for most kinds; °C for temp, B/s for net and
                             # vm (faults/s for vm:majfault), a count for proc,
                             # kernel, oomkill, storage and unit; seconds for
@@ -1078,8 +1165,8 @@ threshold = 90.0            # % for most kinds; °C for temp, B/s for net and
                             # for tcp; absolute for load
 hysteresis = 0.0            # recovery margin in the measurement's unit
 for_secs = 30               # must hold this long before firing
-over_secs = 0               # trend, fillin and oomkill: the window they
-                            # measure over, in seconds. 0 means 300.
+over_secs = 0               # trend, fillin, oomkill and anomaly: the window
+                            # they measure over, in seconds. 0 means 300.
 below = false               # fire when strictly *under* the threshold instead
 target = ""                 # mount point, sensor prefix, GPU or interface
                             # name, psi resource (cpu|mem|io[.full]), a
@@ -1091,6 +1178,10 @@ target = ""                 # mount point, sensor prefix, GPU or interface
                             # throttle and oomkill, a tcp figure (retrans|
                             # listendrops|resets|failed|closewait|timewait|
                             # estab), an array or pool for storage, a
+                            # battery figure (percent|health|remaining|draw|
+                            # cycles|temp), a board figure for soc (throttled|
+                            # undervoltage|sinceboot|clock), a series for
+                            # anomaly (cpu|mem|swap|load|io|net|temp), a
                             # process name for fd rules, or — for a trend
                             # rule with a query — which series of those
                             # processes to follow: rss (default)|cpu|io
@@ -1136,6 +1227,27 @@ target = "swapin"           # or swapout, swap (both), majfault (per second)
 threshold = 1.0e7           # bytes per second read back from swap
 for_secs = 30
 ```
+
+`kind = "battery"`, `kind = "soc"` and `kind = "anomaly"` are the questions
+for a machine on a battery, a single-board computer, and one whose "normal"
+nobody wrote down. `battery` reads the lowest charge by default — write it
+with `below = true`, `threshold = 15` — or `health`, `remaining` (seconds,
+counting only batteries that are running down: a charging battery's time is
+time to *full*), `draw`, `cycles` or `temp`. `soc` reads the Raspberry Pi
+firmware's throttle word: `throttled` counts the conditions in effect now —
+undervoltage, a frequency cap, throttling, the soft temperature limit —
+`undervoltage` is 1 while the supply is sagging, `sinceboot` counts any that
+have happened since boot, and `clock` is the CPU clock as a percentage of its
+ceiling (use `below`). An undervolted Pi does not crash, it slows down, and
+nothing else crabmon measures says why. Both are quiet where there is nothing
+to read. `anomaly` is how many standard deviations a series — `cpu`, `mem`,
+`swap`, `load`, `io`, `net` or `temp` — is from its own recent past, over the
+rule's `over_secs` window: `anomaly:cpu>3/30m` asks "is this unusual *for this
+machine*", which needs no threshold tuned per host, where 80% CPU is routine
+at three in the morning and an incident at noon. A drop is `below = true` with
+a negative threshold. There is no verdict until the window has half filled
+and twenty samples are in, so a restart does not page on noise, and a spread
+floor keeps a perfectly flat series from reading every wobble as infinite.
 
 `kind = "throttle"`, `kind = "oomkill"` and `kind = "tcp"` are the
 container and network questions: a service stalled by its own CPU quota, a

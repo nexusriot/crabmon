@@ -1,4 +1,4 @@
-.TH CRABMON 1 "2026-11-15" "crabmon 0.18.0" "User Commands"
+.TH CRABMON 1 "2026-11-22" "crabmon 0.19.0" "User Commands"
 .SH NAME
 crabmon \- terminal system monitor
 .SH SYNOPSIS
@@ -35,7 +35,7 @@ percentages to mean anything.
 .BR \-s ", " \-\-sort " " \fIKEY\fR
 Initial sort column: \fBpid\fR, \fBname\fR, \fBcpu\fR, \fBmem\fR, \fBvirt\fR,
 \fBdisk\fR, \fBtime\fR, \fBuser\fR, \fBstate\fR, \fBthreads\fR, \fBnice\fR,
-\fBfds\fR, \fBpss\fR, \fBgrowth\fR or \fBmajflt\fR.
+\fBfds\fR, \fBpss\fR, \fBgrowth\fR, \fBmajflt\fR, \fBswap\fR or \fBnet\fR.
 .TP
 .BR \-a ", " \-\-ascending
 Sort ascending.
@@ -91,7 +91,7 @@ Aggregate the process table: \fBnone\fR, \fBservice\fR, \fBcontainer\fR or
 Process-table columns, comma separated, overriding \fB[procs] columns\fR \(em
 e.g. \fBpid,user,cpu,mem,name\fR. Known columns: \fBmark\fR, \fBpid\fR,
 \fBuser\fR, \fBstate\fR, \fBcpu\fR, \fBtrend\fR, \fBmem\fR, \fBvirt\fR,
-\fBpss\fR, \fBgrowth\fR, \fBmajflt\fR, \fBthr\fR, \fBni\fR, \fBfd\fR,
+\fBpss\fR, \fBswap\fR, \fBgrowth\fR, \fBmajflt\fR, \fBnet\fR, \fBthr\fR, \fBni\fR, \fBfd\fR,
 \fBdisk\fR, \fBtime\fR, \fBports\fR, \fBname\fR. An unknown name is an error rather than a column quietly missing
 from the table. \fBname\fR is always drawn last.
 .TP
@@ -249,7 +249,7 @@ names its figure and then, optionally, the unit: \fBunit:failed>=1\fR,
 its own colons, so \fBtrend:io:user:postgres>10M\fR is the IO rate of
 everything that user runs.
 .PP
-\fBtrend\fR, \fBfillin\fR and \fBoomkill\fR measure over a window, the
+\fBtrend\fR, \fBfillin\fR, \fBoomkill\fR and \fBanomaly\fR measure over a window, the
 \fBover_secs\fR of an \fB[[alert]]\fR, given after the value as
 \fB/\fR\fIDURATION\fR: \fBtrend:postgres>200M/10m\fR,
 \fBfillin:/var<3h/30m\fR, \fBoomkill>=1/1h\fR. Without one they use five
@@ -294,7 +294,7 @@ Show the fleet table, or go back to the dashboard from it. Only meaningful
 when crabmon was started with several \fB\-\-remote\fR targets.
 .TP
 .B /
-Filter processes. \fBEsc\fR clears the filter.
+Filter processes. \fBEsc\fR clears the filter, \fBCtrl\-U\fR the line and \fBCtrl\-W\fR its last word.
 .TP
 .B c, m, p, n, d
 Sort by CPU, memory, PID, name or disk IO. Pressing the active column's key
@@ -374,6 +374,14 @@ from the aggregate network rate.
 .TP
 .B g
 Group or expand temperature sensors.
+.TP
+.B C
+Cycle the compact layout: auto, on, off.
+.TP
+.BR b ", " B
+Screen brighter or dimmer by a tenth of its range, never to black. Needs write
+access to \fI/sys/class/backlight\fR (root, the \fBvideo\fR group or a udev
+rule), and only acts on the machine crabmon is running on.
 .TP
 .BR + ", " \- " (or " = " and " _ )
 Refresh faster or slower.
@@ -506,9 +514,7 @@ a warning.
 Refresh interval in milliseconds, clamped to 200\-10000. Default 800.
 .TP
 .B sort_by
-Sort column: \fBpid\fR, \fBname\fR, \fBcpu\fR, \fBmem\fR, \fBvirt\fR,
-\fBdisk\fR, \fBtime\fR, \fBuser\fR, \fBstate\fR, \fBthreads\fR, \fBnice\fR,
-\fBfds\fR, \fBpss\fR, \fBgrowth\fR, \fBmajflt\fR. Default \fBcpu\fR.
+Sort column (pid, name, cpu, mem, virt, disk, time, user, state, threads, nice, fds, pss, growth, majflt, swap, net). Default cpu.
 .TP
 .B sort_desc
 Sort descending. Default true.
@@ -530,6 +536,11 @@ Aggregate the process table: \fBnone\fR, \fBservice\fR, \fBcontainer\fR or
 .B layout
 \fBdashboard\fR, \fBprocesses\fR, \fBcpu\fR, \fBio\fR or \fBfleet\fR.
 Default \fBdashboard\fR.
+.TP
+.B compact
+\fBauto\fR, \fBon\fR or \fBoff\fR: the small-screen dashboard, a few lines of
+vitals over a full-width process table. \fBauto\fR (the default) uses it on a
+terminal smaller than 100 by 30; \fBC\fR cycles it.
 .TP
 .B theme
 \fBdefault\fR, \fBmono\fR, \fBnord\fR, \fBsolarized\fR or \fBgruvbox\fR.
@@ -576,6 +587,14 @@ additionally runs \fBnvidia\-smi\fR once per refresh, on a thread of its own so 
 slow driver delays only the GPU figures (one sample behind, and dropped after
 15 seconds without an answer); off by default because it costs tens of
 milliseconds.
+.PP
+On ARM boards the GPU is a platform device that the DRM scan cannot read, so it
+is found separately: Mali and other SoC GPUs through devfreq (clock, ceiling, a
+load figure where the driver has one, the GPU's own thermal zone where the
+board has one), and a Raspberry Pi's VideoCore through \fBvcgencmd\fR (its
+clock, and the memory reserved for it). A VideoCore has no load figure without
+debugfs, so its row shows the clock rather than a zero. \fB\-\-doctor\fR says
+when \fBvcgencmd\fR is missing.
 .SS [export]
 .B dir
 is where \fBP\fR writes snapshots (empty means the working directory),
@@ -635,7 +654,7 @@ is where segments go when the flag names no directory.
 .B columns
 fixes the column order instead of fitting the terminal width. Names are
 \fBmark\fR, \fBpid\fR, \fBuser\fR, \fBstate\fR, \fBcpu\fR, \fBtrend\fR,
-\fBmem\fR, \fBpss\fR, \fBgrowth\fR, \fBmajflt\fR, \fBvirt\fR, \fBthr\fR, \fBni\fR,
+\fBmem\fR, \fBpss\fR, \fBswap\fR, \fBgrowth\fR, \fBmajflt\fR, \fBnet\fR, \fBvirt\fR, \fBthr\fR, \fBni\fR,
 \fBfd\fR, \fBdisk\fR, \fBtime\fR, \fBports\fR and \fBname\fR; COMMAND is always drawn last and
 unknown names are ignored. Empty (the default) fits as many as will go.
 .B pss
@@ -644,9 +663,17 @@ reads \fB/proc/<pid>/smaps_rollup\fR for each process, which adds the
 page shared between eight processes eight times, so a tree's RSS can exceed
 the machine's memory; PSS divides each shared page among its holders and adds
 up to something real, and USS is what killing the process would actually free.
+It also supplies each process's swapped memory, the \fBSWAP\fR column and
+\fB\-s swap\fR.
 Off by default: one more read per process per sample. Threads are skipped,
 since every thread of a process shares its address space and would report the
 process's own figures.
+.TP
+.B net
+measures each process's TCP traffic from \fBss\fR, which adds the \fBNET/s\fR
+column and \fB\-s net\fR. TCP only (UDP and QUIC read as quiet), only sockets
+open during the interval are counted, and other users' processes need root.
+Off by default: one \fBss\fR run per sample.
 .TP
 .B ports
 looks up listening ports for the rows on screen \(em one fd table per visible row,
@@ -797,7 +824,23 @@ Each table defines one rule:
 is one of
 .IR cpu ", " mem ", " swap ", " load ", " disk ", " temp ", " gpu ", " psi ", "
 .IR io ", " net ", " fd ", " proc ", " trend ", " fillin ", " cgroup ", "
-.IR kernel ", " cputime ", " vm ", " throttle ", " oomkill ", " tcp ", " storage " or " unit .
+.IR kernel ", " cputime ", " vm ", " throttle ", " oomkill ", " tcp ", " storage ", "
+.IR unit ", " battery ", " soc " or " anomaly .
+.I battery
+reads the lowest charge by default (use \fBbelow\fR), or \fBhealth\fR,
+\fBremaining\fR (seconds, for batteries that are running down),
+\fBdraw\fR, \fBcycles\fR or \fBtemp\fR.
+.I soc
+reads a Raspberry Pi's firmware throttle word: \fBthrottled\fR counts the
+conditions in effect now (undervoltage, frequency cap, throttling, soft
+temperature limit), \fBundervoltage\fR is 1 while the supply sags,
+\fBsinceboot\fR counts any seen since boot and \fBclock\fR is the CPU clock
+as a percentage of its ceiling.
+.I anomaly
+is how many standard deviations the series named by \fItarget\fR (\fBcpu\fR,
+\fBmem\fR, \fBswap\fR, \fBload\fR, \fBio\fR, \fBnet\fR or \fBtemp\fR) is from
+its own recent past over \fIover_secs\fR; a drop is \fBbelow\fR with a
+negative threshold. It says nothing until the window is half full.
 .I unit
 measures systemd services: \fItarget\fR is \fBcrashloop\fR (units restarting in
 a loop, the default), \fBfailed\fR, or \fBrestarts\fR (the most automatic

@@ -62,6 +62,9 @@ pub fn proc_row(pid: u32, ppid: Option<u32>, name: &str, cpu: f32, mem: u64) -> 
         cmd: format!("/usr/bin/{name} --flag"),
         pss: None,
         uss: None,
+        swap: None,
+        net_rx_bps: None,
+        net_tx_bps: None,
         exe: format!("/usr/bin/{name}"),
         cwd: "/home/vlad".into(),
     }
@@ -244,9 +247,19 @@ pub fn snapshot() -> Snapshot {
                 energy_full_wh: Some(58.75),
                 time_remaining_secs: Some(17_220),
                 health_percent: Some(97.9),
+                cycle_count: Some(212),
+                voltage_v: Some(11.4),
+                temp_c: None,
             }],
             ac_online: Some(false),
             rapl_watts: None,
+            soc: Default::default(),
+            backlights: vec![crabmon::metrics::backlight::Backlight {
+                name: "intel_backlight".into(),
+                brightness: 48_000,
+                max: 96_000,
+                kind: "raw".into(),
+            }],
         },
         cgroups: Vec::new(),
         // A healthy machine: the kernel log is readable and has nothing to
@@ -293,7 +306,14 @@ pub fn snapshot() -> Snapshot {
 /// No alert rules by default, so tests that assert on the status line are not
 /// competing with the shipped defaults.
 pub fn config() -> crabmon::Config {
-    crabmon::Config { theme: "mono".into(), alerts: vec![], ..Default::default() }
+    // Compact off: the suite's screens are drawn at sizes `auto` would
+    // collapse, and the tests that are about compact ask for it themselves.
+    crabmon::Config {
+        theme: "mono".into(),
+        alerts: vec![],
+        compact: crabmon::ui::Compact::Off,
+        ..Default::default()
+    }
 }
 
 pub fn app() -> crabmon::App {

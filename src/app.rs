@@ -159,6 +159,9 @@ pub struct App {
     pub refresh: Duration,
     pub last_refresh: Instant,
     pub status: Option<(String, Instant)>,
+    /// Where `b` and `B` write. A field rather than a constant so that a test
+    /// can point it at a temporary directory: the keys change the real screen.
+    pub backlight_root: std::path::PathBuf,
 
     pub cpu_hist: History,
     pub per_core_hist: Vec<History>,
@@ -323,6 +326,7 @@ impl App {
             pending_targets: Vec::new(),
             last_refresh: Instant::now(),
             status: None,
+            backlight_root: std::path::PathBuf::from("/sys/class/backlight"),
             cpu_hist: hist(),
             per_core_hist: (0..snap.cpu.per_core.len()).map(|_| hist()).collect(),
             mem_hist: hist(),
@@ -985,6 +989,22 @@ impl App {
         self.rows.get(self.selected)
     }
 
+    /// Brighten or dim the local screen by one step.
+    ///
+    /// Only for the machine crabmon is running on: under `--remote` or
+    /// `--replay` the backlight on the screen is somebody else's, and writing
+    /// this machine's sysfs would change a display that was never being shown.
+    fn adjust_backlight(&mut self, up: bool) {
+        if !self.samples_this_host() {
+            self.set_status("the backlight is only adjustable on this machine");
+            return;
+        }
+        let msg = match crate::metrics::backlight::adjust(&self.backlight_root, up) {
+            Ok(m) | Err(m) => m,
+        };
+        self.set_status(msg);
+    }
+
     pub fn set_status(&mut self, msg: impl Into<String>) {
         self.status = Some((msg.into(), Instant::now()));
     }
@@ -1051,6 +1071,22 @@ impl App {
         if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.reload_config();
             return Action::None;
+        }
+        // A chord is not its letter. Terminals deliver Ctrl-U as `u` with the
+        // control modifier, and every handler below matched on the letter
+        // alone — so Ctrl-U typed into the filter prompt inserted a `u`
+        // (found on a real host, where it turned `sleep` into `usleep`), and in
+        // the process table it opened the unit pane. Ctrl and Alt chords are
+        // line editing where there is a line and nothing where there is not.
+        // AltGr reports as both, and is how some layouts type `@` and `\`, so
+        // a key with both is still a character.
+        if let KeyCode::Char(c) = key.code {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let alt = key.modifiers.contains(KeyModifiers::ALT);
+            if ctrl != alt {
+                self.edit_line(c, ctrl);
+                return Action::None;
+            }
         }
         match self.mode {
             Mode::Normal => self.on_normal_key(key),
@@ -1250,6 +1286,12 @@ impl App {
                     "hiding threads"
                 });
                 self.rebuild_view();
+            }
+            KeyCode::Char('b') => self.adjust_backlight(true),
+            KeyCode::Char('B') => self.adjust_backlight(false),
+            KeyCode::Char('C') => {
+                self.cfg.compact = self.cfg.compact.next();
+                self.set_status(format!("compact layout: {}", self.cfg.compact.name()));
             }
             KeyCode::Char('g') => {
                 self.cfg.group_sensors = !self.cfg.group_sensors;
@@ -1855,6 +1897,31 @@ impl App {
             Err(e) => self.filter_error = Some(e),
         }
         self.rebuild_view();
+    }
+
+    /// `Ctrl-U` clears the line and `Ctrl-W` deletes its last word, in the
+    /// prompts that have one; every other chord does nothing.
+    fn edit_line(&mut self, c: char, ctrl: bool) {
+        if !ctrl || !matches!(c, 'u' | 'w') {
+            return;
+        }
+        let line = match self.mode {
+            Mode::Filter => &mut self.filter_text,
+            Mode::Seek | Mode::Silence | Mode::Renice | Mode::Affinity | Mode::IoPriority => {
+                &mut self.input
+            }
+            _ => return,
+        };
+        match c {
+            'u' => line.clear(),
+            _ => {
+                let kept = line.trim_end().rfind(char::is_whitespace).map_or(0, |i| i + 1);
+                line.truncate(kept);
+            }
+        }
+        if self.mode == Mode::Filter {
+            self.apply_filter();
+        }
     }
 
     fn on_filter_key(&mut self, key: KeyEvent) {

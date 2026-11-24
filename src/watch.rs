@@ -180,9 +180,14 @@ pub fn parse_rule(expr: &str, for_secs: u64) -> Result<AlertRule, String> {
     }
     let over_secs = match window {
         None => 0,
-        Some(_) if !matches!(kind, AlertKind::Trend | AlertKind::FillIn | AlertKind::OomKill) => {
+        Some(_)
+            if !matches!(
+                kind,
+                AlertKind::Trend | AlertKind::FillIn | AlertKind::OomKill | AlertKind::Anomaly
+            ) =>
+        {
             return Err(format!(
-                "{} has no window; only trend, fillin and oomkill take /DURATION",
+                "{} has no window; only trend, fillin, oomkill and anomaly take /DURATION",
                 kind.key_name()
             ));
         }
@@ -216,6 +221,26 @@ pub fn parse_rule(expr: &str, for_secs: u64) -> Result<AlertRule, String> {
         return Err(format!(
             "unknown tcp figure: {target}\nknown figures: {}",
             crate::metrics::netstat::TCP_SERIES.join(", ")
+        ));
+    }
+    if kind == AlertKind::Battery && !crate::alerts::battery_target_is_known(target) {
+        return Err(format!(
+            "unknown battery figure: {target}\nknown figures: {}",
+            crate::alerts::BATTERY_TARGETS.join(", ")
+        ));
+    }
+    if kind == AlertKind::Soc && !crate::alerts::soc_target_is_known(target) {
+        return Err(format!(
+            "unknown board figure: {target}\nknown figures: {}",
+            crate::alerts::SOC_TARGETS.join(", ")
+        ));
+    }
+    // An anomaly rule with no series, or one nobody can measure, would sit
+    // quiet for ever; there is no sensible default to fall back to.
+    if kind == AlertKind::Anomaly && !crate::alerts::anomaly_series_is_known(target) {
+        return Err(format!(
+            "anomaly needs a series, e.g. anomaly:cpu>3\nknown series: {}",
+            crate::alerts::ANOMALY_SERIES.join(", ")
         ));
     }
     if kind == AlertKind::Vm && !crate::metrics::kstat::vm_target_is_known(target) {
@@ -773,6 +798,8 @@ mod tests {
             let expr = match kind {
                 AlertKind::Proc => "proc:nginx>=1".to_string(),
                 AlertKind::Net => format!("{}>=1M", kind.key_name()),
+                // The one kind with no default series to measure.
+                AlertKind::Anomaly => "anomaly:cpu>=1".to_string(),
                 _ => format!("{}>=1", kind.key_name()),
             };
             let rule = parse_rule(&expr, 0).unwrap_or_else(|e| panic!("{expr}: {e}"));

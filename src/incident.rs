@@ -171,7 +171,13 @@ pub fn summary(rule: &ActiveAlert, first: &Snapshot, at: &Snapshot, dump: &str) 
 
 /// A table of the busiest processes, by CPU.
 fn table(snap: &Snapshot, limit: usize) -> String {
-    let mut procs: Vec<_> = snap.procs.iter().collect();
+    // Processes, not tasks: Linux lists every thread as a row of its own,
+    // carrying its process's memory. Found on a real host, where the "busiest
+    // processes" of an incident were `SSU2` and `tokio-rt-worker` — threads of
+    // one daemon, three of the eight rows, each with the daemon's RSS.
+    let distinguishable = crate::metrics::threads_are_distinguishable(&snap.procs);
+    let mut procs: Vec<_> =
+        snap.procs.iter().filter(|p| !distinguishable || p.threads.is_some()).collect();
     procs.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal));
     let mut out = String::from("| process | pid | user | CPU | RSS |\n|---|---:|---|---:|---:|\n");
     for p in procs.into_iter().take(limit) {
@@ -394,5 +400,32 @@ mod tests {
             out.contains("- **Paged**: no — maintenance window \"backup\" until 03:30 UTC"),
             "{out}"
         );
+    }
+
+    /// Linux lists each thread as a row carrying its process's memory; the
+    /// "busiest processes" of an incident were a daemon's worker threads.
+    #[test]
+    fn the_busiest_table_lists_processes_and_not_their_threads() {
+        let process =
+            |pid, name: &str, cpu, mem| ProcRow { threads: Some(40), ..proc(pid, name, cpu, mem) };
+        // Two threads of `daemon`: no task count, and the process's RSS again.
+        let busy = snap(
+            10.0,
+            1 << 30,
+            vec![
+                process(1, "daemon", 5.0, 48 << 20),
+                proc(2, "worker-a", 4.0, 48 << 20),
+                proc(3, "worker-b", 3.0, 48 << 20),
+                process(4, "other", 1.0, 1 << 20),
+            ],
+        );
+        let t = table(&busy, 10);
+        assert!(t.contains("daemon") && t.contains("other"), "{t}");
+        assert!(!t.contains("worker-a") && !t.contains("worker-b"), "threads were listed:\n{t}");
+
+        // Where nothing reports a task count the rows cannot be told apart
+        // (another platform), and dropping them all would be an empty table.
+        let flat = snap(1.0, 1, vec![proc(7, "only", 1.0, 1)]);
+        assert!(table(&flat, 10).contains("only"));
     }
 }
