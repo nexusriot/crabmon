@@ -77,6 +77,14 @@ mkdir -p "$(dirname "$out")"
 # Manifests first, then the tree with paths rooted at `/`, as pkg writes them.
 # Files only: pkg creates the directories it needs, and a directory entry it
 # did not record is a warning at best.
-(cd "$stage" && { echo +COMPACT_MANIFEST; echo +MANIFEST; find usr -type f | sort; } |
-  tar --owner=0 --group=0 --numeric-owner --transform "s,^usr,/usr," \
-    --absolute-names -cf - -T -) | xz -9 > "$out"
+# GNU tar and bsdtar (macOS, the BSDs) spell the rename and the ownership
+# differently. The archive goes to a file before xz so a tar failure is not
+# hidden by the pipe's exit status.
+if tar --version 2>/dev/null | grep -q 'GNU tar'; then
+  set -- --owner=0 --group=0 --numeric-owner --transform "s,^usr,/usr," --absolute-names
+else
+  set -- --uid 0 --gid 0 --numeric-owner -s ",^usr,/usr," -P
+fi
+(cd "$stage" && { echo +COMPACT_MANIFEST; echo +MANIFEST; find usr -type f | sort; } > "$stage/.list" &&
+  tar "$@" -cf "$stage/.tar" -T "$stage/.list")
+xz -9c "$stage/.tar" > "$out"
