@@ -208,8 +208,10 @@ mod tests {
 
     #[test]
     fn a_machine_with_no_backlight_reads_as_none() {
-        assert!(scan(&tmpdir("empty")).is_empty());
+        let root = tmpdir("empty");
+        assert!(scan(&root).is_empty());
         assert!(scan(Path::new("/nonexistent/backlight")).is_empty());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -252,7 +254,9 @@ mod tests {
 
     #[test]
     fn adjusting_with_nothing_to_adjust_is_an_error_not_a_panic() {
-        assert!(adjust(&tmpdir("none"), true).is_err());
+        let root = tmpdir("none");
+        assert!(adjust(&root, true).is_err());
+        let _ = fs::remove_dir_all(&root);
         assert!(set(Path::new("/tmp"), "../etc", 1).is_err());
         assert!(set(Path::new("/tmp"), "", 1).is_err());
     }

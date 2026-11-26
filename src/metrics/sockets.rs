@@ -162,7 +162,25 @@ pub const MAX_FDS_SCANNED: usize = 4096;
 /// by how many processes the machine has.
 pub fn listening_ports(pids: &[u32]) -> HashMap<u32, Vec<u16>> {
     let mut out = HashMap::new();
-    if !cfg!(target_os = "linux") || pids.is_empty() {
+    if pids.is_empty() {
+        return out;
+    }
+    if cfg!(target_os = "freebsd") {
+        for (pid, s) in read_sockstat() {
+            if !pids.contains(&pid) || !(s.state == "LISTEN" || s.protocol.starts_with("udp")) {
+                continue;
+            }
+            if let Some(port) = port_of(&s.local) {
+                let ports: &mut Vec<u16> = out.entry(pid).or_default();
+                if !ports.contains(&port) {
+                    ports.push(port);
+                }
+            }
+        }
+        out.values_mut().for_each(|p| p.sort_unstable());
+        return out;
+    }
+    if !cfg!(target_os = "linux") {
         return out;
     }
     let table = all_sockets();
@@ -192,14 +210,63 @@ pub fn port_of(local: &str) -> Option<u16> {
     local.rsplit_once(':').and_then(|(_, p)| p.parse().ok())
 }
 
-/// Every socket held by `pid`, listening sockets first. Linux-only.
-pub fn for_pid(pid: u32) -> Vec<Socket> {
-    if !cfg!(target_os = "linux") {
-        return Vec::new();
+/// Parse `sockstat -46 -s`: `USER COMMAND PID FD PROTO LOCAL FOREIGN [STATE]`.
+///
+/// The command may hold spaces, so the row is anchored on the protocol word
+/// (`tcp4`, `udp6`, `tcp46`...) and read outwards: the pid two before it, the
+/// addresses after. A header, a short row or a non-numeric pid is skipped.
+pub fn parse_sockstat(content: &str) -> Vec<(u32, Socket)> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let Some(at) = f.iter().position(|w| {
+            (w.starts_with("tcp") || w.starts_with("udp"))
+                && w.len() > 3
+                && w[3..].chars().all(|c| c.is_ascii_digit())
+        }) else {
+            continue;
+        };
+        if at < 3 || f.len() < at + 3 {
+            continue;
+        }
+        let Ok(pid) = f[at - 2].parse::<u32>() else { continue };
+        out.push((
+            pid,
+            Socket {
+                protocol: f[at].to_string(),
+                local: f[at + 1].to_string(),
+                remote: f[at + 2].to_string(),
+                state: f.get(at + 3).map(|s| s.to_string()).unwrap_or_default(),
+            },
+        ));
     }
-    let table = all_sockets();
-    let mut out: Vec<Socket> =
-        socket_inodes_of(pid).into_iter().filter_map(|i| table.get(&i).cloned()).collect();
+    out
+}
+
+/// Every IPv4 and IPv6 socket `sockstat` will show, with its owner. Other
+/// users' sockets need root. Empty where `sockstat` is not on the machine.
+pub fn read_sockstat() -> Vec<(u32, Socket)> {
+    #[cfg(target_os = "freebsd")]
+    {
+        if let Ok(out) = std::process::Command::new("sockstat").args(["-46", "-s"]).output()
+            && out.status.success()
+        {
+            return parse_sockstat(&String::from_utf8_lossy(&out.stdout));
+        }
+    }
+    Vec::new()
+}
+
+/// Every socket held by `pid`, listening sockets first.
+pub fn for_pid(pid: u32) -> Vec<Socket> {
+    let mut out: Vec<Socket> = if cfg!(target_os = "freebsd") {
+        read_sockstat().into_iter().filter(|(p, _)| *p == pid).map(|(_, s)| s).collect()
+    } else if cfg!(target_os = "linux") {
+        let table = all_sockets();
+        socket_inodes_of(pid).into_iter().filter_map(|i| table.get(&i).cloned()).collect()
+    } else {
+        return Vec::new();
+    };
     out.sort_by(|a, b| {
         (b.state == "LISTEN")
             .cmp(&(a.state == "LISTEN"))
@@ -213,6 +280,41 @@ pub fn for_pid(pid: u32) -> Vec<Socket> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sockstat_rows_become_sockets_owned_by_a_pid() {
+        let text = "\
+USER     COMMAND      PID FD PROTO LOCAL ADDRESS         FOREIGN ADDRESS      STATE
+root     sshd        1369  7 tcp4  *:22                  *:*                  LISTEN
+_beastie beastied    1408  3 tcp46 *:8088                *:*                  LISTEN
+root     sshd-sessi 21132  7 tcp4  192.168.18.55:22      192.168.18.79:50258  ESTABLISHED
+root     syslogd     1146  7 udp4  *:514                 *:*
+root     my daemon   77    4 tcp6  ::1:9000              *:*                  LISTEN
+";
+        let s = parse_sockstat(text);
+        assert_eq!(s.len(), 5);
+        assert_eq!(s[0].0, 1369);
+        assert_eq!(s[0].1.state, "LISTEN");
+        assert_eq!(port_of(&s[1].1.local), Some(8088));
+        assert_eq!(s[1].1.protocol, "tcp46");
+        assert_eq!(s[2].1.state, "ESTABLISHED");
+        // UDP has no state, and must not borrow one.
+        assert_eq!(s[3].1.state, "");
+        // A command with a space in it does not shift the columns.
+        assert_eq!(s[4].0, 77);
+        assert_eq!(port_of(&s[4].1.local), Some(9000));
+    }
+
+    #[test]
+    fn sockstat_noise_and_a_missing_tool_yield_nothing() {
+        assert!(parse_sockstat("").is_empty());
+        assert!(
+            parse_sockstat("USER COMMAND PID FD PROTO LOCAL ADDRESS FOREIGN ADDRESS\n").is_empty()
+        );
+        assert!(parse_sockstat("root x notapid 3 tcp4 *:1 *:*\n").is_empty());
+        assert!(parse_sockstat("root x 1 3 tcp4\n").is_empty());
+        let _ = read_sockstat();
+    }
 
     // The header plus one real line from /proc/net/tcp on this machine.
     const TCP: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode

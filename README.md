@@ -447,6 +447,29 @@ missing before it starts compiling. Override with `ARM64_TARGET`,
 named `_amd64.deb` like the dynamic one, so it is also left under
 `target/x86_64-unknown-linux-musl/debian/` where the two cannot collide.
 
+### FreeBSD
+
+```sh
+make bin-freebsd     # bin/crabmon-freebsd
+make pkg-freebsd     # dist/crabmon-<version>-freebsd-amd64.pkg
+```
+
+Both are built **in a container, from Linux**: they need Docker and nothing
+else — no FreeBSD machine, no Rust, no cross linker. The image
+(`scripts/freebsd/Dockerfile`) carries rustc, clang and lld, and links against
+FreeBSD's own libc taken from the release's `base.txz`, pinned by SHA-256. The
+first build downloads that (about 165 MB) and compiles the dependencies; later
+ones reuse both. The package is assembled by `scripts/freebsd/mkpkg.sh` — a
+pkg(8) archive is a tar of two manifests and the files — and installs with:
+
+```sh
+pkg add crabmon-<version>-freebsd-amd64.pkg      # files go under /usr/local
+```
+
+It is linked against FreeBSD 15.0 and stamped `FreeBSD:15:amd64`, so it
+installs on 15.x. `FREEBSD_RELEASE` (and `FREEBSD_ABI`) select another release
+once its `base.txz` checksum is added to `scripts/build.sh`.
+
 ## Usage
 
 Run `crabmon`. It draws into the alternate screen and restores your terminal on
@@ -1636,11 +1659,15 @@ thing for something other than a person.
 - PSI needs Linux 4.20+ with `CONFIG_PSI=y`; the panel is hidden otherwise.
 - CPU package power needs readable RAPL counters, which are root-only on most
   kernels since CVE-2020-8694. Battery figures need no privileges.
-- Per-disk IO on FreeBSD is read from `iostat -x`, including its `%b` and
-  `ms/t` columns for utilisation and latency; those are since-boot averages
-  rather than the interval rates the Linux path derives. That path is
-  compile-checked in CI and unit-tested against captured output, but has not
-  been run on real FreeBSD hardware.
+- On FreeBSD (tested on 15.0), the core dashboard works: CPU with its clock and
+  model, memory with buffers and reclaimable cache, per-disk IO (from
+  `iostat -x -I`'s cumulative counters, differenced into the same interval rates
+  as Linux), network, the process table and tree, a process's listening ports,
+  sockets, open files and environment (from `sockstat` and `procstat`), alerts,
+  recording, `--serve`, `--remote` and the fleet. What has no FreeBSD source is
+  absent: thread counts, cgroups and systemd units, kernel events, pressure
+  stall, GPU, sensors, batteries, per-process swap and network, and descriptor
+  counts, and `--doctor` says so.
 - `--serve --remote` exports a fleet with a `host` label on every series;
   `--once`, `--stream` and `--watch` still sample the host they run on and
   refuse `--remote` rather than quietly reporting the wrong machine.

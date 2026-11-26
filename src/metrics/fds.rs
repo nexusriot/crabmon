@@ -64,6 +64,50 @@ impl OpenFile {
     }
 }
 
+/// Parse `procstat -f <pid>`: `PID COMM FD T V FLAGS REF OFFSET PRO NAME`.
+///
+/// Only numbered descriptors are descriptors; `text`, `cwd`, `root` and `jail`
+/// are the process's other vnode references. Sockets are left out for the
+/// reason the Linux path leaves them out. A descriptor with no name (`-`) is
+/// labelled by its type, the way Linux labels `pipe:[...]`.
+pub fn parse_procstat_files(content: &str) -> Vec<OpenFile> {
+    let mut out: Vec<OpenFile> = content
+        .lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 10 {
+                return None;
+            }
+            let fd: u32 = f[2].parse().ok()?;
+            let kind = f[3];
+            if kind == "s" {
+                return None;
+            }
+            let name = f[9..].join(" ");
+            let target = if name == "-" {
+                match kind {
+                    "p" => "pipe",
+                    "k" => "kqueue",
+                    "e" => "eventfd",
+                    "t" => "pty",
+                    "c" => "crypto",
+                    "m" => "mqueue",
+                    "h" => "shm",
+                    "-" | "x" => "unknown",
+                    other => other,
+                }
+                .to_string()
+            } else {
+                name
+            };
+            Some(OpenFile { fd, target })
+        })
+        .take(MAX_FILES_LISTED)
+        .collect();
+    out.sort_by_key(|f| f.fd);
+    out
+}
+
 /// The process's open descriptors, in numeric order.
 ///
 /// Sockets are left out: the detail pane already lists them with their
@@ -92,7 +136,13 @@ pub fn open_files(pid: u32) -> Option<Vec<OpenFile>> {
         out.sort_by_key(|f| f.fd);
         Some(out)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "freebsd")]
+    {
+        let out =
+            std::process::Command::new("procstat").args(["-f", &pid.to_string()]).output().ok()?;
+        out.status.success().then(|| parse_procstat_files(&String::from_utf8_lossy(&out.stdout)))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     {
         let _ = pid;
         None
@@ -163,6 +213,31 @@ impl LimitCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PROCSTAT_F: &str =
+        "  PID COMM                FD T V FLAGS    REF  OFFSET PRO NAME        
+ 1408 beastied          text v r r-------   -       - -   /usr/local/bin/beastied
+ 1408 beastied           cwd v d r-------   -       - -   /                 
+ 1408 beastied             0 v c rw------   4       0 -   /dev/null         
+ 1408 beastied             1 p - rw------   2       0 -   -                 
+ 1408 beastied             3 s - rw---n--   3       0 TCP 0 0 ::.8088 ::.0
+ 1408 beastied             4 k - rw------   2       0 -   -                 
+ 1408 beastied            12 v r r-------   1    4096 -   /var/log/my file.log
+";
+
+    #[test]
+    fn procstat_lists_numbered_descriptors_and_labels_the_nameless() {
+        let f = parse_procstat_files(PROCSTAT_F);
+        let got: Vec<(u32, &str)> = f.iter().map(|f| (f.fd, f.target.as_str())).collect();
+        // text and cwd are not descriptors; the socket is the sockets list's.
+        assert_eq!(
+            got,
+            [(0, "/dev/null"), (1, "pipe"), (4, "kqueue"), (12, "/var/log/my file.log")]
+        );
+        assert!(f[0].is_path() && !f[1].is_path());
+        assert!(parse_procstat_files("").is_empty());
+        assert!(parse_procstat_files("garbage line\n").is_empty());
+    }
 
     // Verbatim from /proc/self/limits on Linux 6.8.
     const LIMITS: &str = "\

@@ -90,6 +90,7 @@ src/
     procnet.rs       per-process TCP bytes from `ss`, as rates
     soc.rs           Raspberry Pi throttle word, clock ceiling, governor
     backlight.rs     screen backlight level, and stepping it
+    bsd.rs           what sysinfo leaves blank on FreeBSD: release, CPU model, clock, uid 0's name
     socgpu.rs        Mali (devfreq) and Raspberry Pi VideoCore (vcgencmd) GPUs
     kmsg.rs          OOM kills, crashes and IO errors from /dev/kmsg
     ioprio.rs        IO scheduling class and level
@@ -717,7 +718,7 @@ terminal or a runaway process:
 
 ## Testing
 
-Over 900 tests: the in-crate unit tests plus eight integration suites. All are
+Over 1100 tests: the in-crate unit tests plus eight integration suites. All are
 offline and deterministic except `proc_control` and `e2e_local`, which exercise
 the running machine, and `e2e_docker`, which builds and runs a container:
 
@@ -1058,12 +1059,16 @@ reads as a quiet machine.
   them, so a busy multi-threaded process can exceed 100%.
 - `nvidia-smi` figures are one sample behind, and the first sample waits up
   to two seconds for an answer so `--once` has one.
-- The FreeBSD disk-IO path shells out to `iostat -x` per tick and reports
-  since-boot averages rather than instantaneous rates — which now applies to
-  the utilisation and latency figures it reads out of `%b` and `ms/t` as well,
-  so a FreeBSD host's "% busy" is its average since boot and not what the disk
-  is doing now. It is compile-checked in CI and unit-tested against captured
-  output, but has never run on real FreeBSD hardware.
+- FreeBSD is supported, not equal. It is built from Linux in a container
+  (`make bin-freebsd`, `make pkg-freebsd`; `scripts/freebsd/`) and the unit and
+  integration suites have been run on a real FreeBSD 15.0 host. Disk IO shells
+  out to `iostat -x -I` each tick for cumulative counters and differences them;
+  listening ports, sockets, open files and environment shell out to `sockstat`
+  and `procstat`, each one process spawn. Thread counts, per-process swap and
+  network, descriptor counts, sensors, batteries, GPUs, cgroups and units have no
+  source there and read as absent. libprocstat prints a warning to stderr when a
+  process exits mid-sample; the sample runs with stderr muted
+  (`bsd::MuteStderr`), or the line would land inside the table.
 - `--remote` streams by default (`[remote] stream`, on): one SSH session and
   one `crabmon --stream` for the whole session. The one-shot fallback, taken
   when the far end is too old to understand the flag, does re-run

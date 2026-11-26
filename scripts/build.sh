@@ -35,6 +35,17 @@ E2E_RUNNER_IMAGE=${E2E_RUNNER_IMAGE:-crabmon-e2e-runner:local}
 E2E_CARGO_VOLUME=${E2E_CARGO_VOLUME:-crabmon-e2e-cargo}
 E2E_TARGET_VOLUME=${E2E_TARGET_VOLUME:-crabmon-e2e-target}
 
+# The FreeBSD cross toolchain image (scripts/freebsd/Dockerfile) and the
+# volumes that keep its cargo cache and target directory off the checkout.
+# FREEBSD_RELEASE picks the sysroot the binary is linked against; the package
+# is stamped with the matching ABI unless FREEBSD_ABI says otherwise.
+FREEBSD_RELEASE=${FREEBSD_RELEASE:-15.0}
+FREEBSD_ABI=${FREEBSD_ABI:-FreeBSD:${FREEBSD_RELEASE%%.*}:amd64}
+FREEBSD_IMAGE=${FREEBSD_IMAGE:-crabmon-freebsd-build:$FREEBSD_RELEASE}
+FREEBSD_CARGO_VOLUME=${FREEBSD_CARGO_VOLUME:-crabmon-freebsd-cargo}
+FREEBSD_TARGET_VOLUME=${FREEBSD_TARGET_VOLUME:-crabmon-freebsd-target}
+FREEBSD_TARGET=x86_64-unknown-freebsd
+
 # The version lives in Cargo.toml and nowhere else; every other mention of it
 # is derived, so a bump cannot half-happen.
 version() {
@@ -187,6 +198,77 @@ rpm_cross() { # platform
   say "packaging ($platform rpm)"
   $CARGO generate-rpm --target "$target" --auto-req disabled
   ls -1 "target/$target"/generate-rpm/*.rpm 2>/dev/null || ls -1 target/generate-rpm/*.rpm
+}
+
+# ------------------------------------------------------------------ FreeBSD
+#
+# Built entirely in a container: the image carries rustc, clang, lld and
+# FreeBSD's own libc (see scripts/freebsd/Dockerfile), so a Linux machine with
+# Docker produces a binary and a `pkg add`-able package for FreeBSD with
+# nothing else installed. The checkout is mounted read-only; outputs are
+# copied out and handed to the invoking user rather than left owned by root.
+
+freebsd_image() {
+  require_docker
+  say "preparing the FreeBSD toolchain image ($FREEBSD_IMAGE)"
+  docker build -q --build-arg "FREEBSD_RELEASE=$FREEBSD_RELEASE" \
+    --build-arg "BASE_SHA256=$(freebsd_base_sha256)" \
+    -f scripts/freebsd/Dockerfile -t "$FREEBSD_IMAGE" scripts/freebsd >/dev/null
+}
+
+# base.txz is pinned by checksum, per release: a mirror that served something
+# else would otherwise supply the libc this links against.
+freebsd_base_sha256() {
+  case "$FREEBSD_RELEASE" in
+    15.0) echo ac0c933cc02ee8af4da793f551e4a9a15cdcf0e67851290b1e8c19dd6d30bba8 ;;
+    *)
+      echo "no pinned base.txz checksum for FreeBSD $FREEBSD_RELEASE; add it to scripts/build.sh" >&2
+      echo "(MANIFEST at download.freebsd.org/releases/amd64/amd64/$FREEBSD_RELEASE-RELEASE/)" >&2
+      exit 1
+      ;;
+  esac
+}
+
+# Run a command in the toolchain container. $1 is a host directory mounted
+# writable at /out; the rest is the command.
+freebsd_run() { # outdir command...
+  local out=$1
+  shift
+  mkdir -p "$out"
+  docker run --rm \
+    -v "$PWD":/src:ro \
+    -v "$(cd "$out" && pwd)":/out \
+    -v "$FREEBSD_CARGO_VOLUME":/cargo \
+    -v "$FREEBSD_TARGET_VOLUME":/target \
+    -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
+    "$FREEBSD_IMAGE" "$@"
+}
+
+# The cargo invocation, shared by the binary and the package.
+freebsd_cargo() {
+  echo "cargo build --release --locked --target $FREEBSD_TARGET"
+}
+
+cmd_bin_freebsd() {
+  freebsd_image
+  say "building (release, $FREEBSD_TARGET, FreeBSD $FREEBSD_RELEASE sysroot)"
+  freebsd_run "$BIN_DIR" sh -ec "
+    $(freebsd_cargo)
+    cp /target/$FREEBSD_TARGET/release/$NAME /out/$NAME-freebsd
+    chown \$HOST_UID:\$HOST_GID /out/$NAME-freebsd"
+  say "$BIN_DIR/$NAME-freebsd  ($(version), $FREEBSD_TARGET)"
+}
+
+cmd_pkg_freebsd() {
+  local pkg="$NAME-$(version)-freebsd-${FREEBSD_ABI##*:}.pkg"
+  freebsd_image
+  say "building and packaging (FreeBSD $FREEBSD_RELEASE, $FREEBSD_ABI)"
+  freebsd_run "$DIST_DIR" sh -ec "
+    $(freebsd_cargo)
+    sh /src/scripts/freebsd/mkpkg.sh /src /target/$FREEBSD_TARGET/release/$NAME \
+      $(version) $FREEBSD_ABI /out/$pkg
+    chown \$HOST_UID:\$HOST_GID /out/$pkg"
+  ls -1 "$DIST_DIR/$pkg"
 }
 
 cmd_bin_arm64() { bin_cross arm64 "$@"; }
@@ -457,8 +539,8 @@ Usage: ./scripts/build.sh <command>       (or: make <command>)
   deb          Debian package into target/debian
   rpm          RPM package into target/generate-rpm (needs no rpmbuild)
 
-  Cross builds — `bin-X` copies a binary to $BIN_DIR/$NAME-X, `deb-X` and
-  `rpm-X` build the package for it. X is arm64 (static, uConsole and
+  Cross builds — \`bin-X\` copies a binary to $BIN_DIR/$NAME-X, \`deb-X\` and
+  \`rpm-X\` build the package for it. X is arm64 (static, uConsole and
   Raspberry Pi), armhf (32-bit ARM, glibc), riscv64 (static) or static
   (x86-64, static; runs on any distribution):
 
@@ -474,6 +556,9 @@ Usage: ./scripts/build.sh <command>       (or: make <command>)
   rpm-armhf    RPM package for armv7hl
   rpm-riscv64  RPM package for riscv64
   rpm-static   RPM package of the static x86-64 binary
+  bin-freebsd  FreeBSD x86-64 binary, cross-built in a container (needs
+               Docker and nothing else) into $BIN_DIR/$NAME-freebsd
+  pkg-freebsd  FreeBSD package into $DIST_DIR, for \`pkg add\` on the target
   dist         release tarball into $DIST_DIR
   install      install under PREFIX=$PREFIX (honours DESTDIR)
   uninstall    remove what install put there

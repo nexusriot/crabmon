@@ -178,7 +178,13 @@ fn platform() -> Check {
         false => Check::new(
             "platform",
             Status::Limited,
-            format!("{detail}; per-disk IO, GPU, cgroup, pressure and fd counts are Linux-only"),
+            if cfg!(target_os = "freebsd") {
+                format!(
+                    "{detail}; GPU, cgroup, pressure, fd and per-process network panels are Linux-only"
+                )
+            } else {
+                format!("{detail}; per-disk IO, GPU, cgroup, pressure and fd counts are Linux-only")
+            },
         ),
     }
 }

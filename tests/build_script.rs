@@ -106,6 +106,20 @@ fn the_default_command_is_the_help_rather_than_a_build() {
     assert!(stdout.contains("build"), "{stdout}");
 }
 
+/// The help is an unquoted heredoc, so a backtick in it runs a command. It once
+/// printed `bin-X: command not found` and dropped the words it was quoting.
+#[cfg(unix)]
+#[test]
+fn the_help_prints_its_backticks_instead_of_running_them() {
+    let out = std::process::Command::new("bash")
+        .args(["scripts/build.sh", "help"])
+        .output()
+        .expect("bash should be able to run the build script");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.stderr.is_empty(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("`bin-X`") && stdout.contains("`pkg add`"), "{stdout}");
+}
+
 /// A mistyped command must fail loudly. Exiting 0 on one would let a CI step
 /// that runs the wrong name pass while doing nothing at all.
 #[cfg(unix)]
@@ -127,4 +141,76 @@ fn cross_debs_are_repacked_without_an_empty_depends_field() {
     let deb_cross = script.split("deb_cross()").nth(1).expect("deb_cross should exist");
     let body = deb_cross.split("\n}\n").next().unwrap();
     assert!(body.contains("strip_empty_depends"), "deb_cross no longer calls it:\n{body}");
+}
+
+/// The FreeBSD package is built by hand — pkg(8) is not available on the Linux
+/// machine doing the building — so what `pkg add` will verify is checked here:
+/// the manifests lead the archive, and every file's checksum and the flat size
+/// in the manifest are those of the file actually packed.
+#[cfg(unix)]
+#[test]
+fn the_freebsd_package_carries_manifests_and_checksums_that_match_its_files() {
+    use std::process::Command;
+    let have = |t: &str| Command::new(t).arg("--version").output().is_ok();
+    if !(have("tar") && have("xz") && have("sha256sum") && have("gzip")) {
+        eprintln!("skipping: tar, xz, gzip and sha256sum are needed");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("crabmon-pkg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let fake = dir.join("crabmon");
+    std::fs::write(&fake, b"not really an ELF").unwrap();
+    let out = dir.join("c.pkg");
+    let status = Command::new("sh")
+        .args(["scripts/freebsd/mkpkg.sh", ".", fake.to_str().unwrap(), "9.8.7"])
+        .args(["FreeBSD:15:amd64", out.to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let unpack = dir.join("x");
+    std::fs::create_dir_all(&unpack).unwrap();
+    // tar -t lists in archive order, which is the order pkg reads.
+    let listing = Command::new("tar").arg("-tJf").arg(&out).output().unwrap();
+    let names: Vec<String> =
+        String::from_utf8_lossy(&listing.stdout).lines().map(str::to_string).collect();
+    assert_eq!(&names[..2], ["+COMPACT_MANIFEST", "+MANIFEST"], "{names:?}");
+    assert!(names.contains(&"/usr/local/bin/crabmon".to_string()), "{names:?}");
+    assert!(names.iter().all(|n| !n.ends_with('/')), "directory entries are not wanted: {names:?}");
+    assert!(
+        Command::new("tar")
+            .arg("-xJf")
+            .arg(&out)
+            .arg("-C")
+            .arg(&unpack)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(unpack.join("+MANIFEST")).unwrap())
+            .expect("the manifest is JSON");
+    assert_eq!(manifest["name"], "crabmon");
+    assert_eq!(manifest["version"], "9.8.7");
+    assert_eq!(manifest["abi"], "FreeBSD:15:amd64");
+    let compact: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(unpack.join("+COMPACT_MANIFEST")).unwrap())
+            .expect("the compact manifest is JSON too");
+    assert_eq!(compact["version"], "9.8.7");
+    assert!(compact.get("files").is_none());
+
+    let files = manifest["files"].as_object().unwrap();
+    assert_eq!(files.len(), names.len() - 2, "every packed file is in the manifest");
+    let mut total = 0;
+    for (path, sum) in files {
+        let on_disk = unpack.join(path.trim_start_matches('/'));
+        let sha = Command::new("sha256sum").arg(&on_disk).output().unwrap();
+        let got = String::from_utf8_lossy(&sha.stdout);
+        assert_eq!(got.split_whitespace().next().unwrap(), sum.as_str().unwrap(), "{path}");
+        total += std::fs::metadata(&on_disk).unwrap().len();
+    }
+    assert_eq!(manifest["flatsize"].as_u64(), Some(total));
+    let _ = std::fs::remove_dir_all(&dir);
 }
