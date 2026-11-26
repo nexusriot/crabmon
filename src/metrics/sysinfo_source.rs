@@ -198,6 +198,7 @@ impl SysinfoSource {
     pub fn new(virtual_prefixes: Vec<String>, use_nvidia_smi: bool) -> anyhow::Result<Self> {
         use anyhow::Context;
         let unsupported = "this platform cannot be monitored";
+        let _quiet = super::bsd::MuteStderr::new();
         let mut sys = System::new_with_specifics(refresh_kind()).context(unsupported)?;
         sys.refresh_specifics(refresh_kind());
 
@@ -227,10 +228,26 @@ impl SysinfoSource {
 
         let host = HostInfo {
             hostname: System::host_name().unwrap_or_else(|_| "unknown".into()),
-            os: System::long_os_version().or_else(|_| System::name()).unwrap_or_default(),
-            kernel: System::kernel_version().unwrap_or_default(),
+            os: super::bsd::host().os.clone().unwrap_or_else(|| {
+                // `uname -v` style strings end in a newline on some systems.
+                System::long_os_version()
+                    .or_else(|_| System::name())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string()
+            }),
+            kernel: super::bsd::host()
+                .kernel
+                .clone()
+                .unwrap_or_else(|| System::kernel_version().unwrap_or_default()),
             arch: System::cpu_arch(),
-            cpu_brand: sys.cpus().first().map(|c| c.brand().trim().to_string()).unwrap_or_default(),
+            cpu_brand: sys
+                .cpus()
+                .first()
+                .map(|c| c.brand().trim().to_string())
+                .filter(|b| !b.is_empty())
+                .or_else(|| super::bsd::host().cpu_model.clone())
+                .unwrap_or_default(),
             logical_cores: sys.cpus().len(),
             physical_cores: System::physical_core_count().ok(),
             uptime_secs: System::uptime().unwrap_or(0),
@@ -366,7 +383,8 @@ impl SysinfoSource {
             let user = p
                 .user_id()
                 .and_then(|uid| self.users.as_ref()?.get_user_by_id(uid))
-                .map(|u| u.name().to_string());
+                .map(|u| u.name().to_string())
+                .map(|n| super::bsd::user_name(uid_of(p), n));
 
             let start_time = p.start_time();
             // Both are `None` when the sweep is off, which the UI renders as
@@ -430,6 +448,14 @@ impl SysinfoSource {
                 },
             );
 
+            let name = super::bsd::tidy_name(name, &exe);
+            // Only FreeBSD reports an empty argument vector for a retitled
+            // process; a Linux kernel thread's empty command line is real.
+            let cmd = if cfg!(target_os = "freebsd") {
+                super::bsd::fallback_cmd(cmd, &name, &exe)
+            } else {
+                cmd
+            };
             rows.push(ProcRow {
                 pid: pid_u,
                 ppid: p.parent().map(|p| p.as_u32()),
@@ -598,11 +624,12 @@ impl SysinfoSource {
                 io.insert(dev.clone(), DiskCounters::rates(prev, cur, secs));
             }
         }
-        // FreeBSD has no /proc/diskstats; iostat already reports rates, so they
-        // are used directly rather than differenced.
-        if io.is_empty() {
+        // Where the counters could not be read at all (an `iostat` too old for
+        // `-I`), fall back to FreeBSD's since-boot averages: rough, but not blank.
+        if stats.is_empty() {
             io.extend(diskstats::read_rates_freebsd());
         }
+        let mounted_from = diskstats::read_mount_devices();
 
         // `disks` is borrowed immutably below, so resolve device keys first.
         let listed: Vec<(String, String, String, String, bool, u64, u64)> = self
@@ -625,6 +652,14 @@ impl SysinfoSource {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for (mount, device, fs, kind, removable, total, avail) in listed {
+            // `sysinfo` calls a FreeBSD root filesystem `root`; the mount table
+            // knows the device.
+            let device = match mounted_from.get(&mount) {
+                Some(real) if !device.starts_with("/dev/") && real.starts_with("/dev/") => {
+                    real.clone()
+                }
+                _ => device,
+            };
             if is_container_overlay(&mount, &fs) || !seen.insert(mount.clone()) {
                 continue;
             }
@@ -743,9 +778,6 @@ pub fn effective_interval(last: Option<Instant>, now: Instant, dt: Duration) -> 
 
 impl MetricSource for SysinfoSource {
     fn snapshot(&mut self, dt: Duration) -> Snapshot {
-        let started = Instant::now();
-        let secs = effective_interval(self.last_sampled, started, dt).as_secs_f64();
-        self.last_sampled = Some(started);
         self.relist_if_due();
         self.kmsg.drain();
 
@@ -757,8 +789,20 @@ impl MetricSource for SysinfoSource {
                 super::control::start_ticks(pid.as_u32()).map(|ticks| (pid.as_u32(), ticks))
             })
             .collect();
+        let quiet = super::bsd::MuteStderr::new();
         self.sys.refresh_specifics(refresh_kind());
+        drop(quiet);
         self.refresh_lists(false);
+
+        // Stamped here, after the slow part, because this is where the counters
+        // below are read. Taken at the top instead, a refresh that stalled for
+        // two seconds under heavy IO left the next interval at its nominal
+        // quarter-second while the counters had moved for two: a 2.5 GB write
+        // showed as 10 GB/s on a disk that does 1.4, and the frame after it as
+        // zero. Found on FreeBSD under `dd`; the same arithmetic ran everywhere.
+        let started = Instant::now();
+        let secs = effective_interval(self.last_sampled, started, dt).as_secs_f64();
+        self.last_sampled = Some(started);
 
         let mut host = self.host.clone();
         host.uptime_secs = System::uptime().unwrap_or(host.uptime_secs);
@@ -768,7 +812,16 @@ impl MetricSource for SysinfoSource {
 
         let cpu = CpuSample {
             per_core: self.sys.cpus().iter().map(|c| c.usage().clamp(0.0, 100.0)).collect(),
-            freq_mhz: self.sys.cpus().iter().map(|c| c.frequency()).collect(),
+            // sysinfo has no clock on FreeBSD; the nominal one stands in.
+            freq_mhz: self
+                .sys
+                .cpus()
+                .iter()
+                .map(|c| match c.frequency() {
+                    0 => super::bsd::host().mhz.unwrap_or(0),
+                    f => f,
+                })
+                .collect(),
         };
 
         let mem = MemSample {

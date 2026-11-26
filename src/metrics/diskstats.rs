@@ -154,6 +154,74 @@ pub fn parse_iostat(content: &str) -> BTreeMap<String, DeviceRates> {
     out
 }
 
+/// Parse `iostat -x -I`, FreeBSD's *cumulative* per-device counters.
+///
+/// `-I` replaces the per-second averages with totals since boot — `r/i`,
+/// `w/i`, `kr/i` (kilobytes), `kw/i`, `tsvc_t/i` (seconds spent servicing)
+/// and `sb/i` (seconds the device was busy) — which is exactly what
+/// `/proc/diskstats` is, so the same differencing turns them into what the
+/// disk is doing *now*. Plain `iostat -x` only has averages since boot, and a
+/// host up for a month reads as idle however hard it is being hit.
+pub fn parse_iostat_totals(content: &str) -> DiskStats {
+    let mut out = BTreeMap::new();
+    let mut cols: Option<Vec<String>> = None;
+    for line in content.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.is_empty() {
+            continue;
+        }
+        if f[0] == "device" {
+            cols = Some(f.iter().map(|c| c.to_string()).collect());
+            continue;
+        }
+        let Some(cols) = &cols else { continue };
+        let col = |name: &str| -> Option<f64> {
+            let i = cols.iter().position(|c| c == name)?;
+            f.get(i)?.parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0)
+        };
+        let (Some(kr), Some(kw)) = (col("kr/i"), col("kw/i")) else { continue };
+        out.insert(
+            f[0].to_string(),
+            DiskCounters {
+                read_bytes: (kr * 1024.0) as u64,
+                write_bytes: (kw * 1024.0) as u64,
+                ios: (col("r/i").unwrap_or(0.0) + col("w/i").unwrap_or(0.0)) as u64,
+                io_ms: (col("tsvc_t/i").unwrap_or(0.0) * 1000.0) as u64,
+                io_ticks_ms: (col("sb/i").unwrap_or(0.0) * 1000.0) as u64,
+                in_flight: col("qlen").unwrap_or(0.0) as u64,
+            },
+        );
+    }
+    out
+}
+
+/// What `mount -p` says each mount point is mounted from, as `(mount, device)`
+/// pairs. The `fstab` format is stable across the BSDs and has no header.
+///
+/// `sysinfo` names a FreeBSD root filesystem `root`, which no disk is called.
+pub fn parse_mount_p(content: &str) -> BTreeMap<String, String> {
+    content
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let (dev, mount) = (f.next()?, f.next()?);
+            Some((mount.to_string(), dev.to_string()))
+        })
+        .collect()
+}
+
+pub fn read_mount_devices() -> BTreeMap<String, String> {
+    #[cfg(target_os = "freebsd")]
+    {
+        if let Ok(out) = std::process::Command::new("mount").arg("-p").output()
+            && out.status.success()
+        {
+            return parse_mount_p(&String::from_utf8_lossy(&out.stdout));
+        }
+    }
+    BTreeMap::new()
+}
+
 /// Per-device rates, already per-second. Only FreeBSD uses this path; Linux
 /// derives rates from the cumulative counters instead.
 pub fn read_rates_freebsd() -> BTreeMap<String, DeviceRates> {
@@ -162,10 +230,10 @@ pub fn read_rates_freebsd() -> BTreeMap<String, DeviceRates> {
         use std::process::Command;
         // `-x` gives per-device extended statistics; `-w 1 -c 2` would block for
         // a second, so the single-shot since-boot average is used instead.
-        if let Ok(out) = Command::new("iostat").args(["-x"]).output() {
-            if out.status.success() {
-                return parse_iostat(&String::from_utf8_lossy(&out.stdout));
-            }
+        if let Ok(out) = Command::new("iostat").args(["-x"]).output()
+            && out.status.success()
+        {
+            return parse_iostat(&String::from_utf8_lossy(&out.stdout));
         }
     }
     BTreeMap::new()
@@ -176,6 +244,14 @@ pub fn read_diskstats() -> DiskStats {
     {
         if let Ok(content) = fs::read_to_string("/proc/diskstats") {
             return parse_diskstats(&content);
+        }
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        if let Ok(out) = std::process::Command::new("iostat").args(["-x", "-I"]).output()
+            && out.status.success()
+        {
+            return parse_iostat_totals(&String::from_utf8_lossy(&out.stdout));
         }
     }
     BTreeMap::new()
@@ -199,8 +275,27 @@ where
         if stats.contains_key(&base) {
             return Some(base);
         }
+        // A BSD partition is its disk plus a suffix — `ada0s1a`, `nda0p2` —
+        // and only the disk has counters. The longest disk that the name
+        // starts with and continues with `s<digit>`/`p<digit>` is the one.
+        if let Some(disk) = whole_disk_of(&base, stats) {
+            return Some(disk);
+        }
     }
     None
+}
+
+fn whole_disk_of(partition: &str, stats: &DiskStats) -> Option<String> {
+    stats
+        .keys()
+        .filter(|disk| {
+            partition.strip_prefix(disk.as_str()).is_some_and(|rest| {
+                let mut c = rest.chars();
+                matches!(c.next(), Some('s' | 'p')) && c.next().is_some_and(|d| d.is_ascii_digit())
+            })
+        })
+        .max_by_key(|d| d.len())
+        .cloned()
 }
 
 /// Production resolver: follow symlinks under `/dev`.
@@ -421,5 +516,65 @@ ada1 1 2 3 4
         // against /proc/diskstats needs in order to take the last component.
         let real = canonicalize_dev(".").expect("the working directory resolves");
         assert!(real.starts_with('/') || cfg!(windows), "{real} is not absolute");
+    }
+
+    const IOSTAT_I: &str = "                        extended device statistics  
+device           r/i         w/i         kr/i         kw/i qlen   tsvc_t/i      sb/i  
+ada0          2044.0      2621.0      46810.5     121431.5    0        6.0       1.3 
+cd0              0.0         0.0          0.0          0.0    0        0.0       0.0 
+";
+
+    #[test]
+    fn freebsd_cumulative_iostat_becomes_counters_like_diskstats() {
+        let s = parse_iostat_totals(IOSTAT_I);
+        let ada = s["ada0"];
+        assert_eq!(ada.read_bytes, 46_810 * 1024 + 512);
+        assert_eq!(ada.write_bytes, 121_431 * 1024 + 512);
+        assert_eq!(ada.ios, 4665);
+        assert_eq!(ada.io_ms, 6000);
+        assert_eq!(ada.io_ticks_ms, 1300);
+        assert_eq!(s["cd0"], DiskCounters::default());
+        // Differenced like Linux's, they give a rate for the interval.
+        let mut later = ada;
+        later.read_bytes += 2048;
+        later.io_ticks_ms += 500;
+        let r = DiskCounters::rates(&ada, &later, 1.0);
+        assert_eq!(r.read_bps, 2048.0);
+        assert_eq!(r.util, Some(0.5));
+    }
+
+    #[test]
+    fn cumulative_iostat_without_its_header_or_columns_yields_nothing() {
+        assert!(parse_iostat_totals("").is_empty());
+        assert!(parse_iostat_totals("ada0 1 2 3 4\n").is_empty());
+        assert!(parse_iostat_totals("device r/s w/s\nada0 1 2\n").is_empty());
+        assert!(parse_iostat_totals("device kr/i kw/i\nada0 x y\n").is_empty());
+    }
+
+    #[test]
+    fn mount_p_maps_each_mount_point_to_what_it_is_mounted_from() {
+        let m = parse_mount_p(
+            "/dev/ada0s1a\t\t/\t\t\tufs\trw\t\t1 1\ndevfs\t\t\t/dev\t\t\tdevfs\trw\t\t0 0\n",
+        );
+        assert_eq!(m["/"], "/dev/ada0s1a");
+        assert_eq!(m["/dev"], "devfs");
+        assert!(parse_mount_p("").is_empty());
+    }
+
+    #[test]
+    fn a_bsd_partition_resolves_to_its_whole_disk() {
+        let stats: DiskStats = ["ada0", "ada1", "nda0", "da0"]
+            .iter()
+            .map(|n| (n.to_string(), DiskCounters::default()))
+            .collect();
+        let id = |d: &str| resolve_device_key(d, &stats, |_| None);
+        assert_eq!(id("/dev/ada0s1a").as_deref(), Some("ada0"));
+        assert_eq!(id("/dev/ada1p2").as_deref(), Some("ada1"));
+        assert_eq!(id("/dev/nda0p3").as_deref(), Some("nda0"));
+        assert_eq!(id("/dev/da0").as_deref(), Some("da0"));
+        // A name that merely starts like a disk is not that disk's partition.
+        assert_eq!(id("/dev/ada0x"), None);
+        assert_eq!(id("/dev/ada"), None);
+        assert_eq!(id("zroot/ROOT/default"), None);
     }
 }

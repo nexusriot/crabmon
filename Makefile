@@ -8,6 +8,8 @@
 #   make bin        release binary into ./bin
 #   make bin-arm64  cross-compile for aarch64 (uConsole) into ./bin; also
 #                   bin-/deb-/rpm- for armhf, riscv64 and static (musl x86-64)
+#   make bin-freebsd / pkg-freebsd  FreeBSD binary / `pkg add` package, built
+#                   in a container from Linux (needs only Docker)
 #   make install    install under PREFIX (default /usr/local)
 #
 # Variables are passed through: make install PREFIX=$HOME/.local
@@ -23,7 +25,8 @@ ARGS ?=
 .PHONY: help build release bin run test test-unit e2e e2e-local check fmt fmt-check \
         lint ci deb rpm dist install uninstall snapshot clean version \
         bin-arm64 bin-armhf bin-riscv64 bin-static deb-arm64 deb-armhf \
-        deb-riscv64 deb-static rpm-arm64 rpm-armhf rpm-riscv64 rpm-static
+        deb-riscv64 deb-static rpm-arm64 rpm-armhf rpm-riscv64 rpm-static \
+        bin-freebsd pkg-freebsd
 
 help:
 	@$(BUILD) help
@@ -84,6 +87,12 @@ bin-riscv64:
 
 bin-static:
 	@$(BUILD) bin-static
+
+bin-freebsd:
+	@$(BUILD) bin-freebsd
+
+pkg-freebsd:
+	@$(BUILD) pkg-freebsd
 
 deb-arm64:
 	@$(BUILD) deb-arm64

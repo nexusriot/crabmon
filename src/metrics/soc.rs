@@ -228,6 +228,9 @@ mod tests {
         assert!(ThrottleFlags(0).now().is_empty());
     }
 
+    // Unix only: the firmware's sysfs node is `soc:firmware`, and a `:` is not
+    // allowed in a Windows path component.
+    #[cfg(unix)]
     #[test]
     fn a_pi_is_read_from_sysfs_and_the_devicetree() {
         let root = tmpdir("pi");

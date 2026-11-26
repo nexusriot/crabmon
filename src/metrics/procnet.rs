@@ -23,7 +23,6 @@
 //!   TCP socket on the machine.
 
 use std::collections::HashMap;
-use std::process::Command;
 
 /// One TCP socket's lifetime counters and its owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,7 +143,7 @@ impl NetTracker {
 pub fn is_available() -> bool {
     #[cfg(target_os = "linux")]
     {
-        Command::new("ss")
+        std::process::Command::new("ss")
             .arg("-V")
             .output()
             .map(|o| o.status.success() || !o.stdout.is_empty() || !o.stderr.is_empty())
@@ -160,7 +159,10 @@ pub fn is_available() -> bool {
 pub fn read() -> Option<Vec<SocketBytes>> {
     #[cfg(target_os = "linux")]
     {
-        let out = Command::new("ss").args(["-t", "-i", "-n", "-H", "-e", "-p"]).output().ok()?;
+        let out = std::process::Command::new("ss")
+            .args(["-t", "-i", "-n", "-H", "-e", "-p"])
+            .output()
+            .ok()?;
         out.status.success().then(|| parse_ss(&String::from_utf8_lossy(&out.stdout)))
     }
     #[cfg(not(target_os = "linux"))]

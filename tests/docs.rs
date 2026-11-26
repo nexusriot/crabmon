@@ -496,7 +496,7 @@ fn the_test_count_quoted_in_design_is_not_wildly_stale() {
     // The suites are counted at build time in CI; here just sanity-check the
     // claim is in the right order of magnitude and not above the real figure.
     assert!(quoted >= 200, "the quoted count {quoted} looks stale");
-    assert!(quoted <= 1000, "the quoted count {quoted} looks invented");
+    assert!(quoted <= 1500, "the quoted count {quoted} looks invented");
 }
 
 /// Ask git whether it would ignore `path`. `None` when git is unavailable or

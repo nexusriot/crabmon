@@ -1,4 +1,4 @@
-.TH CRABMON 1 "2026-11-22" "crabmon 0.19.0" "User Commands"
+.TH CRABMON 1 "2026-11-26" "crabmon 0.19.0" "User Commands"
 .SH NAME
 crabmon \- terminal system monitor
 .SH SYNOPSIS
@@ -1014,11 +1014,17 @@ and pressure stall information are Linux-only; those panels and columns are
 simply absent elsewhere. Pressure needs Linux 4.20+ with \fBCONFIG_PSI=y\fR.
 .PP
 Per-disk IO, utilisation and request latency come from \fI/proc/diskstats\fR on
-Linux and from
-.BR iostat (8)
-on FreeBSD, where they are since-boot averages rather than the interval rates
-the Linux path derives. The FreeBSD path is compile-checked and unit-tested
-against captured output but has not been exercised on real hardware.
+Linux and from the cumulative counters of
+.BR "iostat -x -I" (8)
+on FreeBSD, differenced into the same interval rates. On FreeBSD a process's
+listening ports, sockets, open files and environment come from
+.BR sockstat (1)
+and
+.BR procstat (1),
+and thread counts, cgroups, units, kernel events, pressure, GPUs, sensors,
+batteries, per-process swap and network, and descriptor counts are absent.
+FreeBSD binaries and packages are built from Linux with \fBmake bin-freebsd\fR
+and \fBmake pkg-freebsd\fR, which need only Docker.
 .PP
 Battery and mains state need no privileges. CPU package power comes from RAPL,
 whose counters are root-only on most kernels since CVE-2020-8694; the figure is

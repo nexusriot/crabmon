@@ -15,7 +15,11 @@ use std::time::{Duration, Instant};
 fn clean_home() -> &'static std::path::Path {
     static HOME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     HOME.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("crabmon-cli-home-{}", std::process::id()));
+        // Under cargo's own scratch directory, at a fixed name, rather than in
+        // /tmp named by pid: a `static` is never dropped, so nothing here can
+        // delete it afterwards, and a pid-named one left a directory behind on
+        // every run. The next run replaces it; `cargo clean` removes it.
+        let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("crabmon-cli-home");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a temporary home");
         dir
@@ -368,6 +372,7 @@ fn doctor_fails_a_silence_window_that_crabmon_would_refuse() {
     std::fs::write(&cfg, "[[silence]]\ndaily = \"02:00-03:00\"\n").unwrap();
     let out = crabmon(&["--config", cfg.to_str().unwrap(), "--doctor"]);
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stdout));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -514,10 +519,39 @@ fn watch_gives_up_and_exits_zero_when_nothing_matches() {
     assert!(out.stdout.is_empty(), "nothing matched, so nothing should be printed");
 }
 
+/// A process for `--watch` to find. crabmon leaves its own process out of what
+/// it judges, so "crabmon is running, it will match itself" held only where the
+/// test binary's path happened to contain the word — a checkout called
+/// `crabmon`. A child of the test is a match on any host.
+struct Target {
+    child: Option<std::process::Child>,
+}
+
+impl Target {
+    fn start() -> (Target, &'static str) {
+        if cfg!(unix) {
+            let child = Command::new("sleep").arg("60").spawn().ok();
+            if child.is_some() {
+                return (Target { child }, "sleep");
+            }
+        }
+        (Target { child: None }, "crabmon")
+    }
+}
+
+impl Drop for Target {
+    fn drop(&mut self) {
+        if let Some(c) = self.child.as_mut() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
 #[test]
 fn watch_exits_nonzero_and_prints_the_match() {
-    // crabmon is always running while this test runs, so it matches itself.
-    let out = crabmon(&["--watch", "crabmon", "--watch-timeout", "10", "--refresh", "200"]);
+    let (_target, query) = Target::start();
+    let out = crabmon(&["--watch", query, "--watch-timeout", "10", "--refresh", "200"]);
     assert_eq!(out.status.code(), Some(1), "a match must be distinguishable in the shell");
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("the match is printed as json");
@@ -528,9 +562,10 @@ fn watch_exits_nonzero_and_prints_the_match() {
 /// the text report headed it `localhost up 00:00 … mem 0 B / 0 B`.
 #[test]
 fn a_watch_match_reports_the_machine_it_was_measured_on() {
+    let (_target, query) = Target::start();
     let out = crabmon(&[
         "--watch",
-        "crabmon",
+        query,
         "--watch-timeout",
         "10",
         "--refresh",
@@ -542,7 +577,7 @@ fn a_watch_match_reports_the_machine_it_was_measured_on() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(!text.contains("mem 0 B / 0 B"), "{text}");
     assert!(!text.contains("up 00:00"), "{text}");
-    let json = crabmon(&["--watch", "crabmon", "--watch-timeout", "10", "--refresh", "200"]);
+    let json = crabmon(&["--watch", query, "--watch-timeout", "10", "--refresh", "200"]);
     let v: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
     assert!(v["mem"]["total"].as_u64().unwrap_or(0) > 0, "{v}");
     assert!(!v["host"]["hostname"].as_str().unwrap_or("").is_empty(), "{v}");

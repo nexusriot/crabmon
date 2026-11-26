@@ -148,6 +148,34 @@ pub fn parse_environ(raw: &str) -> Vec<EnvVar> {
         .collect()
 }
 
+/// Parse `procstat -e <pid>`, which prints the whole environment on one line
+/// after a `PID COMM` prefix, separated by plain spaces. A value may hold
+/// spaces too, so a word that does not open with `NAME=` belongs to the
+/// variable before it.
+pub fn parse_procstat_env(content: &str) -> Vec<EnvVar> {
+    let is_start = |w: &str| {
+        w.split_once('=').is_some_and(|(n, _)| {
+            !n.is_empty()
+                && !n.starts_with(|c: char| c.is_ascii_digit())
+                && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+    };
+    let mut entries: Vec<String> = Vec::new();
+    for line in content.lines().skip(1) {
+        // Skip the pid and the command name.
+        for w in line.split_whitespace().skip(2) {
+            match entries.last_mut() {
+                Some(last) if !is_start(w) => {
+                    last.push(' ');
+                    last.push_str(w);
+                }
+                _ => entries.push(w.to_string()),
+            }
+        }
+    }
+    parse_environ(&entries.join("\0"))
+}
+
 /// A process's environment, or `None` when it cannot be read — another user's
 /// process, or one that exited while the pane was opening.
 pub fn environment(pid: u32) -> Option<Vec<EnvVar>> {
@@ -156,7 +184,13 @@ pub fn environment(pid: u32) -> Option<Vec<EnvVar>> {
         let raw = std::fs::read_to_string(format!("/proc/{pid}/environ")).ok()?;
         Some(parse_environ(&raw))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "freebsd")]
+    {
+        let out =
+            std::process::Command::new("procstat").args(["-e", &pid.to_string()]).output().ok()?;
+        out.status.success().then(|| parse_procstat_env(&String::from_utf8_lossy(&out.stdout)))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     {
         let _ = pid;
         None
@@ -166,6 +200,19 @@ pub fn environment(pid: u32) -> Option<Vec<EnvVar>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn procstat_environment_is_split_on_names_not_on_every_space() {
+        let text = "  PID COMM             ENVIRONMENT\n 1408 beastied         HOME=/nonexistent GREETING=hello big world PATH=/bin:/sbin DB_PASSWORD=hunter2 PWD=/\n";
+        let env = parse_procstat_env(text);
+        let names: Vec<&str> = env.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["HOME", "GREETING", "PATH", "DB_PASSWORD", "PWD"]);
+        assert_eq!(env[1].value, "hello big world");
+        // The same masking as everywhere else applies.
+        assert!(env[3].hidden && env[3].value.is_empty());
+        assert!(parse_procstat_env("").is_empty());
+        assert!(parse_procstat_env("  PID COMM ENVIRONMENT\n").is_empty());
+    }
 
     #[test]
     fn an_environment_block_splits_on_nuls() {

@@ -13,6 +13,17 @@ run on.
 
 ### Added
 
+- **FreeBSD.** `make bin-freebsd` and `make pkg-freebsd` build a binary and a
+  `pkg add`-able package from Linux, in a container that needs only Docker
+  (`scripts/freebsd/`; FreeBSD's libc comes from the release's `base.txz`,
+  pinned by checksum). Tested on a real FreeBSD 15.0 host, which turned up:
+  the kernel read as `199506` and the CPU model and clock as blank; root's
+  processes named `toor`; the root disk named `root` with no IO behind it; disk
+  rates that were averages since boot; no listening ports, sockets, open files
+  or environment in the detail pane; a blank Command line for retitled
+  processes; and `kinfo_getfile(): No such process` printed into the middle of
+  the table whenever a process exited mid-sample. All fixed — see `--doctor`
+  on FreeBSD for what has no source there.
 - **Small screens.** Below 100×30 the dashboard collapses to a box of vitals
   — CPU, memory, swap, load, network, disk, the hottest sensor, each battery
   with its time left and draw — over a full-width process table, instead of
@@ -57,6 +68,16 @@ run on.
 Found by running the build against a real VPS (Ubuntu 26.04, one CPU, 21 days
 up) rather than a test fixture.
 
+- **Rates inflated after a sample that stalled.** The interval was measured
+  from the start of one snapshot to the start of the next, but the counters are
+  read after the slow process refresh. When that refresh stalled for two
+  seconds under heavy IO, the counters had moved for two seconds and were
+  divided by a quarter of one: a 2.5 GB write showed as 10 GB/s on a disk that
+  does 1.4, and the next frame as zero. The interval is now stamped where the
+  counters are read. Found on FreeBSD under `dd`; every platform shared it.
+- **The `cli` tests left directories in `/tmp`.** One per run, for the shared
+  home and for the `--doctor` silence test. They now live under cargo's own
+  scratch directory and the second cleans up after itself.
 - **A first network rate of hundreds of GiB/s.** The sampler thread measured
   the gap before the second sample from when it started, not from when the
   first sample was read, so the second sample of every TUI run divided a

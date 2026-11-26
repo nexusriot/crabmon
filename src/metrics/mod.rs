@@ -2,6 +2,7 @@
 //! app can be driven from a fixture in tests instead of the live host.
 
 pub mod backlight;
+pub mod bsd;
 pub mod cgroup;
 pub mod containers;
 pub mod control;
